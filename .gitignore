@@ -5,3 +5,8 @@ zig-out/
 *.png
 *.jpg
 *.jpeg
+*.safetensors
+*.pt
+*.bin
+assets/
+zig-pkg/

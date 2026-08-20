@@ -10,9 +10,13 @@ fn printUsage() void {
         \\  sam3 benchmark                 Run SIMD GEMM and inference performance benchmarks
         \\  sam3 image [options]           Segment an image using points, boxes, or text concepts
         \\  sam3 video [options]           Track objects across video frames
+        \\  sam3 vision [options]          Run Meta's SAM 3 vision encoder on an image from the checkpoint
+        \\  sam3 segment [options]         Segment an image from point prompts using the real checkpoint
+        \\  sam3 weights <path> [--filter <substr>] [--verify]
+        \\                                 Inspect a SafeTensors checkpoint (module + tensor layout)
         \\
         \\Image Options:
-        \\  --image <path>                 Input image file (.ppm or .bmp)
+        \\  --image <path>                 Input image file (.png, .jpg, .ppm, ...)
         \\  --text <concept>               Promptable Concept Segmentation text (e.g. "yellow bus")
         \\  --point <x,y,label>            Point prompt (e.g. 0.5,0.5,1) [label 1=fg, 0=bg]
         \\  --box <x1,y1,x2,y2>            Bounding box prompt (e.g. 0.1,0.1,0.9,0.9)
@@ -26,6 +30,19 @@ fn printUsage() void {
         \\  --weights <path.safetensors>   Optional model weights
         \\  --output <dir>                 Directory to save output segmented video frames
         \\
+        \\Vision Options:
+        \\  --image <path>                 Input image file (.png, .jpg, .ppm, ...)
+        \\  --weights <path.safetensors>   Meta SAM 3 checkpoint (required)
+        \\  --size <pixels>                Model input side length, multiple of 14 (default: 1008)
+        \\
+        \\
+        \\Segment Options:
+        \\  --image <path>                 Input image file (.png, .jpg, .ppm, ...)
+        \\  --weights <path.safetensors>   Meta SAM 3 checkpoint (required)
+        \\  --point <x,y,label>            Prompt point in normalised coords, repeatable
+        \\  --output <path>                Where to write the overlay (.ppm or .bmp)
+        \\  --size <pixels>                Model input side length (default: 1008)
+        \\  --single-mask                  Return one mask instead of the three multimask outputs
     , .{});
 }
 
@@ -76,10 +93,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
 
-        var img = if (std.mem.endsWith(u8, image_path.?, ".ppm"))
-            try sam3.ImageRGB.loadPPM(allocator, image_path.?)
-        else
-            return error.UnsupportedImageFormat;
+        var img = try sam3.image.load(allocator, image_path.?);
         defer img.deinit();
 
         std.debug.print("Loaded image '{s}' (Resolution: {d}x{d})\n", .{ image_path.?, img.width, img.height });
@@ -97,6 +111,10 @@ pub fn main(init: std.process.Init) !void {
 
         if (weights_path) |wpath| {
             try model.loadWeights(wpath);
+            std.debug.print("Loaded {d} tensors from checkpoint '{s}'\n", .{
+                model.weights.checkpoint_tensors,
+                wpath,
+            });
         }
 
         var pts_list: std.ArrayList(sam3.Point) = .empty;
@@ -126,6 +144,16 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("  -> Predicted IoU Quality Score: {d:.4}\n", .{res.iou_scores.at2(0, 0)});
         std.debug.print("  -> Concept Presence Score: {d:.4}\n", .{res.presence_score});
 
+        if (weights_path != null) {
+            const cov = model.weights.coverage();
+            std.debug.print("  -> Checkpoint coverage: {d}/{d} weights resolved ({d:.1}%), {d} randomly initialised\n", .{
+                cov.resolved,
+                cov.requested(),
+                cov.fraction() * 100.0,
+                cov.synthesised,
+            });
+        }
+
         sam3.visualization.overlayMask(&img, res.masks, sam3.RGB{ .r = 0, .g = 220, .b = 100 }, 0.5);
         if (pts_list.items.len > 0) {
             sam3.visualization.drawPointMarker(&img, pts_list.items[0], 6);
@@ -139,6 +167,96 @@ pub fn main(init: std.process.Init) !void {
             try img.saveBMP(output_path.?);
         }
         std.debug.print("  -> Saved segmented mask overlay to '{s}'\n\n", .{output_path.?});
+    } else if (std.mem.eql(u8, command, "weights")) {
+        const weights_file = args_it.next() orelse {
+            std.debug.print("Error: 'weights' requires a path to a .safetensors checkpoint.\n\n", .{});
+            printUsage();
+            return;
+        };
+
+        var filter: ?[]const u8 = null;
+        var verify = false;
+        while (args_it.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--filter")) {
+                filter = args_it.next();
+            } else if (std.mem.eql(u8, arg, "--verify")) {
+                verify = true;
+            }
+        }
+
+        try sam3.cli.runInspectWeights(allocator, weights_file, filter, verify);
+    } else if (std.mem.eql(u8, command, "vision")) {
+        var image_path: ?[]const u8 = null;
+        var weights_path: ?[]const u8 = null;
+        var image_size: usize = 1008;
+
+        while (args_it.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--image")) {
+                image_path = args_it.next();
+            } else if (std.mem.eql(u8, arg, "--weights")) {
+                weights_path = args_it.next();
+            } else if (std.mem.eql(u8, arg, "--size")) {
+                image_size = try std.fmt.parseInt(usize, args_it.next() orelse "1008", 10);
+            }
+        }
+
+        if (image_path == null or weights_path == null) {
+            std.debug.print("Error: --image and --weights are required for the vision subcommand.\n\n", .{});
+            printUsage();
+            return;
+        }
+
+        try sam3.cli.runVisionEncoder(allocator, image_path.?, weights_path.?, image_size);
+    } else if (std.mem.eql(u8, command, "segment")) {
+        var image_path: ?[]const u8 = null;
+        var weights_path: ?[]const u8 = null;
+        var output_path: ?[]const u8 = null;
+        var image_size: usize = 1008;
+        var single_mask = false;
+
+        var pts_list: std.ArrayList(sam3.Point) = .empty;
+        defer pts_list.deinit(allocator);
+
+        while (args_it.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--image")) {
+                image_path = args_it.next();
+            } else if (std.mem.eql(u8, arg, "--weights")) {
+                weights_path = args_it.next();
+            } else if (std.mem.eql(u8, arg, "--output")) {
+                output_path = args_it.next();
+            } else if (std.mem.eql(u8, arg, "--size")) {
+                image_size = try std.fmt.parseInt(usize, args_it.next() orelse "1008", 10);
+            } else if (std.mem.eql(u8, arg, "--single-mask")) {
+                single_mask = true;
+            } else if (std.mem.eql(u8, arg, "--point")) {
+                const pstr = args_it.next() orelse continue;
+                var it = std.mem.splitScalar(u8, pstr, ',');
+                const x_str = it.next() orelse "0.5";
+                const y_str = it.next() orelse "0.5";
+                const l_str = it.next() orelse "1";
+                try pts_list.append(allocator, sam3.Point{
+                    .x = try std.fmt.parseFloat(f32, x_str),
+                    .y = try std.fmt.parseFloat(f32, y_str),
+                    .label = try std.fmt.parseInt(i32, l_str, 10),
+                });
+            }
+        }
+
+        if (image_path == null or weights_path == null or output_path == null or pts_list.items.len == 0) {
+            std.debug.print("Error: --image, --weights, --output and at least one --point are required.\n\n", .{});
+            printUsage();
+            return;
+        }
+
+        try sam3.cli.runSegment(
+            allocator,
+            image_path.?,
+            weights_path.?,
+            output_path.?,
+            pts_list.items,
+            image_size,
+            !single_mask,
+        );
     } else {
         printUsage();
     }

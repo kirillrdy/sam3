@@ -7,6 +7,8 @@ pub const safetensors = @import("weights/safetensors.zig");
 pub const weight_loader = @import("weights/weight_loader.zig");
 pub const config = @import("models/config.zig");
 pub const image_encoder = @import("models/image_encoder.zig");
+pub const vision_encoder = @import("models/vision_encoder.zig");
+pub const sam3_tracker = @import("models/sam3_tracker.zig");
 pub const prompt_encoder = @import("models/prompt_encoder.zig");
 pub const detector = @import("models/detector.zig");
 pub const mask_decoder = @import("models/mask_decoder.zig");
@@ -28,6 +30,8 @@ pub const Box = prompt_encoder.Box;
 pub const SAM3VideoPredictor = tracker.SAM3VideoPredictor;
 pub const SafeTensors = safetensors.SafeTensors;
 pub const WeightStore = weight_loader.WeightStore;
+pub const VisionEncoder = vision_encoder.VisionEncoder;
+pub const VisionConfig = vision_encoder.VisionConfig;
 pub const ImageRGB = image.ImageRGB;
 pub const RGB = image.RGB;
 

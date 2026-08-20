@@ -10,14 +10,41 @@ pub const InitType = enum {
     constant,
 };
 
+/// How much of the model was actually served by a loaded checkpoint, as opposed
+/// to being filled in with random initialisation.
+pub const Coverage = struct {
+    checkpoint_tensors: usize,
+    resolved: usize,
+    synthesised: usize,
+
+    pub fn requested(self: Coverage) usize {
+        return self.resolved + self.synthesised;
+    }
+
+    pub fn fraction(self: Coverage) f32 {
+        if (self.requested() == 0) return 0.0;
+        return @as(f32, @floatFromInt(self.resolved)) / @as(f32, @floatFromInt(self.requested()));
+    }
+};
+
 pub const WeightStore = struct {
     allocator: std.mem.Allocator,
     weights: std.StringHashMap(Tensor),
+
+    /// Tensors read from a checkpoint file.
+    checkpoint_tensors: usize,
+    /// Weights the model asked for and found in the checkpoint.
+    resolved: usize,
+    /// Weights the model asked for and had to randomly initialise instead.
+    synthesised: usize,
 
     pub fn init(allocator: std.mem.Allocator) WeightStore {
         return WeightStore{
             .allocator = allocator,
             .weights = std.StringHashMap(Tensor).init(allocator),
+            .checkpoint_tensors = 0,
+            .resolved = 0,
+            .synthesised = 0,
         };
     }
 
@@ -34,10 +61,29 @@ pub const WeightStore = struct {
         return self.weights.get(name);
     }
 
+    /// Stores a tensor under a key this store takes ownership of, releasing any
+    /// tensor already held under that name.
+    fn putOwned(self: *WeightStore, name_owned: []const u8, tensor: Tensor) !void {
+        const gop = try self.weights.getOrPut(name_owned);
+        if (gop.found_existing) {
+            self.allocator.free(name_owned);
+            gop.value_ptr.*.deinit();
+        }
+        gop.value_ptr.* = tensor;
+    }
+
     pub fn put(self: *WeightStore, name: []const u8, tensor: Tensor) !void {
         const name_dupe = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(name_dupe);
-        try self.weights.put(name_dupe, tensor);
+        try self.putOwned(name_dupe, tensor);
+    }
+
+    pub fn coverage(self: WeightStore) Coverage {
+        return Coverage{
+            .checkpoint_tensors = self.checkpoint_tensors,
+            .resolved = self.resolved,
+            .synthesised = self.synthesised,
+        };
     }
 
     pub fn getOrInit(
@@ -48,8 +94,12 @@ pub const WeightStore = struct {
         seed: u64,
     ) !Tensor {
         if (self.get(name)) |existing| {
-            return existing;
+            if (std.mem.eql(usize, existing.shape, shape)) {
+                self.resolved += 1;
+                return existing;
+            }
         }
+        self.synthesised += 1;
 
         var t = try Tensor.init(self.allocator, shape);
         errdefer t.deinit();
@@ -84,7 +134,7 @@ pub const WeightStore = struct {
 
         const name_dupe = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(name_dupe);
-        try self.weights.put(name_dupe, t);
+        try self.putOwned(name_dupe, t);
         return t;
     }
 
@@ -94,7 +144,9 @@ pub const WeightStore = struct {
 
         var it = st.tensors.iterator();
         while (it.next()) |entry| {
-            try self.weights.put(entry.key_ptr.*, entry.value_ptr.*);
+            // Key and tensor ownership both move into this store.
+            try self.putOwned(entry.key_ptr.*, entry.value_ptr.*);
+            self.checkpoint_tensors += 1;
         }
     }
 };

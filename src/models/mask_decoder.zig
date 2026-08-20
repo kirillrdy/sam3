@@ -54,7 +54,21 @@ pub const MaskDecoder = struct {
         const mask_tokens_shape = [_]usize{ 1, num_mask_tokens, d };
         const mask_tokens = try weights.getOrInit("mask_decoder.mask_tokens.weight", &mask_tokens_shape, .xavier, 702);
 
-        const token_list = [_]Tensor{ iou_token, mask_tokens, sparse_prompt_embeddings };
+        var iou_3d = try iou_token.clone(self.allocator);
+        defer iou_3d.deinit();
+        if (iou_3d.shape.len == 2) {
+            const s = [_]usize{ 1, iou_3d.shape[0], d };
+            try iou_3d.reshape(&s);
+        }
+
+        var mask_3d = try mask_tokens.clone(self.allocator);
+        defer mask_3d.deinit();
+        if (mask_3d.shape.len == 2) {
+            const s = [_]usize{ 1, mask_3d.shape[0], d };
+            try mask_3d.reshape(&s);
+        }
+
+        const token_list = [_]Tensor{ iou_3d, mask_3d, sparse_prompt_embeddings };
         var tokens = try Tensor.concat(self.allocator, &token_list, 1);
         defer tokens.deinit();
 

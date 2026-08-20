@@ -1,4 +1,5 @@
 const std = @import("std");
+const native_endian = @import("builtin").cpu.arch.endian();
 const Tensor = @import("../tensor/tensor.zig").Tensor;
 
 pub const DType = enum {
@@ -55,6 +56,166 @@ pub const SafeTensorInfo = struct {
     shape: []usize,
     data_offsets: [2]usize,
 };
+
+/// A single entry of a SafeTensors header, without any tensor data attached.
+pub const TensorEntry = struct {
+    name: []const u8,
+    dtype: DType,
+    shape: []usize,
+    data_offsets: [2]usize,
+
+    pub fn numElements(self: TensorEntry) usize {
+        return Tensor.totalElements(self.shape);
+    }
+
+    pub fn byteLen(self: TensorEntry) usize {
+        return self.data_offsets[1] - self.data_offsets[0];
+    }
+};
+
+/// Header-only view of a SafeTensors file: every tensor name, dtype and shape,
+/// parsed without reading (or allocating) any of the tensor payload. Lets a
+/// multi-gigabyte checkpoint be inspected in milliseconds.
+pub const Header = struct {
+    allocator: std.mem.Allocator,
+    entries: []TensorEntry,
+    data_start: usize,
+    file_size: usize,
+
+    pub fn deinit(self: *Header) void {
+        for (self.entries) |entry| {
+            self.allocator.free(entry.name);
+            self.allocator.free(entry.shape);
+        }
+        self.allocator.free(self.entries);
+    }
+
+    pub fn totalElements(self: Header) usize {
+        var total: usize = 0;
+        for (self.entries) |entry| total += entry.numElements();
+        return total;
+    }
+};
+
+/// Parses the JSON header block into owned entries, sorted by tensor name.
+pub fn parseHeaderEntries(allocator: std.mem.Allocator, header_bytes: []const u8) ![]TensorEntry {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, header_bytes, .{});
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return error.InvalidSafeTensorsHeader;
+
+    var list: std.ArrayList(TensorEntry) = .empty;
+    errdefer {
+        for (list.items) |entry| {
+            allocator.free(entry.name);
+            allocator.free(entry.shape);
+        }
+        list.deinit(allocator);
+    }
+
+    var it = parsed.value.object.iterator();
+    while (it.next()) |kv| {
+        const name = kv.key_ptr.*;
+        if (std.mem.eql(u8, name, "__metadata__")) continue;
+
+        const t_obj = kv.value_ptr.*;
+        if (t_obj != .object) continue;
+
+        const dtype_val = t_obj.object.get("dtype") orelse continue;
+        if (dtype_val != .string) continue;
+        const dtype = DType.fromString(dtype_val.string) orelse return error.UnsupportedDType;
+
+        const shape_val = t_obj.object.get("shape") orelse continue;
+        if (shape_val != .array) continue;
+
+        var shape_list: std.ArrayList(usize) = .empty;
+        errdefer shape_list.deinit(allocator);
+        for (shape_val.array.items) |item| {
+            if (item == .integer) {
+                try shape_list.append(allocator, @intCast(item.integer));
+            }
+        }
+
+        const offsets_val = t_obj.object.get("data_offsets") orelse continue;
+        if (offsets_val != .array or offsets_val.array.items.len != 2) continue;
+
+        const name_dupe = try allocator.dupe(u8, name);
+        errdefer allocator.free(name_dupe);
+
+        try list.append(allocator, TensorEntry{
+            .name = name_dupe,
+            .dtype = dtype,
+            .shape = try shape_list.toOwnedSlice(allocator),
+            .data_offsets = .{
+                @intCast(offsets_val.array.items[0].integer),
+                @intCast(offsets_val.array.items[1].integer),
+            },
+        });
+    }
+
+    const entries = try list.toOwnedSlice(allocator);
+    std.mem.sort(TensorEntry, entries, {}, struct {
+        fn lessThan(_: void, a: TensorEntry, b: TensorEntry) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lessThan);
+    return entries;
+}
+
+/// Reads just the header of a SafeTensors file from disk.
+/// Opens a file read-only through the raw syscall layer used across this
+/// codebase, returning the descriptor and its size.
+fn openReadOnly(file_path: []const u8) !struct { fd: i32, size: usize } {
+    var path_z: [1024]u8 = undefined;
+    if (file_path.len >= path_z.len) return error.PathTooLong;
+    @memcpy(path_z[0..file_path.len], file_path);
+    path_z[file_path.len] = 0;
+    const p_slice: [:0]const u8 = path_z[0..file_path.len :0];
+
+    const fd_res = std.os.linux.open(p_slice, .{ .ACCMODE = .RDONLY }, 0);
+    const signed: isize = @bitCast(fd_res);
+    if (signed < 0) return error.FileNotFound;
+    const fd: i32 = @intCast(signed);
+    errdefer _ = std.os.linux.close(fd);
+
+    const size = std.os.linux.lseek(fd, 0, 2);
+    _ = std.os.linux.lseek(fd, 0, 0);
+    return .{ .fd = fd, .size = size };
+}
+
+fn readExactly(fd: i32, buffer: []u8) !void {
+    var total_read: usize = 0;
+    while (total_read < buffer.len) {
+        const n_res = std.os.linux.read(fd, buffer.ptr + total_read, buffer.len - total_read);
+        const n_signed: isize = @bitCast(n_res);
+        if (n_signed <= 0) break;
+        total_read += @intCast(n_signed);
+    }
+    if (total_read < buffer.len) return error.UnexpectedEOF;
+}
+
+pub fn readHeader(allocator: std.mem.Allocator, file_path: []const u8) !Header {
+    const file = try openReadOnly(file_path);
+    defer _ = std.os.linux.close(file.fd);
+
+    if (file.size < 8) return error.InvalidSafeTensorsFile;
+
+    var len_bytes: [8]u8 = undefined;
+    try readExactly(file.fd, &len_bytes);
+    const header_len: usize = @intCast(std.mem.readInt(u64, &len_bytes, .little));
+    if (8 + header_len > file.size) return error.InvalidSafeTensorsFile;
+
+    const header_bytes = try allocator.alloc(u8, header_len);
+    defer allocator.free(header_bytes);
+    try readExactly(file.fd, header_bytes);
+
+    return Header{
+        .allocator = allocator,
+        .entries = try parseHeaderEntries(allocator, header_bytes),
+        .data_start = 8 + header_len,
+        .file_size = file.size,
+    };
+}
 
 pub const SafeTensors = struct {
     allocator: std.mem.Allocator,
@@ -131,9 +292,17 @@ pub const SafeTensors = struct {
             switch (dtype) {
                 .F32 => {
                     if (raw_tensor_bytes.len != num_elems * 4) return error.TensorSizeMismatch;
-                    for (0..num_elems) |i| {
-                        const val_u32 = std.mem.readInt(u32, raw_tensor_bytes[i * 4 ..][0..4], .little);
-                        t.data[i] = @bitCast(val_u32);
+                    // Checkpoint payloads are 4-byte aligned in practice, which lets
+                    // the 860M f32 weights of a full SAM 3 release land via memcpy
+                    // instead of an element-at-a-time decode.
+                    if (native_endian == .little and @intFromPtr(raw_tensor_bytes.ptr) % @alignOf(f32) == 0) {
+                        const src: [*]const f32 = @ptrCast(@alignCast(raw_tensor_bytes.ptr));
+                        @memcpy(t.data, src[0..num_elems]);
+                    } else {
+                        for (0..num_elems) |i| {
+                            const val_u32 = std.mem.readInt(u32, raw_tensor_bytes[i * 4 ..][0..4], .little);
+                            t.data[i] = @bitCast(val_u32);
+                        }
                     }
                 },
                 .F16 => {
@@ -173,27 +342,27 @@ pub const SafeTensors = struct {
         return res;
     }
 
+    /// Maps the checkpoint instead of buffering it, so peak memory is the size
+    /// of the materialised f32 tensors rather than twice the file size. A 3.4 GB
+    /// checkpoint like Meta's full SAM 3 release is otherwise unloadable on a
+    /// machine with modest RAM.
     pub fn loadFromFile(allocator: std.mem.Allocator, file_path: []const u8) !SafeTensors {
-        var path_z: [1024]u8 = undefined;
-        if (file_path.len >= path_z.len) return error.PathTooLong;
-        @memcpy(path_z[0..file_path.len], file_path);
-        path_z[file_path.len] = 0;
-        const p_slice: [:0]const u8 = path_z[0..file_path.len :0];
+        const file = try openReadOnly(file_path);
+        defer _ = std.os.linux.close(file.fd);
 
-        const fd_res = std.os.linux.open(p_slice, .{ .ACCMODE = .RDONLY }, 0);
-        const signed: isize = @bitCast(fd_res);
-        if (signed < 0) return error.FileNotFound;
-        const fd: i32 = @intCast(signed);
-        defer _ = std.os.linux.close(fd);
+        if (file.size < 8) return error.InvalidSafeTensorsFile;
 
-        const size = std.os.linux.lseek(fd, 0, 2);
-        _ = std.os.linux.lseek(fd, 0, 0);
+        const mapped = try std.posix.mmap(
+            null,
+            file.size,
+            .{ .READ = true },
+            .{ .TYPE = .PRIVATE },
+            file.fd,
+            0,
+        );
+        defer std.posix.munmap(mapped);
 
-        const buffer = try allocator.alloc(u8, size);
-        defer allocator.free(buffer);
-
-        _ = std.os.linux.read(fd, buffer.ptr, buffer.len);
-        return loadFromSlice(allocator, buffer);
+        return loadFromSlice(allocator, mapped);
     }
 
     pub fn writeToSlice(self: SafeTensors, allocator: std.mem.Allocator) ![]u8 {
@@ -247,3 +416,48 @@ pub const SafeTensors = struct {
         return out_list.toOwnedSlice(allocator);
     }
 };
+
+test "header parsing reports tensor layout without materialising data" {
+    const allocator = std.testing.allocator;
+
+    var st = SafeTensors.init(allocator);
+    defer st.deinit();
+
+    const w_shape = [_]usize{ 2, 3 };
+    try st.tensors.put(
+        try allocator.dupe(u8, "encoder.weight"),
+        try Tensor.initConstant(allocator, &w_shape, 1.5),
+    );
+    const b_shape = [_]usize{4};
+    try st.tensors.put(
+        try allocator.dupe(u8, "encoder.bias"),
+        try Tensor.initZeros(allocator, &b_shape),
+    );
+
+    const bytes = try st.writeToSlice(allocator);
+    defer allocator.free(bytes);
+
+    const header_len: usize = @intCast(std.mem.readInt(u64, bytes[0..8], .little));
+    const entries = try parseHeaderEntries(allocator, bytes[8 .. 8 + header_len]);
+    defer {
+        for (entries) |entry| {
+            allocator.free(entry.name);
+            allocator.free(entry.shape);
+        }
+        allocator.free(entries);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    // Entries come back sorted by name.
+    try std.testing.expectEqualStrings("encoder.bias", entries[0].name);
+    try std.testing.expectEqualStrings("encoder.weight", entries[1].name);
+    try std.testing.expectEqualSlices(usize, &b_shape, entries[0].shape);
+    try std.testing.expectEqual(DType.F32, entries[1].dtype);
+    try std.testing.expectEqual(@as(usize, 6), entries[1].numElements());
+    try std.testing.expectEqual(@as(usize, 24), entries[1].byteLen());
+
+    var loaded = try SafeTensors.loadFromSlice(allocator, bytes);
+    defer loaded.deinit();
+    const weight = loaded.tensors.get("encoder.weight").?;
+    try std.testing.expectEqual(@as(f32, 1.5), weight.data[0]);
+}

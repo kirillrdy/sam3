@@ -119,6 +119,7 @@ pub fn conv2d(
     return out;
 }
 
+
 pub fn convTranspose2d(
     allocator: std.mem.Allocator,
     input: Tensor,
@@ -146,49 +147,149 @@ pub fn convTranspose2d(
     const out_shape = [_]usize{ batch, c_out, h_out, w_out };
     var out = try Tensor.initZeros(allocator, &out_shape);
 
-    for (0..batch) |b| {
-        for (0..c_in) |ci| {
-            for (0..h_in) |ih| {
-                for (0..w_in) |iw| {
-                    const in_val = input.at4(b, ci, ih, iw);
-                    if (in_val == 0.0) continue;
+    // Gathering per output pixel (rather than scattering per input pixel) keeps
+    // every task's writes disjoint, so the batch/channel loop parallelises.
+    const Context = struct {
+        input: Tensor,
+        weight: Tensor,
+        bias: ?Tensor,
+        out: *Tensor,
+        c_in: usize,
+        h_in: usize,
+        w_in: usize,
+        c_out: usize,
+        k_h: usize,
+        k_w: usize,
+        h_out: usize,
+        w_out: usize,
+        stride: usize,
+        padding: usize,
+    };
 
-                    for (0..c_out) |co| {
-                        for (0..k_h) |kh| {
-                            const oh_signed = @as(isize, @intCast(ih * stride + kh)) - @as(isize, @intCast(padding));
-                            if (oh_signed < 0 or oh_signed >= h_out) continue;
-                            const oh: usize = @intCast(oh_signed);
+    var ctx = Context{
+        .input = input,
+        .weight = weight,
+        .bias = bias,
+        .out = &out,
+        .c_in = c_in,
+        .h_in = h_in,
+        .w_in = w_in,
+        .c_out = c_out,
+        .k_h = k_h,
+        .k_w = k_w,
+        .h_out = h_out,
+        .w_out = w_out,
+        .stride = stride,
+        .padding = padding,
+    };
 
-                            for (0..k_w) |kw| {
-                                const ow_signed = @as(isize, @intCast(iw * stride + kw)) - @as(isize, @intCast(padding));
-                                if (ow_signed < 0 or ow_signed >= w_out) continue;
-                                const ow: usize = @intCast(ow_signed);
+    parallel.parallelFor(allocator, batch * c_out, &ctx, struct {
+        fn worker(c: *Context, start: usize, end: usize) void {
+            for (start..end) |task| {
+                const b = task / c.c_out;
+                const co = task % c.c_out;
+                const b_val = if (c.bias) |bi| bi.data[co] else 0.0;
 
-                                const w_val = weight.at4(ci, co, kh, kw);
-                                const curr = out.at4(b, co, oh, ow);
-                                out.set4(b, co, oh, ow, curr + in_val * w_val);
+                for (0..c.h_out) |oh| {
+                    for (0..c.w_out) |ow| {
+                        var sum: f32 = b_val;
+
+                        for (0..c.k_h) |kh| {
+                            // oh = ih * stride + kh - padding
+                            const num_h = @as(isize, @intCast(oh + c.padding)) - @as(isize, @intCast(kh));
+                            if (num_h < 0) continue;
+                            if (@rem(num_h, @as(isize, @intCast(c.stride))) != 0) continue;
+                            const ih = @as(usize, @intCast(@divExact(num_h, @as(isize, @intCast(c.stride)))));
+                            if (ih >= c.h_in) continue;
+
+                            for (0..c.k_w) |kw| {
+                                const num_w = @as(isize, @intCast(ow + c.padding)) - @as(isize, @intCast(kw));
+                                if (num_w < 0) continue;
+                                if (@rem(num_w, @as(isize, @intCast(c.stride))) != 0) continue;
+                                const iw = @as(usize, @intCast(@divExact(num_w, @as(isize, @intCast(c.stride)))));
+                                if (iw >= c.w_in) continue;
+
+                                for (0..c.c_in) |ci| {
+                                    sum += c.input.at4(b, ci, ih, iw) * c.weight.at4(ci, co, kh, kw);
+                                }
                             }
                         }
-                    }
-                }
-            }
-        }
 
-        if (bias) |bi| {
-            for (0..c_out) |co| {
-                const b_val = bi.data[co];
-                for (0..h_out) |oh| {
-                    for (0..w_out) |ow| {
-                        const curr = out.at4(b, co, oh, ow);
-                        out.set4(b, co, oh, ow, curr + b_val);
+                        c.out.set4(b, co, oh, ow, sum);
                     }
                 }
             }
         }
-    }
+    }.worker);
 
     return out;
 }
+
+/// Non-overlapping max pooling, matching `nn.MaxPool2d(kernel_size, stride)`.
+pub fn maxPool2d(
+    allocator: std.mem.Allocator,
+    input: Tensor,
+    kernel: usize,
+    stride: usize,
+) !Tensor {
+    std.debug.assert(input.shape.len == 4);
+
+    const batch = input.shape[0];
+    const channels = input.shape[1];
+    const h_in = input.shape[2];
+    const w_in = input.shape[3];
+
+    const h_out = (h_in - kernel) / stride + 1;
+    const w_out = (w_in - kernel) / stride + 1;
+
+    const out_shape = [_]usize{ batch, channels, h_out, w_out };
+    var out = try Tensor.init(allocator, &out_shape);
+
+    const Context = struct {
+        input: Tensor,
+        out: *Tensor,
+        channels: usize,
+        h_out: usize,
+        w_out: usize,
+        kernel: usize,
+        stride: usize,
+    };
+
+    var ctx = Context{
+        .input = input,
+        .out = &out,
+        .channels = channels,
+        .h_out = h_out,
+        .w_out = w_out,
+        .kernel = kernel,
+        .stride = stride,
+    };
+
+    parallel.parallelFor(allocator, batch * channels, &ctx, struct {
+        fn worker(c: *Context, start: usize, end: usize) void {
+            for (start..end) |task| {
+                const b = task / c.channels;
+                const ch = task % c.channels;
+
+                for (0..c.h_out) |oh| {
+                    for (0..c.w_out) |ow| {
+                        var best: f32 = -std.math.inf(f32);
+                        for (0..c.kernel) |kh| {
+                            for (0..c.kernel) |kw| {
+                                const v = c.input.at4(b, ch, oh * c.stride + kh, ow * c.stride + kw);
+                                if (v > best) best = v;
+                            }
+                        }
+                        c.out.set4(b, ch, oh, ow, best);
+                    }
+                }
+            }
+        }
+    }.worker);
+
+    return out;
+}
+
 
 pub fn bilinearUpsample(
     allocator: std.mem.Allocator,
@@ -433,4 +534,65 @@ test "Conv2D and BilinearUpsample" {
 
     try std.testing.expectEqual(@as(usize, 4), up.shape[2]);
     try std.testing.expectEqual(@as(usize, 4), up.shape[3]);
+}
+
+test "ConvTranspose2D matches hand-computed overlap-add" {
+    const allocator = std.testing.allocator;
+
+    const shape = [_]usize{ 1, 1, 2, 2 };
+    var input = try Tensor.init(allocator, &shape);
+    defer input.deinit();
+    input.data[0] = 1; input.data[1] = 2;
+    input.data[2] = 3; input.data[3] = 4;
+
+    var weight = try Tensor.init(allocator, &shape);
+    defer weight.deinit();
+    weight.data[0] = 1; weight.data[1] = 2;
+    weight.data[2] = 3; weight.data[3] = 4;
+
+    // stride 2: each input pixel stamps a disjoint copy of the kernel.
+    var strided = try convTranspose2d(allocator, input, weight, null, 2, 0);
+    defer strided.deinit();
+    const expect_stride2 = [_]f32{
+        1, 2, 2,  4,
+        3, 4, 6,  8,
+        3, 6, 4,  8,
+        9, 12, 12, 16,
+    };
+    try std.testing.expectEqual(@as(usize, 4), strided.shape[2]);
+    for (expect_stride2, strided.data) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
+    }
+
+    // stride 1: neighbouring stamps overlap and accumulate.
+    var overlapped = try convTranspose2d(allocator, input, weight, null, 1, 0);
+    defer overlapped.deinit();
+    const expect_stride1 = [_]f32{
+        1, 4,  4,
+        6, 20, 16,
+        9, 24, 16,
+    };
+    try std.testing.expectEqual(@as(usize, 3), overlapped.shape[2]);
+    for (expect_stride1, overlapped.data) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
+    }
+}
+
+test "MaxPool2D halves a feature map" {
+    const allocator = std.testing.allocator;
+
+    const shape = [_]usize{ 1, 1, 4, 4 };
+    var input = try Tensor.init(allocator, &shape);
+    defer input.deinit();
+    for (input.data, 0..) |*v, i| v.* = @floatFromInt(i);
+
+    var pooled = try maxPool2d(allocator, input, 2, 2);
+    defer pooled.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), pooled.shape[2]);
+    try std.testing.expectEqual(@as(usize, 2), pooled.shape[3]);
+    const expected = [_]f32{ 5, 7, 13, 15 };
+    for (expected, pooled.data) |e, a| {
+        try std.testing.expectEqual(e, a);
+    }
 }

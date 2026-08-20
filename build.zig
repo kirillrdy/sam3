@@ -28,6 +28,11 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
+    const zigimg = b.dependency("zigimg", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const mod = b.addModule("sam3", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
@@ -39,6 +44,9 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        .imports = &.{
+            .{ .name = "zigimg", .module = zigimg.module("zigimg") },
+        },
     });
 
     // Here we define an executable. An executable needs to have a root module
@@ -141,6 +149,104 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // --- Asset fetching -----------------------------------------------------
+    //
+    // `zig build fetch-weights` and `zig build fetch-examples` download what the
+    // model needs through a small Zig downloader, so a checkout needs no curl,
+    // no shell and no image tooling. Both steps are idempotent: a file that is
+    // already present and matches its published SHA-256 is left alone.
+    //
+    // The checkpoint is not a `build.zig.zon` dependency on purpose. It is
+    // 3.2 GiB, `facebook/sam3` is gated behind a manual approval form, and the
+    // package manager cannot send the `Authorization` header that unlocks it —
+    // so the download is verified against Meta's published SHA-256 instead of a
+    // package hash.
+
+    const fetch_exe = b.addExecutable(.{
+        .name = "fetch",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/fetch.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+
+    const hf_repo = b.option(
+        []const u8,
+        "hf-repo",
+        "Hugging Face repo to pull SAM 3 from (default: a public mirror; set HF_TOKEN and pass facebook/sam3 for the official one)",
+    ) orelse "jetjodh/sam3";
+
+    const weights_step = b.step("fetch-weights", "Download Meta's SAM 3 checkpoint and tokenizer assets");
+
+    const checkpoint = b.addRunArtifact(fetch_exe);
+    checkpoint.has_side_effects = true;
+    checkpoint.setCwd(b.path("."));
+    checkpoint.addArgs(&.{
+        "--url",
+        b.fmt("https://huggingface.co/{s}/resolve/main/model.safetensors", .{hf_repo}),
+        "--out",
+        "sam3.safetensors",
+        // Meta's published checksum for the 859.9M-parameter F32 checkpoint.
+        "--sha256",
+        "6d06f0a5f84e435071fe6603e61d0b4cc7b40e0d39d487cfd4d67d8cc11cc14a",
+        "--token-env",
+        "HF_TOKEN",
+        "--label",
+        "sam3.safetensors (3.2 GiB)",
+    });
+    weights_step.dependOn(&checkpoint.step);
+
+    for ([_][]const u8{
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "vocab.json",
+        "merges.txt",
+        "LICENSE",
+    }) |asset| {
+        const run = b.addRunArtifact(fetch_exe);
+        run.has_side_effects = true;
+        run.setCwd(b.path("."));
+        run.addArgs(&.{
+            "--url",
+            b.fmt("https://huggingface.co/{s}/resolve/main/{s}", .{ hf_repo, asset }),
+            "--out",
+            b.fmt("assets/sam3/{s}", .{asset}),
+            "--token-env",
+            "HF_TOKEN",
+            "--label",
+            asset,
+        });
+        weights_step.dependOn(&run.step);
+    }
+
+    // The four sample images the SAM 3 playground offers, as PNG (the CLI
+    // decodes PNG and PPM natively). No checksums: Unsplash re-encodes on
+    // demand, so pinning bytes would be a false promise.
+    const examples_step = b.step("fetch-examples", "Download the playground sample images");
+
+    for ([_][2][]const u8{
+        .{ "dog", "photo-1543466835-00a7907e9de1" },
+        .{ "cat", "photo-1514888286974-6c03e2ca1dba" },
+        .{ "person", "photo-1507003211169-0a1dd7228f2d" },
+        .{ "car", "photo-1459603677915-a62079ffd002" },
+    }) |example| {
+        const run = b.addRunArtifact(fetch_exe);
+        run.has_side_effects = true;
+        run.setCwd(b.path("."));
+        run.addArgs(&.{
+            "--url",
+            b.fmt("https://images.unsplash.com/{s}?w=800&fm=png", .{example[1]}),
+            "--out",
+            b.fmt("assets/examples/{s}.png", .{example[0]}),
+            "--label",
+            b.fmt("{s}.png", .{example[0]}),
+        });
+        examples_step.dependOn(&run.step);
+    }
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

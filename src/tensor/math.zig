@@ -51,10 +51,25 @@ pub inline fn quickGelu(x: f32) f32 {
     return x * sigmoid(1.702 * x);
 }
 
-pub fn applyActivation(t: *Tensor, act_type: enum { gelu, quick_gelu, silu, relu, sigmoid }) void {
+/// Gauss error function, Abramowitz & Stegun 7.1.26 (max abs error 1.5e-7).
+pub inline fn erf(x: f32) f32 {
+    const sign: f32 = if (x < 0.0) -1.0 else 1.0;
+    const ax = @abs(x);
+    const t = 1.0 / (1.0 + 0.3275911 * ax);
+    const y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * @exp(-ax * ax);
+    return sign * y;
+}
+
+/// Exact GELU (`nn.GELU()` / HF `"gelu"`), as opposed to the tanh approximation.
+pub inline fn geluExact(x: f32) f32 {
+    return 0.5 * x * (1.0 + erf(x * std.math.sqrt1_2));
+}
+
+pub fn applyActivation(t: *Tensor, act_type: enum { gelu, gelu_exact, quick_gelu, silu, relu, sigmoid }) void {
     for (t.data) |*v| {
         v.* = switch (act_type) {
             .gelu => gelu(v.*),
+            .gelu_exact => geluExact(v.*),
             .quick_gelu => quickGelu(v.*),
             .silu => silu(v.*),
             .relu => relu(v.*),
@@ -380,4 +395,13 @@ test "LayerNorm" {
 
     try std.testing.expectApproxEqAbs(@as(f32, -1.0), normed.at2(0, 0), 1e-3);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), normed.at2(0, 1), 1e-3);
+}
+
+test "Exact GELU matches reference values" {
+    // Reference: torch.nn.functional.gelu (erf formulation).
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), geluExact(0.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8413447), geluExact(1.0), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.1586553), geluExact(-1.0), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.9544997), geluExact(2.0), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.0040495), geluExact(-3.0), 1e-5);
 }

@@ -76,6 +76,35 @@ pub const SAM3Config = struct {
         };
     }
 
+    /// Dimensions of Meta's released SAM 3 checkpoint (`facebook/sam3`,
+    /// 859.9M parameters). Verified against the checkpoint header by
+    /// `sam3 weights <file> --verify`.
+    pub fn sam3_full() SAM3Config {
+        return SAM3Config{
+            .image_size = 1008,
+            .patch_size = 14,
+            .encoder_embed_dim = 1024,
+            .encoder_num_heads = 16,
+            .encoder_depth = 32,
+            // The vision backbone MLP widens 1024 -> 4736.
+            .encoder_mlp_ratio = 4.625,
+            .prompt_embed_dim = 256,
+            .text_vocab_size = 49408,
+            .text_max_seq_len = 32,
+            .text_num_layers = 24,
+            .presence_threshold = 0.5,
+            .presence_head_dim = 256,
+            .num_object_queries = 200,
+            .mask_decoder_num_heads = 8,
+            .mask_decoder_depth = 6,
+            .mask_decoder_num_multimask_outputs = 3,
+            .mask_decoder_iou_head_depth = 3,
+            .memory_bank_size = 7,
+            .memory_dim = 64,
+            .num_maskmem_features = 64,
+        };
+    }
+
     pub inline fn gridH(self: SAM3Config) usize {
         return self.image_size / self.patch_size;
     }

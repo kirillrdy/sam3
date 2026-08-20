@@ -1,6 +1,7 @@
 const std = @import("std");
 const Tensor = @import("../tensor/tensor.zig").Tensor;
 const parallel = @import("../tensor/parallel.zig");
+const zigimg = @import("zigimg");
 
 pub const RGB = struct {
     r: u8,
@@ -259,3 +260,89 @@ pub const ImageRGB = struct {
         _ = std.os.linux.write(fd, file_buf.ptr, file_buf.len);
     }
 };
+
+/// Reads an image file. PPM goes through the loader in this file; everything
+/// else (PNG, JPEG, BMP, ...) is decoded by zigimg.
+pub fn load(allocator: std.mem.Allocator, file_path: []const u8) !ImageRGB {
+    if (std.mem.endsWith(u8, file_path, ".ppm")) return ImageRGB.loadPPM(allocator, file_path);
+
+    const bytes = try readFileAlloc(allocator, file_path);
+    defer allocator.free(bytes);
+    return decode(allocator, bytes);
+}
+
+fn readFileAlloc(allocator: std.mem.Allocator, file_path: []const u8) ![]u8 {
+    var path_z: [1024]u8 = undefined;
+    if (file_path.len >= path_z.len) return error.PathTooLong;
+    @memcpy(path_z[0..file_path.len], file_path);
+    path_z[file_path.len] = 0;
+    const p_slice: [:0]const u8 = path_z[0..file_path.len :0];
+
+    const fd_res = std.os.linux.open(p_slice, .{ .ACCMODE = .RDONLY }, 0);
+    const signed: isize = @bitCast(fd_res);
+    if (signed < 0) return error.FileNotFound;
+    const fd: i32 = @intCast(signed);
+    defer _ = std.os.linux.close(fd);
+
+    const size = std.os.linux.lseek(fd, 0, 2);
+    _ = std.os.linux.lseek(fd, 0, 0);
+
+    const buf = try allocator.alloc(u8, size);
+    errdefer allocator.free(buf);
+
+    var read_total: usize = 0;
+    while (read_total < buf.len) {
+        const n = std.os.linux.read(fd, buf.ptr + read_total, buf.len - read_total);
+        if (n == 0) break;
+        read_total += n;
+    }
+    return buf[0..read_total];
+}
+/// Decodes any format zigimg understands (PNG, JPEG, BMP, TGA, QOI, GIF, ...)
+/// and flattens it to 8-bit RGB.
+pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !ImageRGB {
+    var decoded = try zigimg.Image.fromMemory(allocator, bytes);
+    defer decoded.deinit(allocator);
+
+    try decoded.convert(allocator, .rgb24);
+
+    var out = try ImageRGB.init(allocator, decoded.width, decoded.height);
+    errdefer out.deinit();
+
+    for (decoded.pixels.rgb24, 0..) |px, i| {
+        out.data[i * 3] = px.r;
+        out.data[i * 3 + 1] = px.g;
+        out.data[i * 3 + 2] = px.b;
+    }
+    return out;
+}
+
+test "decodes a PNG round-tripped through zigimg" {
+    const allocator = std.testing.allocator;
+
+    var source = try zigimg.Image.create(allocator, 4, 3, .rgb24);
+    defer source.deinit(allocator);
+
+    for (source.pixels.rgb24, 0..) |*px, i| {
+        px.* = .{ .r = @intCast(i * 5), .g = @intCast(255 - i * 5), .b = @intCast(i * 2) };
+    }
+
+    var encode_buf: [8192]u8 = undefined;
+    const png = try source.writeToMemory(allocator, &encode_buf, .{ .png = .{} });
+
+    var img = try decode(allocator, png);
+    defer img.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), img.width);
+    try std.testing.expectEqual(@as(usize, 3), img.height);
+    for (source.pixels.rgb24, 0..) |px, i| {
+        try std.testing.expectEqual(px.r, img.data[i * 3]);
+        try std.testing.expectEqual(px.g, img.data[i * 3 + 1]);
+        try std.testing.expectEqual(px.b, img.data[i * 3 + 2]);
+    }
+}
+
+test "rejects data that is not an image" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.Unsupported, decode(allocator, "not an image at all"));
+}
