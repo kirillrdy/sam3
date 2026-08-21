@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const tensor = @import("tensor/tensor.zig");
+pub const pool = @import("tensor/pool.zig");
 pub const math = @import("tensor/math.zig");
 pub const ops = @import("tensor/ops.zig");
 pub const safetensors = @import("weights/safetensors.zig");

@@ -183,6 +183,14 @@ fn openReadOnly(file_path: []const u8) !struct { fd: i32, size: usize } {
     return .{ .fd = fd, .size = size };
 }
 
+/// Whether a checkpoint is readable at `file_path`, so callers can say
+/// something useful about a missing one before starting any work.
+pub fn exists(file_path: []const u8) bool {
+    const file = openReadOnly(file_path) catch return false;
+    _ = std.os.linux.close(file.fd);
+    return true;
+}
+
 fn readExactly(fd: i32, buffer: []u8) !void {
     var total_read: usize = 0;
     while (total_read < buffer.len) {

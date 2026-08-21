@@ -718,6 +718,29 @@ pub fn segmentWithPoints(
 
     var image_embedding = try fpn_levels[2].clone(allocator);
     defer image_embedding.deinit();
+
+    // A frame with no memory bank behind it gets the learned "no memory"
+    // embedding added to the coarsest level, exactly as the reference does
+    // before running the SAM heads on the first frame.
+    {
+        var name_buf: [128]u8 = undefined;
+        const no_memory = try param(
+            weights,
+            &name_buf,
+            "{s}.no_memory_embedding",
+            .{cfg.prefix},
+            &[_]usize{ 1, 1, cfg.hidden_size },
+            .zeros,
+            15,
+        );
+
+        const plane = image_embedding.shape[2] * image_embedding.shape[3];
+        for (0..cfg.hidden_size) |c| {
+            const v = no_memory.data[c];
+            for (image_embedding.data[c * plane ..][0..plane]) |*x| x.* += v;
+        }
+    }
+
     image_embedding.addInPlace(dense);
 
     var positional = try imagePositionalEmbeddings(allocator, cfg, weights);

@@ -1,7 +1,83 @@
 const std = @import("std");
 const Tensor = @import("tensor.zig").Tensor;
 const math = @import("math.zig");
+const gemm = @import("gemm.zig");
 const parallel = @import("parallel.zig");
+
+const VEC = gemm.VEC;
+const Vec = gemm.Vec;
+
+/// Output columns held in vector registers while the channel and kernel loops
+/// run underneath them, so each accumulator is written to memory once.
+const OW_TILE = 4 * VEC;
+
+/// Copies `[N, C, H, W]` into `[N, C, H + 2p, W + 2p]` with a zero border, so
+/// the convolution inner loop needs no bounds checks.
+fn zeroPad(allocator: std.mem.Allocator, input: Tensor, pad: usize) !Tensor {
+    const batch = input.shape[0];
+    const channels = input.shape[1];
+    const h = input.shape[2];
+    const w = input.shape[3];
+
+    const shape = [_]usize{ batch, channels, h + 2 * pad, w + 2 * pad };
+    var out = try Tensor.initZeros(allocator, &shape);
+    errdefer out.deinit();
+
+    const w_pad = w + 2 * pad;
+    for (0..batch * channels) |plane| {
+        const src_plane = input.data[plane * h * w ..][0 .. h * w];
+        const dst_plane = out.data[plane * (h + 2 * pad) * w_pad ..][0 .. (h + 2 * pad) * w_pad];
+        for (0..h) |y| {
+            @memcpy(dst_plane[(y + pad) * w_pad + pad ..][0..w], src_plane[y * w ..][0..w]);
+        }
+    }
+
+    return out;
+}
+
+/// A 1x1 convolution is `[C_out, C_in] . [C_in, H*W]`, so it goes straight to
+/// the blocked GEMM.
+fn conv2dPointwise(
+    allocator: std.mem.Allocator,
+    input: Tensor,
+    weight: Tensor,
+    bias: ?Tensor,
+    out: *Tensor,
+) !void {
+    const batch = input.shape[0];
+    const c_in = input.shape[1];
+    const plane = input.shape[2] * input.shape[3];
+    const c_out = weight.shape[0];
+
+    for (0..batch) |b| {
+        try gemm.gemm(
+            allocator,
+            c_out,
+            plane,
+            c_in,
+            weight.data,
+            c_in,
+            input.data[b * c_in * plane ..][0 .. c_in * plane],
+            plane,
+            .row_major,
+            null,
+            out.data[b * c_out * plane ..][0 .. c_out * plane],
+        );
+
+        if (bias) |bi| {
+            for (0..c_out) |co| {
+                const row = out.data[(b * c_out + co) * plane ..][0..plane];
+                const bv: Vec = @splat(bi.data[co]);
+                var i: usize = 0;
+                while (i + VEC <= plane) : (i += VEC) {
+                    const v: Vec = row[i..][0..VEC].*;
+                    row[i..][0..VEC].* = v + bv;
+                }
+                while (i < plane) : (i += 1) row[i] += bi.data[co];
+            }
+        }
+    }
+}
 
 pub fn conv2d(
     allocator: std.mem.Allocator,
@@ -30,86 +106,117 @@ pub fn conv2d(
     const w_out = (w_in + 2 * padding - k_w) / stride + 1;
 
     const out_shape = [_]usize{ batch, c_out, h_out, w_out };
-    var out = try Tensor.initZeros(allocator, &out_shape);
+    var out = try Tensor.init(allocator, &out_shape);
+    errdefer out.deinit();
+
+    if (k_h == 1 and k_w == 1 and stride == 1 and padding == 0) {
+        try conv2dPointwise(allocator, input, weight, bias, &out);
+        return out;
+    }
+
+    // Padding is materialised once rather than tested per tap.
+    var padded: ?Tensor = if (padding > 0) try zeroPad(allocator, input, padding) else null;
+    defer if (padded) |*p| p.deinit();
+    const src = if (padded) |p| p else input;
+    const h_src = src.shape[2];
+    const w_src = src.shape[3];
 
     const Context = struct {
-        input: Tensor,
+        src: Tensor,
         weight: Tensor,
         bias: ?Tensor,
         out: *Tensor,
-        batch: usize,
         c_in: usize,
-        h_in: usize,
-        w_in: usize,
+        h_src: usize,
+        w_src: usize,
         c_out: usize,
         k_h: usize,
         k_w: usize,
         h_out: usize,
         w_out: usize,
         stride: usize,
-        padding: usize,
     };
 
     var ctx = Context{
-        .input = input,
+        .src = src,
         .weight = weight,
         .bias = bias,
         .out = &out,
-        .batch = batch,
         .c_in = c_in,
-        .h_in = h_in,
-        .w_in = w_in,
+        .h_src = h_src,
+        .w_src = w_src,
         .c_out = c_out,
         .k_h = k_h,
         .k_w = k_w,
         .h_out = h_out,
         .w_out = w_out,
         .stride = stride,
-        .padding = padding,
     };
 
-    const total_tasks = batch * c_out;
-    parallel.parallelFor(allocator, total_tasks, &ctx, struct {
+    parallel.parallelFor(allocator, batch * c_out, &ctx, struct {
         fn worker(c: *Context, start: usize, end: usize) void {
-            const c_o_total = c.c_out;
-            const h_o = c.h_out;
-            const w_o = c.w_out;
-            const c_i_total = c.c_in;
-            const h_i = c.h_in;
-            const w_i = c.w_in;
-            const kh_max = c.k_h;
-            const kw_max = c.k_w;
-            const st = c.stride;
-            const pad = c.padding;
+            const plane_src = c.h_src * c.w_src;
+            const taps = c.k_h * c.k_w;
 
             for (start..end) |task| {
-                const b = task / c_o_total;
-                const co = task % c_o_total;
-                const b_val = if (c.bias) |bi| bi.data[co] else 0.0;
+                const b = task / c.c_out;
+                const co = task % c.c_out;
+                const bias_val = if (c.bias) |bi| bi.data[co] else 0.0;
+                const w_base = co * c.c_in * taps;
 
-                for (0..h_o) |oh| {
-                    for (0..w_o) |ow| {
-                        var sum: f32 = b_val;
-                        const ih_start = @as(isize, @intCast(oh * st)) - @as(isize, @intCast(pad));
-                        const iw_start = @as(isize, @intCast(ow * st)) - @as(isize, @intCast(pad));
+                for (0..c.h_out) |oh| {
+                    const out_row = c.out.data[(task * c.h_out + oh) * c.w_out ..][0..c.w_out];
 
-                        for (0..c_i_total) |ci| {
-                            for (0..kh_max) |kh| {
-                                const ih = ih_start + @as(isize, @intCast(kh));
-                                if (ih < 0 or ih >= h_i) continue;
+                    if (c.stride == 1) {
+                        // Tiled over output columns: the tile stays in registers
+                        // across every input channel and kernel tap.
+                        var ow0: usize = 0;
+                        while (ow0 < c.w_out) : (ow0 += OW_TILE) {
+                            const width = @min(OW_TILE, c.w_out - ow0);
+                            var acc: [OW_TILE]f32 = @splat(bias_val);
 
-                                for (0..kw_max) |kw| {
-                                    const iw = iw_start + @as(isize, @intCast(kw));
-                                    if (iw < 0 or iw >= w_i) continue;
+                            for (0..c.c_in) |ci| {
+                                const in_plane = c.src.data[(b * c.c_in + ci) * plane_src ..][0..plane_src];
+                                const w_ch = c.weight.data[w_base + ci * taps ..][0..taps];
 
-                                    const in_val = c.input.at4(b, ci, @intCast(ih), @intCast(iw));
-                                    const w_val = c.weight.at4(co, ci, kh, kw);
-                                    sum += in_val * w_val;
+                                for (0..c.k_h) |kh| {
+                                    const in_row = in_plane[(oh + kh) * c.w_src ..];
+                                    for (0..c.k_w) |kw| {
+                                        const wv = w_ch[kh * c.k_w + kw];
+                                        if (wv == 0.0) continue;
+                                        const tap = in_row[ow0 + kw ..];
+
+                                        if (width == OW_TILE) {
+                                            const wsplat: Vec = @splat(wv);
+                                            inline for (0..OW_TILE / VEC) |t| {
+                                                const iv: Vec = tap[t * VEC ..][0..VEC].*;
+                                                const av: Vec = acc[t * VEC ..][0..VEC].*;
+                                                acc[t * VEC ..][0..VEC].* = av + wsplat * iv;
+                                            }
+                                        } else {
+                                            for (0..width) |t| acc[t] += wv * tap[t];
+                                        }
+                                    }
                                 }
                             }
-                        }
 
-                        c.out.set4(b, co, oh, ow, sum);
+                            @memcpy(out_row[ow0..][0..width], acc[0..width]);
+                        }
+                    } else {
+                        // Strided: contiguity over output columns is gone, so
+                        // reduce along the (contiguous) kernel row instead.
+                        for (0..c.w_out) |ow| {
+                            var sum: f32 = bias_val;
+                            for (0..c.c_in) |ci| {
+                                const in_plane = c.src.data[(b * c.c_in + ci) * plane_src ..][0..plane_src];
+                                const w_ch = c.weight.data[w_base + ci * taps ..][0..taps];
+                                for (0..c.k_h) |kh| {
+                                    const in_row = in_plane[(oh * c.stride + kh) * c.w_src + ow * c.stride ..][0..c.k_w];
+                                    sum += math.dotProduct(in_row, w_ch[kh * c.k_w ..][0..c.k_w]);
+                                }
+                            }
+                            out_row[ow] = sum;
+                        }
                     }
                 }
             }
@@ -119,6 +226,73 @@ pub fn conv2d(
     return out;
 }
 
+
+/// `convTranspose2d` for `kernel == stride`, `padding == 0`: one GEMM per kernel
+/// tap, each writing a disjoint sub-lattice of the output.
+fn convTranspose2dStrided(
+    allocator: std.mem.Allocator,
+    input: Tensor,
+    weight: Tensor,
+    bias: ?Tensor,
+    stride: usize,
+    out: *Tensor,
+) !void {
+    const batch = input.shape[0];
+    const c_in = input.shape[1];
+    const h_in = input.shape[2];
+    const w_in = input.shape[3];
+    const c_out = weight.shape[1];
+
+    const plane_in = h_in * w_in;
+    const taps = stride * stride;
+    const w_out = w_in * stride;
+
+    // weight is [C_in, C_out, k, k]; the GEMM wants [C_out, C_in] per tap.
+    const tap_weights = try allocator.alloc(f32, c_out * c_in);
+    defer allocator.free(tap_weights);
+
+    const product = try allocator.alloc(f32, c_out * plane_in);
+    defer allocator.free(product);
+
+    for (0..batch) |b| {
+        for (0..taps) |tap| {
+            const kh = tap / stride;
+            const kw = tap % stride;
+
+            for (0..c_out) |co| {
+                for (0..c_in) |ci| {
+                    tap_weights[co * c_in + ci] = weight.data[((ci * c_out + co) * stride + kh) * stride + kw];
+                }
+            }
+
+            try gemm.gemm(
+                allocator,
+                c_out,
+                plane_in,
+                c_in,
+                tap_weights,
+                c_in,
+                input.data[b * c_in * plane_in ..][0 .. c_in * plane_in],
+                plane_in,
+                .row_major,
+                null,
+                product,
+            );
+
+            for (0..c_out) |co| {
+                const bias_val = if (bias) |bi| bi.data[co] else 0.0;
+                const src = product[co * plane_in ..][0..plane_in];
+                for (0..h_in) |ih| {
+                    const dst_row = out.data[((b * c_out + co) * h_in * stride + ih * stride + kh) * w_out ..][0..w_out];
+                    const src_row = src[ih * w_in ..][0..w_in];
+                    for (0..w_in) |iw| {
+                        dst_row[iw * stride + kw] = src_row[iw] + bias_val;
+                    }
+                }
+            }
+        }
+    }
+}
 
 pub fn convTranspose2d(
     allocator: std.mem.Allocator,
@@ -146,6 +320,16 @@ pub fn convTranspose2d(
 
     const out_shape = [_]usize{ batch, c_out, h_out, w_out };
     var out = try Tensor.initZeros(allocator, &out_shape);
+    errdefer out.deinit();
+
+    // The FPN scale layers all use kernel == stride with no padding. Each output
+    // pixel then comes from exactly one input pixel and one kernel tap, so the
+    // whole thing is `stride * stride` independent GEMMs of
+    // `[C_out, C_in] . [C_in, H_in*W_in]` scattered into the output grid.
+    if (k_h == stride and k_w == stride and padding == 0) {
+        try convTranspose2dStrided(allocator, input, weight, bias, stride, &out);
+        return out;
+    }
 
     // Gathering per output pixel (rather than scattering per input pixel) keeps
     // every task's writes disjoint, so the batch/channel loop parallelises.
@@ -594,5 +778,182 @@ test "MaxPool2D halves a feature map" {
     const expected = [_]f32{ 5, 7, 13, 15 };
     for (expected, pooled.data) |e, a| {
         try std.testing.expectEqual(e, a);
+    }
+}
+
+/// Textbook definition, used to pin the blocked/GEMM paths above.
+fn referenceConv2d(
+    allocator: std.mem.Allocator,
+    input: Tensor,
+    weight: Tensor,
+    bias: ?Tensor,
+    stride: usize,
+    padding: usize,
+) !Tensor {
+    const batch = input.shape[0];
+    const c_in = input.shape[1];
+    const h_in = input.shape[2];
+    const w_in = input.shape[3];
+    const c_out = weight.shape[0];
+    const k_h = weight.shape[2];
+    const k_w = weight.shape[3];
+    const h_out = (h_in + 2 * padding - k_h) / stride + 1;
+    const w_out = (w_in + 2 * padding - k_w) / stride + 1;
+
+    const shape = [_]usize{ batch, c_out, h_out, w_out };
+    var out = try Tensor.init(allocator, &shape);
+    errdefer out.deinit();
+
+    for (0..batch) |b| {
+        for (0..c_out) |co| {
+            for (0..h_out) |oh| {
+                for (0..w_out) |ow| {
+                    var sum: f32 = if (bias) |bi| bi.data[co] else 0.0;
+                    for (0..c_in) |ci| {
+                        for (0..k_h) |kh| {
+                            const ih = @as(isize, @intCast(oh * stride + kh)) - @as(isize, @intCast(padding));
+                            if (ih < 0 or ih >= h_in) continue;
+                            for (0..k_w) |kw| {
+                                const iw = @as(isize, @intCast(ow * stride + kw)) - @as(isize, @intCast(padding));
+                                if (iw < 0 or iw >= w_in) continue;
+                                sum += input.at4(b, ci, @intCast(ih), @intCast(iw)) * weight.at4(co, ci, kh, kw);
+                            }
+                        }
+                    }
+                    out.set4(b, co, oh, ow, sum);
+                }
+            }
+        }
+    }
+    return out;
+}
+
+fn referenceConvTranspose2d(
+    allocator: std.mem.Allocator,
+    input: Tensor,
+    weight: Tensor,
+    bias: ?Tensor,
+    stride: usize,
+    padding: usize,
+) !Tensor {
+    const batch = input.shape[0];
+    const c_in = input.shape[1];
+    const h_in = input.shape[2];
+    const w_in = input.shape[3];
+    const c_out = weight.shape[1];
+    const k_h = weight.shape[2];
+    const k_w = weight.shape[3];
+    const h_out = (h_in - 1) * stride - 2 * padding + k_h;
+    const w_out = (w_in - 1) * stride - 2 * padding + k_w;
+
+    const shape = [_]usize{ batch, c_out, h_out, w_out };
+    var out = try Tensor.initZeros(allocator, &shape);
+    errdefer out.deinit();
+
+    for (0..batch) |b| {
+        for (0..c_out) |co| {
+            for (0..h_out * w_out) |i| {
+                out.data[(b * c_out + co) * h_out * w_out + i] = if (bias) |bi| bi.data[co] else 0.0;
+            }
+        }
+    }
+
+    for (0..batch) |b| {
+        for (0..c_in) |ci| {
+            for (0..c_out) |co| {
+                for (0..h_in) |ih| {
+                    for (0..w_in) |iw| {
+                        const v = input.at4(b, ci, ih, iw);
+                        for (0..k_h) |kh| {
+                            const oh = @as(isize, @intCast(ih * stride + kh)) - @as(isize, @intCast(padding));
+                            if (oh < 0 or oh >= h_out) continue;
+                            for (0..k_w) |kw| {
+                                const ow = @as(isize, @intCast(iw * stride + kw)) - @as(isize, @intCast(padding));
+                                if (ow < 0 or ow >= w_out) continue;
+                                const idx = ((b * c_out + co) * h_out + @as(usize, @intCast(oh))) * w_out + @as(usize, @intCast(ow));
+                                out.data[idx] += v * weight.at4(ci, co, kh, kw);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}
+
+test "conv2d fast paths match the reference definition" {
+    const allocator = std.testing.allocator;
+
+    // {c_in, c_out, h, w, kernel, stride, padding}: pointwise, padded 3x3, a
+    // patch-embedding-shaped strided case, and a non-square tile remainder.
+    const cases = [_][7]usize{
+        .{ 5, 7, 9, 11, 1, 1, 0 },
+        .{ 4, 6, 10, 13, 3, 1, 1 },
+        .{ 3, 8, 12, 12, 3, 1, 0 },
+        .{ 3, 5, 14, 14, 7, 7, 0 },
+        .{ 2, 4, 9, 9, 2, 2, 0 },
+        .{ 6, 3, 7, 40, 3, 1, 1 },
+    };
+
+    for (cases) |case| {
+        const c_in, const c_out, const h, const w, const k, const stride, const pad = case;
+
+        const in_shape = [_]usize{ 1, c_in, h, w };
+        var input = try Tensor.initRandom(allocator, &in_shape, 11, -1.0, 1.0);
+        defer input.deinit();
+
+        const w_shape = [_]usize{ c_out, c_in, k, k };
+        var weight = try Tensor.initRandom(allocator, &w_shape, 23, -0.5, 0.5);
+        defer weight.deinit();
+
+        const b_shape = [_]usize{c_out};
+        var bias = try Tensor.initRandom(allocator, &b_shape, 37, -0.2, 0.2);
+        defer bias.deinit();
+
+        var got = try conv2d(allocator, input, weight, bias, stride, pad);
+        defer got.deinit();
+        var want = try referenceConv2d(allocator, input, weight, bias, stride, pad);
+        defer want.deinit();
+
+        try std.testing.expectEqualSlices(usize, want.shape, got.shape);
+        for (want.data, got.data) |e, g| try std.testing.expectApproxEqAbs(e, g, 1e-4);
+    }
+}
+
+test "convTranspose2d fast path matches the reference definition" {
+    const allocator = std.testing.allocator;
+
+    // {c_in, c_out, h, w, kernel, stride, padding}: the FPN's kernel == stride
+    // shape, plus overlapping and padded cases that take the general path.
+    const cases = [_][7]usize{
+        .{ 6, 4, 5, 7, 2, 2, 0 },
+        .{ 3, 5, 4, 4, 3, 3, 0 },
+        .{ 4, 3, 5, 5, 3, 1, 0 },
+        .{ 2, 6, 6, 4, 4, 2, 1 },
+    };
+
+    for (cases) |case| {
+        const c_in, const c_out, const h, const w, const k, const stride, const pad = case;
+
+        const in_shape = [_]usize{ 1, c_in, h, w };
+        var input = try Tensor.initRandom(allocator, &in_shape, 5, -1.0, 1.0);
+        defer input.deinit();
+
+        const w_shape = [_]usize{ c_in, c_out, k, k };
+        var weight = try Tensor.initRandom(allocator, &w_shape, 17, -0.5, 0.5);
+        defer weight.deinit();
+
+        const b_shape = [_]usize{c_out};
+        var bias = try Tensor.initRandom(allocator, &b_shape, 29, -0.2, 0.2);
+        defer bias.deinit();
+
+        var got = try convTranspose2d(allocator, input, weight, bias, stride, pad);
+        defer got.deinit();
+        var want = try referenceConvTranspose2d(allocator, input, weight, bias, stride, pad);
+        defer want.deinit();
+
+        try std.testing.expectEqualSlices(usize, want.shape, got.shape);
+        for (want.data, got.data) |e, g| try std.testing.expectApproxEqAbs(e, g, 1e-4);
     }
 }

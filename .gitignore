@@ -1,12 +1,3 @@
 .zig-cache/
 zig-out/
-*.ppm
-*.bmp
-*.png
-*.jpg
-*.jpeg
-*.safetensors
-*.pt
-*.bin
-assets/
 zig-pkg/

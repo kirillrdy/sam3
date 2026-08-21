@@ -15,7 +15,17 @@ pub fn build(b: *std.Build) void {
     // Standard optimization options allow the person running `zig build` to select
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
-    const optimize = b.standardOptimizeOption(.{});
+    // ReleaseFast by default: this runs an 859M-parameter model, and a Debug
+    // build of the same pass is over ten times slower - slow enough that the
+    // default build would look broken rather than merely unoptimised.
+    // `-Doptimize=Debug` still works for actually debugging. This is spelled out
+    // rather than using `preferred_optimize_mode`, which only takes effect under
+    // `-Drelease` and drops the `-Doptimize` flag entirely.
+    const optimize = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "Prioritize performance, safety, or binary size (default: ReleaseFast)",
+    ) orelse .ReleaseFast;
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -97,59 +107,6 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
-    // This creates a top level step. Top level steps have a name and can be
-    // invoked by name when running `zig build` (e.g. `zig build run`).
-    // This will evaluate the `run` step rather than the default step.
-    // For a top level step to actually do something, it must depend on other
-    // steps (e.g. a Run step, as we will see in a moment).
-    const run_step = b.step("run", "Run the app");
-
-    // This creates a RunArtifact step in the build graph. A RunArtifact step
-    // invokes an executable compiled by Zig. Steps will only be executed by the
-    // runner if invoked directly by the user (in the case of top level steps)
-    // or if another step depends on it, so it's up to you to define when and
-    // how this Run step will be executed. In our case we want to run it when
-    // the user runs `zig build run`, so we create a dependency link.
-    const run_cmd = b.addRunArtifact(exe);
-    run_step.dependOn(&run_cmd.step);
-
-    // By making the run step depend on the default step, it will be run from the
-    // installation directory rather than directly from within the cache directory.
-    run_cmd.step.dependOn(b.getInstallStep());
-
-    // This allows the user to pass arguments to the application in the build
-    // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
-
-    // Creates an executable that will run `test` blocks from the provided module.
-    // Here `mod` needs to define a target, which is why earlier we made sure to
-    // set the releative field.
-    const mod_tests = b.addTest(.{
-        .root_module = mod,
-    });
-
-    // A run step that will run the test executable.
-    const run_mod_tests = b.addRunArtifact(mod_tests);
-
-    // Creates an executable that will run `test` blocks from the executable's
-    // root module. Note that test executables only test one module at a time,
-    // hence why we have to create two separate ones.
-    const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
-    });
-
-    // A run step that will run the second test executable.
-    const run_exe_tests = b.addRunArtifact(exe_tests);
-
-    // A top level step for running all tests. dependOn can be called multiple
-    // times and since the two run steps do not depend on one another, this will
-    // make the two of them run in parallel.
-    const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
-
     // --- Asset fetching -----------------------------------------------------
     //
     // `zig build fetch-weights` and `zig build fetch-examples` download what the
@@ -180,6 +137,14 @@ pub fn build(b: *std.Build) void {
 
     const weights_step = b.step("fetch-weights", "Download Meta's SAM 3 checkpoint and tokenizer assets");
 
+    // Everything the build downloads is derived data, not source, so it goes to
+    // the build cache rather than the working tree, and the executable is told
+    // where it landed through `build_options` — the program itself takes no
+    // arguments. Stable names (rather than content-hashed step outputs) are what
+    // make re-running a fetch cheap: a file that is already there and matches
+    // its published SHA-256 is left alone.
+    const checkpoint_path = b.cache_root.join(b.allocator, &.{ "sam3", "sam3.safetensors" }) catch @panic("OOM");
+
     const checkpoint = b.addRunArtifact(fetch_exe);
     checkpoint.has_side_effects = true;
     checkpoint.setCwd(b.path("."));
@@ -187,7 +152,7 @@ pub fn build(b: *std.Build) void {
         "--url",
         b.fmt("https://huggingface.co/{s}/resolve/main/model.safetensors", .{hf_repo}),
         "--out",
-        "sam3.safetensors",
+        checkpoint_path,
         // Meta's published checksum for the 859.9M-parameter F32 checkpoint.
         "--sha256",
         "6d06f0a5f84e435071fe6603e61d0b4cc7b40e0d39d487cfd4d67d8cc11cc14a",
@@ -214,7 +179,7 @@ pub fn build(b: *std.Build) void {
             "--url",
             b.fmt("https://huggingface.co/{s}/resolve/main/{s}", .{ hf_repo, asset }),
             "--out",
-            b.fmt("assets/sam3/{s}", .{asset}),
+            b.cache_root.join(b.allocator, &.{ "sam3", asset }) catch @panic("OOM"),
             "--token-env",
             "HF_TOKEN",
             "--label",
@@ -228,12 +193,20 @@ pub fn build(b: *std.Build) void {
     // demand, so pinning bytes would be a false promise.
     const examples_step = b.step("fetch-examples", "Download the playground sample images");
 
+    var cat_path: []const u8 = "";
     for ([_][2][]const u8{
         .{ "dog", "photo-1543466835-00a7907e9de1" },
         .{ "cat", "photo-1514888286974-6c03e2ca1dba" },
         .{ "person", "photo-1507003211169-0a1dd7228f2d" },
         .{ "car", "photo-1459603677915-a62079ffd002" },
     }) |example| {
+        const out = b.cache_root.join(b.allocator, &.{
+            "sam3",
+            "examples",
+            b.fmt("{s}.png", .{example[0]}),
+        }) catch @panic("OOM");
+        if (std.mem.eql(u8, example[0], "cat")) cat_path = out;
+
         const run = b.addRunArtifact(fetch_exe);
         run.has_side_effects = true;
         run.setCwd(b.path("."));
@@ -241,12 +214,70 @@ pub fn build(b: *std.Build) void {
             "--url",
             b.fmt("https://images.unsplash.com/{s}?w=800&fm=png", .{example[1]}),
             "--out",
-            b.fmt("assets/examples/{s}.png", .{example[0]}),
+            out,
             "--label",
             b.fmt("{s}.png", .{example[0]}),
         });
         examples_step.dependOn(&run.step);
     }
+
+    // Where those two downloads ended up, as compile-time constants in the
+    // executable. This is the only channel: `sam3` parses no arguments, so the
+    // build steps that fetch the checkpoint and the image are also what say
+    // where they are.
+    const exe_options = b.addOptions();
+    exe_options.addOption([]const u8, "weights_path", checkpoint_path);
+    exe_options.addOption([]const u8, "image_path", cat_path);
+    exe.root_module.addOptions("build_options", exe_options);
+
+    // This creates a top level step. Top level steps have a name and can be
+    // invoked by name when running `zig build` (e.g. `zig build run`).
+    // This will evaluate the `run` step rather than the default step.
+    // For a top level step to actually do something, it must depend on other
+    // steps (e.g. a Run step, as we will see in a moment).
+    const run_step = b.step("run", "Segment the sample cat image with the real checkpoint");
+
+    // This creates a RunArtifact step in the build graph. A RunArtifact step
+    // invokes an executable compiled by Zig. Steps will only be executed by the
+    // runner if invoked directly by the user (in the case of top level steps)
+    // or if another step depends on it, so it's up to you to define when and
+    // how this Run step will be executed. In our case we want to run it when
+    // the user runs `zig build run`, so we create a dependency link.
+    const run_cmd = b.addRunArtifact(exe);
+    run_step.dependOn(&run_cmd.step);
+
+    // By making the run step depend on the default step, it will be run from the
+    // installation directory rather than directly from within the cache directory.
+    run_cmd.step.dependOn(b.getInstallStep());
+    // The app takes no arguments: it reads the checkpoint and the sample image
+    // from fixed paths relative to the project root, so both fetch steps have to
+    // have run first, and the working directory has to be that root whatever
+    // directory `zig build` itself was invoked from.
+    run_cmd.step.dependOn(weights_step);
+    run_cmd.step.dependOn(examples_step);
+    run_cmd.setCwd(b.path("."));
+
+    // Creates an executable that will run `test` blocks from the provided module.
+    const mod_tests = b.addTest(.{
+        .root_module = mod,
+    });
+
+    // A run step that will run the test executable.
+    const run_mod_tests = b.addRunArtifact(mod_tests);
+
+    // Creates an executable that will run `test` blocks from the executable's
+    // root module.
+    const exe_tests = b.addTest(.{
+        .root_module = exe.root_module,
+    });
+
+    // A run step that will run the second test executable.
+    const run_exe_tests = b.addRunArtifact(exe_tests);
+
+    // A top level step for running all tests.
+    const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_exe_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

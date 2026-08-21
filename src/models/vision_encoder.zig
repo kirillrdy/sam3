@@ -11,7 +11,8 @@
 //! DETR encoder and drops the 0.5x level.
 //!
 //! Reference: `Sam3ViTModel` / `Sam3VisionModel` in HF Transformers, and
-//! `assets/sam3/config.json` for every hyper-parameter below.
+//! `.zig-cache/sam3/config.json` (fetched by `zig build fetch-weights`) for every
+//! hyper-parameter below.
 
 const std = @import("std");
 const Tensor = @import("../tensor/tensor.zig").Tensor;
@@ -135,7 +136,7 @@ pub const RopeTable = struct {
 
 /// In-place pairwise rotation: `x * cos + rotate_pairwise(x) * sin`, where
 /// `rotate_pairwise` maps (a, b) -> (-b, a) over adjacent channel pairs.
-fn applyRope(x: *Tensor, table: RopeTable, num_heads: usize) void {
+fn applyRope(allocator: std.mem.Allocator, x: *Tensor, table: RopeTable, num_heads: usize) void {
     std.debug.assert(x.shape.len == 3);
     const batch = x.shape[0];
     const seq = x.shape[1];
@@ -144,28 +145,79 @@ fn applyRope(x: *Tensor, table: RopeTable, num_heads: usize) void {
     std.debug.assert(seq == table.seq_len);
     std.debug.assert(dim == num_heads * head_dim);
 
-    for (0..batch) |b| {
-        for (0..seq) |s| {
-            const row = x.data[(b * seq + s) * dim ..][0..dim];
-            const cos_row = table.cos[s * head_dim ..][0..head_dim];
-            const sin_row = table.sin[s * head_dim ..][0..head_dim];
+    const Context = struct {
+        data: []f32,
+        table: RopeTable,
+        seq: usize,
+        dim: usize,
+        num_heads: usize,
+        head_dim: usize,
+    };
 
-            for (0..num_heads) |h| {
-                const head = row[h * head_dim ..][0..head_dim];
-                var d: usize = 0;
-                while (d < head_dim) : (d += 2) {
-                    const a = head[d];
-                    const bb = head[d + 1];
-                    head[d] = a * cos_row[d] - bb * sin_row[d];
-                    head[d + 1] = bb * cos_row[d + 1] + a * sin_row[d + 1];
+    const ctx = Context{
+        .data = x.data,
+        .table = table,
+        .seq = seq,
+        .dim = dim,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+    };
+
+    parallel.parallelFor(allocator, batch * seq, ctx, struct {
+        fn worker(c: Context, start: usize, end: usize) void {
+            const hd = c.head_dim;
+            for (start..end) |task| {
+                const s = task % c.seq;
+                const row = c.data[task * c.dim ..][0..c.dim];
+                const cos_row = c.table.cos[s * hd ..][0..hd];
+                const sin_row = c.table.sin[s * hd ..][0..hd];
+
+                for (0..c.num_heads) |h| {
+                    const head = row[h * hd ..][0..hd];
+                    var d: usize = 0;
+                    while (d < hd) : (d += 2) {
+                        const a = head[d];
+                        const bb = head[d + 1];
+                        head[d] = a * cos_row[d] - bb * sin_row[d];
+                        head[d + 1] = bb * cos_row[d + 1] + a * sin_row[d + 1];
+                    }
                 }
             }
         }
-    }
+    }.worker);
 }
+
+const VEC = math.VEC_SIZE;
+const Vec = math.F32Vec;
+
+/// Queries processed together, so each key and value column loaded from the
+/// packed head is reused across a whole block instead of once.
+const Q_BLOCK = 8;
+/// Queries per value-accumulation tile, chosen with the width below so the tile
+/// fits the sixteen vector registers AVX2 offers.
+const Q_SUB = 4;
+/// Output channels per value-accumulation tile.
+const D_TILE = 4 * VEC;
 
 /// Softmax attention over `[batch, seq, dim]` with pre-applied RoPE, running one
 /// (batch, head) pair per task.
+///
+/// Q, K and V arrive interleaved across heads, so a single head's rows sit
+/// `dim` floats apart - at d=1024 that is a 4 KiB stride, which defeats the
+/// prefetcher and touches a separate page per token. Each task therefore packs
+/// its head first: K transposed to `[head_dim, seq]` and V as `[seq, head_dim]`.
+///
+/// Softmax is not a pass of its own. `scoreBlock` tracks the row maximum while
+/// the block is still in registers, `expRow` exponentiates in place, and the
+/// reciprocal of the sum is handed to `accumulateValues` to fold into its
+/// stores - three passes over `seq_len` scores become one.
+///
+/// The transpose is what makes the scores cheap. Scoring a query against a key
+/// is a 64-element dot product, and computing it as one costs a horizontal
+/// vector reduction per score - more cycles than the eight fused multiply-adds
+/// it reduces. With K transposed, one vector instead spans eight *keys* at a
+/// fixed channel, so a block of queries accumulates eight scores each with no
+/// reduction at all, and the results land contiguously in the score rows.
 fn attention(
     allocator: std.mem.Allocator,
     q: Tensor,
@@ -182,9 +234,31 @@ fn attention(
     var out = try Tensor.init(allocator, &out_shape);
     errdefer out.deinit();
 
-    const num_tasks = batch * num_heads;
-    const scratch = try allocator.alloc(f32, num_tasks * seq);
+    // Per lane rather than per task: at 1008x1008 a windowed layer dispatches
+    // 144 tasks and a global one 64, and a buffer each would be hundreds of
+    // megabytes.
+    const lanes = parallel.laneCount();
+    // Two extra Q_BLOCK slots per lane: the row maxima out of `scoreBlock` and
+    // the softmax reciprocals `accumulateValues` folds into its stores.
+    const per_lane = 2 * seq * head_dim + Q_BLOCK * seq + Q_BLOCK * head_dim + 2 * Q_BLOCK;
+    const scratch = try allocator.alloc(f32, lanes * per_lane);
     defer allocator.free(scratch);
+
+    // A task per (batch, head) leaves the four global layers with only sixteen
+    // of them, which is too coarse for eight lanes of unequal speed: the join
+    // waits on an efficiency core's second task while the performance cores sit
+    // idle. Splitting the query range as well gives the pool enough pieces to
+    // even out. The extra cost is re-packing K and V per piece, which is under a
+    // tenth of a second across the whole forward pass.
+    const min_tasks = 8 * lanes;
+    const q_chunks = blk: {
+        const heads_tasks = batch * num_heads;
+        if (heads_tasks >= min_tasks) break :blk 1;
+        const want = (min_tasks + heads_tasks - 1) / heads_tasks;
+        const blocks = (seq + Q_BLOCK - 1) / Q_BLOCK;
+        break :blk @max(1, @min(want, blocks));
+    };
+    const chunk_blocks = ((seq + Q_BLOCK - 1) / Q_BLOCK + q_chunks - 1) / q_chunks;
 
     const Context = struct {
         q: Tensor,
@@ -192,11 +266,14 @@ fn attention(
         v: Tensor,
         out: *Tensor,
         scratch: []f32,
+        per_lane: usize,
         num_heads: usize,
         seq: usize,
         dim: usize,
         head_dim: usize,
         scale: f32,
+        q_chunks: usize,
+        chunk_blocks: usize,
     };
 
     var ctx = Context{
@@ -205,59 +282,216 @@ fn attention(
         .v = v,
         .out = &out,
         .scratch = scratch,
+        .per_lane = per_lane,
         .num_heads = num_heads,
         .seq = seq,
         .dim = dim,
         .head_dim = head_dim,
         .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
+        .q_chunks = q_chunks,
+        .chunk_blocks = chunk_blocks,
     };
 
-    parallel.parallelFor(allocator, num_tasks, &ctx, struct {
+    parallel.parallelFor(allocator, batch * num_heads * q_chunks, &ctx, struct {
         fn worker(c: *Context, start: usize, end: usize) void {
             const seq_len = c.seq;
             const model_dim = c.dim;
             const hd = c.head_dim;
 
+            const lane = c.scratch[parallel.laneId() * c.per_lane ..][0..c.per_lane];
+            const k_t = lane[0 .. seq_len * hd]; // [head_dim, seq]
+            const v_pack = lane[seq_len * hd ..][0 .. seq_len * hd]; // [seq, head_dim]
+            const scores = lane[2 * seq_len * hd ..][0 .. Q_BLOCK * seq_len];
+            const q_pack = lane[2 * seq_len * hd + Q_BLOCK * seq_len ..][0 .. Q_BLOCK * hd];
+            const tail = 2 * seq_len * hd + Q_BLOCK * seq_len + Q_BLOCK * hd;
+            const row_max = lane[tail ..][0..Q_BLOCK];
+            const row_inv = lane[tail + Q_BLOCK ..][0..Q_BLOCK];
+
+            var out_rows: [Q_BLOCK][]f32 = undefined;
+
             for (start..end) |task| {
-                const b = task / c.num_heads;
-                const h = task % c.num_heads;
-                const head_off = h * hd;
-                const scores = c.scratch[task * seq_len ..][0..seq_len];
+                const head_task = task / c.q_chunks;
+                const chunk = task % c.q_chunks;
+                const b = head_task / c.num_heads;
+                const head_off = (head_task % c.num_heads) * hd;
 
-                for (0..seq_len) |qi| {
-                    const q_vec = c.q.data[(b * seq_len + qi) * model_dim + head_off ..][0..hd];
+                const q_first = chunk * c.chunk_blocks * Q_BLOCK;
+                if (q_first >= seq_len) continue;
+                const q_last = @min(seq_len, q_first + c.chunk_blocks * Q_BLOCK);
 
-                    var max_score: f32 = -std.math.inf(f32);
-                    for (0..seq_len) |ki| {
-                        const k_vec = c.k.data[(b * seq_len + ki) * model_dim + head_off ..][0..hd];
-                        const score = math.dotProduct(q_vec, k_vec) * c.scale;
-                        scores[ki] = score;
-                        if (score > max_score) max_score = score;
+                for (0..seq_len) |i| {
+                    const base = (b * seq_len + i) * model_dim + head_off;
+                    const k_src = c.k.data[base..][0..hd];
+                    for (0..hd) |d| k_t[d * seq_len + i] = k_src[d];
+                    @memcpy(v_pack[i * hd ..][0..hd], c.v.data[base..][0..hd]);
+                }
+
+                var q0: usize = q_first;
+                while (q0 < q_last) : (q0 += Q_BLOCK) {
+                    const rows = @min(Q_BLOCK, q_last - q0);
+                    for (0..rows) |i| {
+                        const base = (b * seq_len + q0 + i) * model_dim + head_off;
+                        @memcpy(q_pack[i * hd ..][0..hd], c.q.data[base..][0..hd]);
+                        out_rows[i] = c.out.data[base..][0..hd];
+                        @memset(out_rows[i], 0.0);
                     }
 
-                    var sum_exp: f32 = 0.0;
-                    for (scores) |*s| {
-                        s.* = @exp(s.* - max_score);
-                        sum_exp += s.*;
-                    }
-                    const inv_sum = 1.0 / (sum_exp + 1e-12);
+                    scoreBlock(q_pack, k_t, scores, row_max, rows, seq_len, hd, c.scale);
 
-                    const out_vec = c.out.data[(b * seq_len + qi) * model_dim + head_off ..][0..hd];
-                    @memset(out_vec, 0.0);
-                    for (0..seq_len) |ki| {
-                        const w = scores[ki] * inv_sum;
-                        if (w == 0.0) continue;
-                        const v_vec = c.v.data[(b * seq_len + ki) * model_dim + head_off ..][0..hd];
-                        for (0..hd) |d| {
-                            out_vec[d] += w * v_vec[d];
-                        }
+                    for (0..rows) |i| {
+                        row_inv[i] = expRow(scores[i * seq_len ..][0..seq_len], row_max[i]);
                     }
+
+                    accumulateValues(scores, v_pack, &out_rows, row_inv, rows, seq_len, hd);
                 }
             }
         }
     }.worker);
 
     return out;
+}
+
+/// `scores[i, ki] = scale * dot(q_pack[i], key ki)` for a block of queries.
+///
+/// `k_t` is `[head_dim, seq]`, so each vector load covers `VEC` consecutive keys
+/// at one channel and the accumulators are already the finished scores.
+fn scoreBlock(
+    q_pack: []const f32,
+    k_t: []const f32,
+    scores: []f32,
+    row_max: []f32,
+    rows: usize,
+    seq_len: usize,
+    hd: usize,
+    scale: f32,
+) void {
+    const scale_v: Vec = @splat(scale);
+    const neg_inf = -std.math.inf(f32);
+
+    // The row maximum softmax needs is tracked here rather than in a pass of
+    // its own: the scores are in registers exactly once, and a vector max per
+    // store is far cheaper than re-reading the whole block from L2.
+    var max_v: [Q_BLOCK]Vec = @splat(@as(Vec, @splat(neg_inf)));
+    for (0..rows) |i| row_max[i] = neg_inf;
+
+    var k0: usize = 0;
+    if (rows == Q_BLOCK) {
+        while (k0 + VEC <= seq_len) : (k0 += VEC) {
+            var acc: [Q_BLOCK]Vec = @splat(@as(Vec, @splat(0.0)));
+
+            for (0..hd) |d| {
+                const kv: Vec = k_t[d * seq_len + k0 ..][0..VEC].*;
+                inline for (0..Q_BLOCK) |i| {
+                    acc[i] += @as(Vec, @splat(q_pack[i * hd + d])) * kv;
+                }
+            }
+
+            inline for (0..Q_BLOCK) |i| {
+                const scaled = acc[i] * scale_v;
+                scores[i * seq_len + k0 ..][0..VEC].* = scaled;
+                max_v[i] = @max(max_v[i], scaled);
+            }
+        }
+        for (0..rows) |i| row_max[i] = @reduce(.Max, max_v[i]);
+    }
+
+    // Ragged tail, and every block when the last one is short.
+    while (k0 < seq_len) : (k0 += 1) {
+        for (0..rows) |i| {
+            var sum: f32 = 0.0;
+            for (0..hd) |d| sum += q_pack[i * hd + d] * k_t[d * seq_len + k0];
+            const v = sum * scale;
+            scores[i * seq_len + k0] = v;
+            row_max[i] = @max(row_max[i], v);
+        }
+    }
+}
+
+/// `out[i] = sum_k scores[i, k] * v_pack[k]`, tiled so a `Q_SUB x D_TILE` patch
+/// of the result stays in registers for the whole reduction.
+fn accumulateValues(
+    scores: []const f32,
+    v_pack: []const f32,
+    out_rows: *[Q_BLOCK][]f32,
+    row_inv: []const f32,
+    rows: usize,
+    seq_len: usize,
+    hd: usize,
+) void {
+    const lanes = D_TILE / VEC;
+
+    var q0: usize = 0;
+    while (q0 < rows) : (q0 += Q_SUB) {
+        const sub = @min(Q_SUB, rows - q0);
+
+        var d0: usize = 0;
+        while (d0 < hd) : (d0 += D_TILE) {
+            const width = @min(D_TILE, hd - d0);
+
+            if (sub == Q_SUB and width == D_TILE) {
+                var acc: [Q_SUB][lanes]Vec = @splat(@as([lanes]Vec, @splat(@as(Vec, @splat(0.0)))));
+
+                for (0..seq_len) |ki| {
+                    const v_row = v_pack[ki * hd + d0 ..];
+                    inline for (0..lanes) |j| {
+                        const vv: Vec = v_row[j * VEC ..][0..VEC].*;
+                        inline for (0..Q_SUB) |i| {
+                            acc[i][j] += @as(Vec, @splat(scores[(q0 + i) * seq_len + ki])) * vv;
+                        }
+                    }
+                }
+
+                inline for (0..Q_SUB) |i| {
+                    const inv: Vec = @splat(row_inv[q0 + i]);
+                    inline for (0..lanes) |j| {
+                        out_rows[q0 + i][d0 + j * VEC ..][0..VEC].* = acc[i][j] * inv;
+                    }
+                }
+            } else {
+                for (0..sub) |i| {
+                    const dst = out_rows[q0 + i][d0..][0..width];
+                    @memset(dst, 0.0);
+                    for (0..seq_len) |ki| {
+                        const w = scores[(q0 + i) * seq_len + ki];
+                        if (w == 0.0) continue;
+                        const v_row = v_pack[ki * hd + d0 ..][0..width];
+                        for (0..width) |j| dst[j] += w * v_row[j];
+                    }
+                    const inv = row_inv[q0 + i];
+                    for (dst) |*x| x.* *= inv;
+                }
+            }
+        }
+    }
+}
+
+/// Exponentiates one score row in place against a maximum `scoreBlock` already
+/// found, and returns the reciprocal of the sum.
+///
+/// The softmax denominator is not applied here. Dividing the row would be a
+/// third full pass over `seq_len` scores; folding the reciprocal into the value
+/// accumulation instead applies it to `head_dim` outputs, which at seq 5184 and
+/// head_dim 64 is eighty times less work.
+inline fn expRow(row: []f32, max_val: f32) f32 {
+    const V = math.VEC_SIZE;
+
+    var sum: f32 = 0.0;
+    const max_splat: math.F32Vec = @splat(max_val);
+    var sum_vec: math.F32Vec = @splat(0.0);
+    var i: usize = 0;
+    while (i + V <= row.len) : (i += V) {
+        const v: math.F32Vec = row[i..][0..V].*;
+        const e = math.expVec(v - max_splat);
+        row[i..][0..V].* = e;
+        sum_vec += e;
+    }
+    sum = @reduce(.Add, sum_vec);
+    while (i < row.len) : (i += 1) {
+        row[i] = @exp(row[i] - max_val);
+        sum += row[i];
+    }
+
+    return 1.0 / (sum + 1e-12);
 }
 
 pub const Windows = struct {
@@ -287,23 +521,47 @@ pub fn windowPartition(allocator: std.mem.Allocator, x: Tensor, window: usize) !
     var out = try Tensor.initZeros(allocator, &shape);
     errdefer out.deinit();
 
-    for (0..win_h) |wh| {
-        for (0..win_w) |ww| {
-            const win_idx = wh * win_w + ww;
-            for (0..window) |ih| {
-                const src_h = wh * window + ih;
-                if (src_h >= h) continue;
-                for (0..window) |iw| {
-                    const src_w = ww * window + iw;
-                    if (src_w >= w) continue;
+    const Context = struct {
+        src: []const f32,
+        dst: []f32,
+        h: usize,
+        w: usize,
+        c: usize,
+        window: usize,
+        win_w: usize,
+    };
 
-                    const src = x.data[((src_h * w) + src_w) * c ..][0..c];
-                    const dst = out.data[(win_idx * window * window + ih * window + iw) * c ..][0..c];
-                    @memcpy(dst, src);
-                }
+    const ctx = Context{
+        .src = x.data,
+        .dst = out.data,
+        .h = h,
+        .w = w,
+        .c = c,
+        .window = window,
+        .win_w = win_w,
+    };
+
+    // One task per window row: within a row the copied spans are contiguous.
+    parallel.parallelFor(allocator, num_windows * window, ctx, struct {
+        fn worker(cx: Context, start: usize, end: usize) void {
+            for (start..end) |task| {
+                const win_idx = task / cx.window;
+                const ih = task % cx.window;
+                const wh = win_idx / cx.win_w;
+                const ww = win_idx % cx.win_w;
+
+                const src_h = wh * cx.window + ih;
+                if (src_h >= cx.h) continue;
+
+                const cols = @min(cx.window, cx.w -| (ww * cx.window));
+                if (cols == 0) continue;
+
+                const src_off = (src_h * cx.w + ww * cx.window) * cx.c;
+                const dst_off = (win_idx * cx.window * cx.window + ih * cx.window) * cx.c;
+                @memcpy(cx.dst[dst_off..][0 .. cols * cx.c], cx.src[src_off..][0 .. cols * cx.c]);
             }
         }
-    }
+    }.worker);
 
     return Windows{ .tensor = out, .padded_h = padded_h, .padded_w = padded_w };
 }
@@ -328,19 +586,45 @@ pub fn windowUnpartition(
     var out = try Tensor.init(allocator, &shape);
     errdefer out.deinit();
 
-    for (0..h) |oh| {
-        const wh = oh / window;
-        const ih = oh % window;
-        for (0..w) |ow| {
-            const ww = ow / window;
-            const iw = ow % window;
-            const win_idx = wh * win_w + ww;
+    const Context = struct {
+        src: []const f32,
+        dst: []f32,
+        w: usize,
+        c: usize,
+        window: usize,
+        win_w: usize,
+    };
 
-            const src = windows.data[(win_idx * window * window + ih * window + iw) * c ..][0..c];
-            const dst = out.data[((oh * w) + ow) * c ..][0..c];
-            @memcpy(dst, src);
+    const ctx = Context{
+        .src = windows.data,
+        .dst = out.data,
+        .w = w,
+        .c = c,
+        .window = window,
+        .win_w = win_w,
+    };
+
+    parallel.parallelFor(allocator, h, ctx, struct {
+        fn worker(cx: Context, start: usize, end: usize) void {
+            for (start..end) |oh| {
+                const wh = oh / cx.window;
+                const ih = oh % cx.window;
+
+                var ow: usize = 0;
+                while (ow < cx.w) {
+                    const ww = ow / cx.window;
+                    const iw = ow % cx.window;
+                    const run = @min(cx.window - iw, cx.w - ow);
+                    const win_idx = wh * cx.win_w + ww;
+
+                    const src_off = (win_idx * cx.window * cx.window + ih * cx.window + iw) * cx.c;
+                    const dst_off = (oh * cx.w + ow) * cx.c;
+                    @memcpy(cx.dst[dst_off..][0 .. run * cx.c], cx.src[src_off..][0 .. run * cx.c]);
+                    ow += run;
+                }
+            }
         }
-    }
+    }.worker);
 
     return out;
 }
@@ -680,8 +964,8 @@ pub const VisionEncoder = struct {
         var v = try math.linear(self.allocator, seq, v_w, v_b);
         defer v.deinit();
 
-        applyRope(&q, rope, cfg.num_heads);
-        applyRope(&k, rope, cfg.num_heads);
+        applyRope(self.allocator, &q, rope, cfg.num_heads);
+        applyRope(self.allocator, &k, rope, cfg.num_heads);
 
         var attn = try attention(self.allocator, q, k, v, cfg.num_heads);
         defer attn.deinit();
@@ -833,7 +1117,7 @@ test "RoPE preserves per-head vector norms" {
     var before = try x.clone(allocator);
     defer before.deinit();
 
-    applyRope(&x, table, num_heads);
+    applyRope(allocator, &x, table, num_heads);
 
     for (0..9) |s| {
         for (0..num_heads) |h| {

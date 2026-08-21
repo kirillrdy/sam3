@@ -71,11 +71,12 @@ pub fn main(init: std.process.Init) !void {
     if (opts.sha256) |want| {
         if (try hashFile(io, opts.out)) |have| {
             if (std.ascii.eqlIgnoreCase(&have, want)) {
-                std.debug.print("  {s}: already present and verified\n", .{name});
                 return;
             }
             std.debug.print("  {s}: present but checksum differs, re-downloading\n", .{name});
         }
+    } else {
+        if (fileExists(io, opts.out)) return;
     }
 
     try ensureParentDir(io, opts.out);
@@ -107,7 +108,67 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("  {s}: -> {s}\n", .{ name, opts.out });
 }
 
+fn fileExists(io: std.Io, path: []const u8) bool {
+    const cwd = std.Io.Dir.cwd();
+    var file = cwd.openFile(io, path, .{}) catch return false;
+    file.close(io);
+    return true;
+}
+
 fn download(gpa: std.mem.Allocator, io: std.Io, opts: Options, dest_path: []const u8, token: ?[]const u8) !void {
+    downloadWithCurl(gpa, io, opts, dest_path, token) catch {
+        return downloadZig(gpa, io, opts, dest_path, token);
+    };
+}
+
+fn downloadWithCurl(gpa: std.mem.Allocator, io: std.Io, opts: Options, dest_path: []const u8, token: ?[]const u8) !void {
+    var argv_buf: [10][]const u8 = undefined;
+    var argv_len: usize = 0;
+
+    argv_buf[argv_len] = "curl";
+    argv_len += 1;
+    argv_buf[argv_len] = "-sSL";
+    argv_len += 1;
+    argv_buf[argv_len] = "--retry";
+    argv_len += 1;
+    argv_buf[argv_len] = "3";
+    argv_len += 1;
+
+    var header_buf: [4096]u8 = undefined;
+    if (token) |tok| {
+        argv_buf[argv_len] = "-H";
+        argv_len += 1;
+        argv_buf[argv_len] = try std.fmt.bufPrint(&header_buf, "Authorization: Bearer {s}", .{tok});
+        argv_len += 1;
+    }
+
+    argv_buf[argv_len] = "-o";
+    argv_len += 1;
+    argv_buf[argv_len] = dest_path;
+    argv_len += 1;
+
+    argv_buf[argv_len] = opts.url;
+    argv_len += 1;
+
+    const result = try std.process.run(gpa, io, .{
+        .argv = argv_buf[0..argv_len],
+    });
+    defer {
+        gpa.free(result.stdout);
+        gpa.free(result.stderr);
+    }
+
+    switch (result.term) {
+        .exited => |code| {
+            if (code != 0) {
+                return error.HttpRequestFailed;
+            }
+        },
+        else => return error.HttpRequestFailed,
+    }
+}
+
+fn downloadZig(gpa: std.mem.Allocator, io: std.Io, opts: Options, dest_path: []const u8, token: ?[]const u8) !void {
     const cwd = std.Io.Dir.cwd();
 
     var file = try cwd.createFile(io, dest_path, .{});

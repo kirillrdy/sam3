@@ -1,6 +1,7 @@
 const std = @import("std");
 const Tensor = @import("tensor.zig").Tensor;
 const parallel = @import("parallel.zig");
+const gemm = @import("gemm.zig");
 
 pub const VEC_SIZE = 8;
 pub const F32Vec = @Vector(VEC_SIZE, f32);
@@ -23,6 +24,40 @@ pub inline fn dotProduct(a: []const f32, b: []const f32) f32 {
         sum += a[i] * b[i];
     }
     return sum;
+}
+
+/// Vectorised `@exp` for f32 lanes.
+///
+/// `@exp` lowers to a scalar libm call, and softmax over a 5184-token attention
+/// map makes tens of millions of them. This is the usual range reduction
+/// (`x = n*ln2 + r`) with a degree-6 minimax polynomial on the reduced argument
+/// and the power of two folded in through the exponent field - accurate to
+/// about one ulp, so a normalised softmax is unchanged to well beyond f32
+/// display precision.
+pub inline fn expVec(x: F32Vec) F32Vec {
+    const log2e: F32Vec = @splat(1.44269504088896341);
+    const ln2_hi: F32Vec = @splat(0.693145751953125);
+    const ln2_lo: F32Vec = @splat(1.42860682030941723e-6);
+
+    // Clamped either side of the f32 range so the exponent assembly cannot
+    // overflow; softmax only ever passes non-positive arguments anyway.
+    const clamped = @min(@max(x, @as(F32Vec, @splat(-87.0))), @as(F32Vec, @splat(88.0)));
+
+    const n = @round(clamped * log2e);
+    const r = clamped - n * ln2_hi - n * ln2_lo;
+
+    var p: F32Vec = @splat(1.9875691500e-4);
+    p = p * r + @as(F32Vec, @splat(1.3981999507e-3));
+    p = p * r + @as(F32Vec, @splat(8.3334519073e-3));
+    p = p * r + @as(F32Vec, @splat(4.1665795894e-2));
+    p = p * r + @as(F32Vec, @splat(1.6666665459e-1));
+    p = p * r + @as(F32Vec, @splat(5.0000001201e-1));
+    p = p * r * r + r + @as(F32Vec, @splat(1.0));
+
+    const exponent: @Vector(VEC_SIZE, i32) = @intFromFloat(n);
+    const bits = (exponent + @as(@Vector(VEC_SIZE, i32), @splat(127))) <<
+        @as(@Vector(VEC_SIZE, u5), @splat(23));
+    return p * @as(F32Vec, @bitCast(bits));
 }
 
 pub inline fn sigmoid(x: f32) f32 {
@@ -65,17 +100,66 @@ pub inline fn geluExact(x: f32) f32 {
     return 0.5 * x * (1.0 + erf(x * std.math.sqrt1_2));
 }
 
-pub fn applyActivation(t: *Tensor, act_type: enum { gelu, gelu_exact, quick_gelu, silu, relu, sigmoid }) void {
-    for (t.data) |*v| {
-        v.* = switch (act_type) {
-            .gelu => gelu(v.*),
-            .gelu_exact => geluExact(v.*),
-            .quick_gelu => quickGelu(v.*),
-            .silu => silu(v.*),
-            .relu => relu(v.*),
-            .sigmoid => sigmoid(v.*),
-        };
-    }
+/// Vectorised `erf`, same Abramowitz & Stegun 7.1.26 rational form as `erf`.
+pub inline fn erfVec(x: F32Vec) F32Vec {
+    const one: F32Vec = @splat(1.0);
+    const zero: F32Vec = @splat(0.0);
+    const sign = @select(f32, x < zero, @as(F32Vec, @splat(-1.0)), one);
+    const ax = @abs(x);
+
+    const t = one / (one + @as(F32Vec, @splat(0.3275911)) * ax);
+    var poly = @as(F32Vec, @splat(1.061405429)) * t - @as(F32Vec, @splat(1.453152027));
+    poly = poly * t + @as(F32Vec, @splat(1.421413741));
+    poly = poly * t - @as(F32Vec, @splat(0.284496736));
+    poly = poly * t + @as(F32Vec, @splat(0.254829592));
+    const y = one - poly * t * expVec(-ax * ax);
+    return sign * y;
+}
+
+pub inline fn geluExactVec(x: F32Vec) F32Vec {
+    const half: F32Vec = @splat(0.5);
+    const one: F32Vec = @splat(1.0);
+    return half * x * (one + erfVec(x * @as(F32Vec, @splat(std.math.sqrt1_2))));
+}
+
+pub const Activation = enum { gelu, gelu_exact, quick_gelu, silu, relu, sigmoid };
+
+/// The MLP activation runs over `tokens * 4736` elements per layer, so it is
+/// both parallelised and, for the exact GELU the backbone actually uses,
+/// vectorised - the scalar form calls libm's `expf` once per element.
+pub fn applyActivation(t: *Tensor, act_type: Activation) void {
+    const Context = struct {
+        data: []f32,
+        kind: Activation,
+    };
+    const ctx = Context{ .data = t.data, .kind = act_type };
+
+    parallel.parallelFor(std.heap.page_allocator, t.data.len, ctx, struct {
+        fn worker(c: Context, start: usize, end: usize) void {
+            const slice = c.data[start..end];
+
+            if (c.kind == .gelu_exact) {
+                var i: usize = 0;
+                while (i + VEC_SIZE <= slice.len) : (i += VEC_SIZE) {
+                    const v: F32Vec = slice[i..][0..VEC_SIZE].*;
+                    slice[i..][0..VEC_SIZE].* = geluExactVec(v);
+                }
+                while (i < slice.len) : (i += 1) slice[i] = geluExact(slice[i]);
+                return;
+            }
+
+            for (slice) |*v| {
+                v.* = switch (c.kind) {
+                    .gelu => gelu(v.*),
+                    .gelu_exact => unreachable,
+                    .quick_gelu => quickGelu(v.*),
+                    .silu => silu(v.*),
+                    .relu => relu(v.*),
+                    .sigmoid => sigmoid(v.*),
+                };
+            }
+        }
+    }.worker);
 }
 
 pub fn softmaxLastDim(t: *Tensor) void {
@@ -196,52 +280,10 @@ pub fn matmul2D(allocator: std.mem.Allocator, a: Tensor, b: Tensor) !Tensor {
     const n = b.shape[1];
 
     const shape = [_]usize{ m, n };
-    const c = try Tensor.initZeros(allocator, &shape);
+    var c = try Tensor.init(allocator, &shape);
+    errdefer c.deinit();
 
-    // Transpose B into b_t (n x k) for cache-friendly contiguous SIMD dot products
-    const b_t_shape = [_]usize{ n, k };
-    var b_t = try Tensor.init(allocator, &b_t_shape);
-    defer b_t.deinit();
-
-    for (0..k) |row| {
-        for (0..n) |col| {
-            b_t.data[col * k + row] = b.data[row * n + col];
-        }
-    }
-
-    const Context = struct {
-        a_data: []const f32,
-        b_t_data: []const f32,
-        c_data: []f32,
-        m: usize,
-        k: usize,
-        n: usize,
-    };
-
-    const ctx = Context{
-        .a_data = a.data,
-        .b_t_data = b_t.data,
-        .c_data = c.data,
-        .m = m,
-        .k = k,
-        .n = n,
-    };
-
-    parallel.parallelFor(allocator, m, ctx, struct {
-        fn worker(cx: Context, start: usize, end: usize) void {
-            const kk = cx.k;
-            const nn = cx.n;
-            for (start..end) |i| {
-                const a_row = cx.a_data[i * kk .. (i + 1) * kk];
-                const c_row = cx.c_data[i * nn .. (i + 1) * nn];
-                for (0..nn) |j| {
-                    const b_col = cx.b_t_data[j * kk .. (j + 1) * kk];
-                    c_row[j] = dotProduct(a_row, b_col);
-                }
-            }
-        }
-    }.worker);
-
+    try gemm.gemm(allocator, m, n, k, a.data, k, b.data, n, .row_major, null, c.data);
     return c;
 }
 
@@ -259,47 +301,26 @@ pub fn linear(allocator: std.mem.Allocator, input: Tensor, weight: Tensor, bias:
     @memcpy(out_shape, input.shape);
     out_shape[in_rank - 1] = out_features;
 
-    const out = try Tensor.init(allocator, out_shape);
+    var out = try Tensor.init(allocator, out_shape);
+    errdefer out.deinit();
 
     const outer_count = input.numElements() / in_features;
 
-    const Context = struct {
-        in_data: []const f32,
-        w_data: []const f32,
-        bias: ?Tensor,
-        out_data: []f32,
-        in_f: usize,
-        out_f: usize,
-    };
-
-    const ctx = Context{
-        .in_data = input.data,
-        .w_data = weight.data,
-        .bias = bias,
-        .out_data = out.data,
-        .in_f = in_features,
-        .out_f = out_features,
-    };
-
-    parallel.parallelFor(allocator, outer_count, ctx, struct {
-        fn worker(c: Context, start: usize, end: usize) void {
-            const in_f = c.in_f;
-            const out_f = c.out_f;
-            for (start..end) |i| {
-                const in_vec = c.in_data[i * in_f .. (i + 1) * in_f];
-                const out_vec = c.out_data[i * out_f .. (i + 1) * out_f];
-
-                for (0..out_f) |j| {
-                    const w_row = c.w_data[j * in_f .. (j + 1) * in_f];
-                    var val = dotProduct(in_vec, w_row);
-                    if (c.bias) |b| {
-                        val += b.data[j];
-                    }
-                    out_vec[j] = val;
-                }
-            }
-        }
-    }.worker);
+    // `nn.Linear` stores its weight as [out_features, in_features], i.e. B
+    // already transposed.
+    try gemm.gemm(
+        allocator,
+        outer_count,
+        out_features,
+        in_features,
+        input.data,
+        in_features,
+        weight.data,
+        in_features,
+        .transposed,
+        if (bias) |b| b.data else null,
+        out.data,
+    );
 
     return out;
 }
@@ -315,31 +336,23 @@ pub fn batchedMatmul(allocator: std.mem.Allocator, a: Tensor, b: Tensor) !Tensor
     const n = b.shape[2];
 
     const out_shape = [_]usize{ batch, m, n };
-    var c = try Tensor.initZeros(allocator, &out_shape);
-
-    const b_t_shape = [_]usize{ n, k };
-    var b_t = try Tensor.init(allocator, &b_t_shape);
-    defer b_t.deinit();
+    var c = try Tensor.init(allocator, &out_shape);
+    errdefer c.deinit();
 
     for (0..batch) |b_idx| {
-        const a_batch = a.data[b_idx * m * k .. (b_idx + 1) * m * k];
-        const b_batch = b.data[b_idx * k * n .. (b_idx + 1) * k * n];
-        const c_batch = c.data[b_idx * m * n .. (b_idx + 1) * m * n];
-
-        for (0..k) |row| {
-            for (0..n) |col| {
-                b_t.data[col * k + row] = b_batch[row * n + col];
-            }
-        }
-
-        for (0..m) |i| {
-            const a_row = a_batch[i * k .. (i + 1) * k];
-            const c_row = c_batch[i * n .. (i + 1) * n];
-            for (0..n) |j| {
-                const b_col = b_t.data[j * k .. (j + 1) * k];
-                c_row[j] = dotProduct(a_row, b_col);
-            }
-        }
+        try gemm.gemm(
+            allocator,
+            m,
+            n,
+            k,
+            a.data[b_idx * m * k ..][0 .. m * k],
+            k,
+            b.data[b_idx * k * n ..][0 .. k * n],
+            n,
+            .row_major,
+            null,
+            c.data[b_idx * m * n ..][0 .. m * n],
+        );
     }
 
     return c;
@@ -404,4 +417,24 @@ test "Exact GELU matches reference values" {
     try std.testing.expectApproxEqAbs(@as(f32, -0.1586553), geluExact(-1.0), 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 1.9544997), geluExact(2.0), 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, -0.0040495), geluExact(-3.0), 1e-5);
+}
+
+test "expVec matches scalar @exp across the softmax range" {
+    // Softmax feeds it max-shifted values, so the interesting range is [-90, 0],
+    // but check a little either side of that too.
+    const probes = [_]f32{ -90.0, -40.0, -10.0, -1.0, -0.5, -0.001, 0.0, 0.5, 1.0, 5.0, 20.0, 80.0 };
+
+    var i: usize = 0;
+    while (i < probes.len) : (i += VEC_SIZE) {
+        var lane: [VEC_SIZE]f32 = @splat(0.0);
+        const take = @min(VEC_SIZE, probes.len - i);
+        @memcpy(lane[0..take], probes[i..][0..take]);
+
+        const got: [VEC_SIZE]f32 = expVec(@as(F32Vec, lane));
+        for (0..take) |j| {
+            const want = @exp(lane[j]);
+            const tol = @max(@abs(want) * 1e-6, 1e-30);
+            try std.testing.expectApproxEqAbs(want, got[j], tol);
+        }
+    }
 }
