@@ -1,111 +1,151 @@
-const std = @import("std");
+//! SAM 3 on ONNX Runtime.
+//!
+//! The runtime is built from source by the `onnxruntime` package next door, so
+//! there is nothing to install for the default build. `-Dopenvino=<prefix>`
+//! additionally builds that package's OpenVINO execution provider, which is how
+//! the runtime reaches an Intel NPU:
+//!
+//!     zig build run -Dopenvino=/path/to/openvino
+//!
+//! That build links a system OpenVINO and the host's libstdc++ rather than
+//! Zig's libc++ -- the provider and the runtime hand each other C++ objects
+//! across a dlopen boundary, so both have to match the ABI of the prebuilt
+//! `libopenvino.so`. See the `onnxruntime` package for what that costs.
+//!
+//! At run time the NPU plugin reaches the device through the Level Zero loader,
+//! which it dlopens by name, and the loader in turn dlopens the NPU driver. Both
+//! `libze_loader.so.1` and `libze_intel_npu.so.1` have to be on the library path.
+//! On NixOS they are in two different places -- the loader is an ordinary
+//! package, the driver is a hardware driver -- and neither is anywhere the
+//! dynamic loader looks by itself:
+//!
+//!     LD_LIBRARY_PATH=/run/opengl-driver/lib:/run/current-system/sw/lib \\
+//!         zig build run -Dopenvino=...
 
-// Although this function looks imperative, it does not perform the build
-// directly and instead it mutates the build graph (`b`) that will be then
-// executed by an external runner. The functions in `std.Build` implement a DSL
-// for defining build steps and express dependencies between them, allowing the
-// build runner to parallelize the build automatically (and the cache system to
-// know when a step doesn't need to be re-run).
+const std = @import("std");
+const onnxruntime = @import("onnxruntime");
+
+/// Where a session is asked to run. Not a promise: a graph a device turns down
+/// -- too large for the NPU, an operator the provider does not implement --
+/// falls back to the CPU at run time and says so.
+const Device = enum { npu, gpu, cpu };
+
 pub fn build(b: *std.Build) void {
-    // Standard target options allow the person running `zig build` to choose
-    // what target to build for. Here we do not override the defaults, which
-    // means any target is allowed, and the default is native. Other options
-    // for restricting supported target set are available.
     const target = b.standardTargetOptions(.{});
-    // Standard optimization options allow the person running `zig build` to select
-    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
-    // set a preferred release mode, allowing the user to decide how to optimize.
-    // ReleaseFast by default: this runs an 859M-parameter model, and a Debug
-    // build of the same pass is over ten times slower - slow enough that the
-    // default build would look broken rather than merely unoptimised.
-    // `-Doptimize=Debug` still works for actually debugging. This is spelled out
-    // rather than using `preferred_optimize_mode`, which only takes effect under
-    // `-Drelease` and drops the `-Doptimize` flag entirely.
+    // ReleaseFast by default: preprocessing a frame and resampling masks back
+    // up to it are the only arithmetic left in this program, but a Debug build
+    // of them is slow enough to look like the model is at fault.
     const optimize = b.option(
         std.builtin.OptimizeMode,
         "optimize",
         "Prioritize performance, safety, or binary size (default: ReleaseFast)",
     ) orelse .ReleaseFast;
-    // It's also possible to define more custom flags to toggle optional features
-    // of this build script using `b.option()`. All defined flags (including
-    // target and optimize options) will be listed when running `zig build --help`
-    // in this directory.
 
-    // This creates a module, which represents a collection of source files alongside
-    // some compilation options, such as optimization mode and linked system libraries.
-    // Zig modules are the preferred way of making Zig code available to consumers.
-    // addModule defines a module that we intend to make available for importing
-    // to our consumers. We must give it a name because a Zig package can expose
-    // multiple modules and consumers will need to be able to specify which
-    // module they want to access.
+    // --- ONNX Runtime -------------------------------------------------------
+    //
+    // Without `-Dopenvino` this is one static library and nothing else: the CPU
+    // execution provider, compiled from source, depending on no system library
+    // beyond libc. With it there are three artifacts and a system OpenVINO
+    // behind them, and the wiring below is what the runtime needs to find them
+    // again at run time.
+
+    const openvino = b.option(
+        []const u8,
+        "openvino",
+        "Prefix of a system OpenVINO (2026.0+) to build the execution provider against, for Intel NPU and GPU support",
+    );
+    const openvino_include = b.option(
+        []const u8,
+        "openvino-include",
+        "Include directory of the OpenVINO headers, if not <prefix>/include",
+    );
+    const device = b.option(
+        Device,
+        "device",
+        "Which device to run the model on (default: npu with -Dopenvino, otherwise cpu)",
+    ) orelse if (openvino != null) Device.npu else Device.cpu;
+
+    const untested_npu = b.option(
+        bool,
+        "untested-npu",
+        "Use the NPU even on a generation this has not been run on (default: false)",
+    ) orelse false;
+
+    if (openvino == null and device != .cpu) {
+        std.log.err("-Ddevice={t} needs -Dopenvino: only the CPU provider is built without it", .{device});
+        std.process.exit(1);
+    }
+
+    const ort = if (openvino) |prefix| b.dependency("onnxruntime", .{
+        .target = target,
+        .optimize = optimize,
+        .openvino = prefix,
+        .@"openvino-include" = openvino_include orelse b.pathJoin(&.{ prefix, "include" }),
+    }) else b.dependency("onnxruntime", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const zigimg = b.dependency("zigimg", .{
         .target = target,
         .optimize = optimize,
     });
 
     const mod = b.addModule("sam3", .{
-        // The root source file is the "entry point" of this module. Users of
-        // this module will only be able to access public declarations contained
-        // in this file, which means that if you have declarations that you
-        // intend to expose to consumers that were defined in other files part
-        // of this module, you will have to make sure to re-export them from
-        // the root file.
         .root_source_file = b.path("src/root.zig"),
-        // Later on we'll use this module as the root module of a test executable
-        // which requires us to specify a target.
         .target = target,
+        .optimize = optimize,
         .imports = &.{
             .{ .name = "zigimg", .module = zigimg.module("zigimg") },
         },
     });
+    // Linking the artifact carries its headers along, so `@cInclude`ing
+    // "onnxruntime_c_api.h" needs no include path of our own.
+    mod.linkLibrary(ort.artifact("onnxruntime"));
 
-    // Here we define an executable. An executable needs to have a root module
-    // which needs to expose a `main` function. While we could add a main function
-    // to the module defined above, it's sometimes preferable to split business
-    // logic and the CLI into two separate modules.
-    //
-    // If your goal is to create a Zig library for others to use, consider if
-    // it might benefit from also exposing a CLI tool. A parser library for a
-    // data serialization format could also bundle a CLI syntax checker, for example.
-    //
-    // If instead your goal is to create an executable, consider if users might
-    // be interested in also being able to embed the core functionality of your
-    // program in their own executable in order to avoid the overhead involved in
-    // subprocessing your CLI tool.
-    //
-    // If neither case applies to you, feel free to delete the declaration you
-    // don't need and to put everything under a single module.
     const exe = b.addExecutable(.{
         .name = "sam3",
         .root_module = b.createModule(.{
-            // b.createModule defines a new module just like b.addModule but,
-            // unlike b.addModule, it does not expose the module to consumers of
-            // this package, which is why in this case we don't have to give it a name.
             .root_source_file = b.path("src/main.zig"),
-            // Target and optimization levels must be explicitly wired in when
-            // defining an executable or library (in the root module), and you
-            // can also hardcode a specific target for an executable or library
-            // definition if desireable (e.g. firmware for embedded devices).
             .target = target,
             .optimize = optimize,
-            // List of modules available for import in source files part of the
-            // root module.
             .imports = &.{
-                // Here "sam3" is the name you will use in your source code to
-                // import this module (e.g. `@import("sam3")`). The name is
-                // repeated because you are allowed to rename your imports, which
-                // can be extremely useful in case of collisions (which can happen
-                // importing modules from different packages).
                 .{ .name = "sam3", .module = mod },
             },
         }),
     });
-
-    // This declares intent for the executable to be installed into the
-    // install prefix when running `zig build` (i.e. when executing the default
-    // step). By default the install prefix is `zig-out/` but can be overridden
-    // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
+
+    var provider_path: []const u8 = "";
+    var cache_path: []const u8 = "";
+    if (openvino != null) {
+        // Compiling the vision encoder for an NPU takes minutes. The provider
+        // keeps the result here, so only the first run pays for it -- and it is
+        // derived data, so it belongs beside everything else the build cached.
+        cache_path = b.cache_root.join(b.allocator, &.{ "sam3", "openvino-cache" }) catch @panic("OOM");
+
+        // An OpenVINO build runs on the host's libstdc++, and Zig does not
+        // carry a static library's link objects across to whoever links it.
+        onnxruntime.linkStdCxx(b, mod);
+        onnxruntime.linkStdCxx(b, exe.root_module);
+
+        // `libonnxruntime_providers_shared.so` is one global pointer and
+        // nothing else. The runtime dlopens it by name, out of the directory
+        // the running binary sits in -- hence `.bin` rather than the usual
+        // `lib` -- and leaves a vtable of its internals there for the provider
+        // to pick back up.
+        b.getInstallStep().dependOn(&b.addInstallArtifact(
+            ort.artifact("onnxruntime_providers_shared"),
+            .{ .dest_dir = .{ .override = .bin } },
+        ).step);
+
+        // The provider itself the runtime does not link at all: it dlopens it
+        // by path when asked, so all the executable needs is to know where it
+        // was installed.
+        const provider = b.addInstallArtifact(ort.artifact("onnxruntime_providers_openvino"), .{});
+        b.getInstallStep().dependOn(&provider.step);
+        provider_path = b.getInstallPath(.lib, "libonnxruntime_providers_openvino.so");
+    }
 
     // --- Asset fetching -----------------------------------------------------
     //
@@ -114,11 +154,9 @@ pub fn build(b: *std.Build) void {
     // no shell and no image tooling. Both steps are idempotent: a file that is
     // already present and matches its published SHA-256 is left alone.
     //
-    // The checkpoint is not a `build.zig.zon` dependency on purpose. It is
-    // 3.2 GiB, `facebook/sam3` is gated behind a manual approval form, and the
-    // package manager cannot send the `Authorization` header that unlocks it —
-    // so the download is verified against Meta's published SHA-256 instead of a
-    // package hash.
+    // The exports are not `build.zig.zon` dependencies on purpose. Together
+    // they are 1.8 GiB, and the package manager would have to hash them into
+    // the global cache before the build could look at them.
 
     const fetch_exe = b.addExecutable(.{
         .name = "fetch",
@@ -132,58 +170,63 @@ pub fn build(b: *std.Build) void {
     const hf_repo = b.option(
         []const u8,
         "hf-repo",
-        "Hugging Face repo to pull SAM 3 from (default: a public mirror; set HF_TOKEN and pass facebook/sam3 for the official one)",
-    ) orelse "jetjodh/sam3";
+        "Hugging Face repo to pull the SAM 3 ONNX export from",
+    ) orelse "onnx-community/sam3-tracker-ONNX";
 
-    const weights_step = b.step("fetch-weights", "Download Meta's SAM 3 checkpoint and tokenizer assets");
+    const weights_step = b.step("fetch-weights", "Download the SAM 3 tracker ONNX export");
 
     // Everything the build downloads is derived data, not source, so it goes to
     // the build cache rather than the working tree, and the executable is told
-    // where it landed through `build_options` — the program itself takes no
-    // arguments. Stable names (rather than content-hashed step outputs) are what
-    // make re-running a fetch cheap: a file that is already there and matches
-    // its published SHA-256 is left alone.
-    const checkpoint_path = b.cache_root.join(b.allocator, &.{ "sam3", "sam3.safetensors" }) catch @panic("OOM");
+    // where it landed through `build_options` -- the program itself takes no
+    // arguments. Stable names (rather than content-hashed step outputs) are
+    // what make re-running a fetch cheap.
+    //
+    // Each graph is a pair: a small `.onnx` holding the structure, and an
+    // `.onnx_data` holding the weights, which the first names by a path
+    // relative to its own directory. They have to land side by side.
+    var vision_path: []const u8 = "";
+    var decoder_path: []const u8 = "";
 
-    const checkpoint = b.addRunArtifact(fetch_exe);
-    checkpoint.has_side_effects = true;
-    checkpoint.setCwd(b.path("."));
-    checkpoint.addArgs(&.{
-        "--url",
-        b.fmt("https://huggingface.co/{s}/resolve/main/model.safetensors", .{hf_repo}),
-        "--out",
-        checkpoint_path,
-        // Meta's published checksum for the 859.9M-parameter F32 checkpoint.
-        "--sha256",
-        "6d06f0a5f84e435071fe6603e61d0b4cc7b40e0d39d487cfd4d67d8cc11cc14a",
-        "--token-env",
-        "HF_TOKEN",
-        "--label",
-        "sam3.safetensors (3.2 GiB)",
-    });
-    weights_step.dependOn(&checkpoint.step);
-
-    for ([_][]const u8{
-        "config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-        "vocab.json",
-        "merges.txt",
-        "LICENSE",
+    for ([_][3][]const u8{
+        .{
+            "vision_encoder.onnx",
+            "9f284aab8c3d8e81e9c79f7b566f9cea43b7bc9afdd920eee2390fb65b3db897",
+            "vision_encoder.onnx",
+        },
+        .{
+            "vision_encoder.onnx_data",
+            "838e1f0b2d0394ed3bd3b3499775dd6676524e1dfc5a7371948a76dcb69e4dd3",
+            "vision_encoder.onnx_data (1.7 GiB)",
+        },
+        .{
+            "prompt_encoder_mask_decoder.onnx",
+            "4f9ac85291d634ae36a21ce940e3c09671cc05b6511966e5d3d96988b12b95f8",
+            "prompt_encoder_mask_decoder.onnx",
+        },
+        .{
+            "prompt_encoder_mask_decoder.onnx_data",
+            "2d870726d484cb496760fd139c21f115cf1b945c6b69583489faa2ac79f1d2ae",
+            "prompt_encoder_mask_decoder.onnx_data (21 MiB)",
+        },
     }) |asset| {
+        const out = b.cache_root.join(b.allocator, &.{ "sam3", "onnx", asset[0] }) catch @panic("OOM");
+        if (std.mem.eql(u8, asset[0], "vision_encoder.onnx")) vision_path = out;
+        if (std.mem.eql(u8, asset[0], "prompt_encoder_mask_decoder.onnx")) decoder_path = out;
+
         const run = b.addRunArtifact(fetch_exe);
         run.has_side_effects = true;
         run.setCwd(b.path("."));
         run.addArgs(&.{
             "--url",
-            b.fmt("https://huggingface.co/{s}/resolve/main/{s}", .{ hf_repo, asset }),
+            b.fmt("https://huggingface.co/{s}/resolve/main/onnx/{s}", .{ hf_repo, asset[0] }),
             "--out",
-            b.cache_root.join(b.allocator, &.{ "sam3", asset }) catch @panic("OOM"),
+            out,
+            "--sha256",
+            asset[1],
             "--token-env",
             "HF_TOKEN",
             "--label",
-            asset,
+            asset[2],
         });
         weights_step.dependOn(&run.step);
     }
@@ -221,73 +264,44 @@ pub fn build(b: *std.Build) void {
         examples_step.dependOn(&run.step);
     }
 
-    // Where those two downloads ended up, as compile-time constants in the
-    // executable. This is the only channel: `sam3` parses no arguments, so the
-    // build steps that fetch the checkpoint and the image are also what say
-    // where they are.
+    // Where those two downloads ended up, and which device to ask for, as
+    // compile-time constants in the executable. This is the only channel:
+    // `sam3` parses no arguments, so the build steps that fetch the model and
+    // the image are also what say where they are.
     const exe_options = b.addOptions();
-    exe_options.addOption([]const u8, "weights_path", checkpoint_path);
+    exe_options.addOption([]const u8, "vision_encoder_path", vision_path);
+    exe_options.addOption([]const u8, "decoder_path", decoder_path);
+    exe_options.addOption([]const u8, "openvino_provider_path", provider_path);
+    exe_options.addOption([]const u8, "openvino_cache_path", cache_path);
     exe_options.addOption([]const u8, "image_path", cat_path);
+    exe_options.addOption([]const u8, "device", @tagName(device));
+    exe_options.addOption(bool, "untested_npu", untested_npu);
     exe.root_module.addOptions("build_options", exe_options);
 
-    // This creates a top level step. Top level steps have a name and can be
-    // invoked by name when running `zig build` (e.g. `zig build run`).
-    // This will evaluate the `run` step rather than the default step.
-    // For a top level step to actually do something, it must depend on other
-    // steps (e.g. a Run step, as we will see in a moment).
     const run_step = b.step("run", "Segment the sample cat image with the real checkpoint");
-
-    // This creates a RunArtifact step in the build graph. A RunArtifact step
-    // invokes an executable compiled by Zig. Steps will only be executed by the
-    // runner if invoked directly by the user (in the case of top level steps)
-    // or if another step depends on it, so it's up to you to define when and
-    // how this Run step will be executed. In our case we want to run it when
-    // the user runs `zig build run`, so we create a dependency link.
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
 
     // By making the run step depend on the default step, it will be run from the
-    // installation directory rather than directly from within the cache directory.
+    // installation directory rather than directly from within the cache
+    // directory -- which is also where the runtime looks for
+    // `libonnxruntime_providers_shared.so`.
     run_cmd.step.dependOn(b.getInstallStep());
-    // The app takes no arguments: it reads the checkpoint and the sample image
-    // from fixed paths relative to the project root, so both fetch steps have to
-    // have run first, and the working directory has to be that root whatever
+    // The app takes no arguments: it reads the model and the sample image from
+    // fixed paths under the build cache, so both fetch steps have to have run
+    // first, and the working directory has to be the project root whatever
     // directory `zig build` itself was invoked from.
     run_cmd.step.dependOn(weights_step);
     run_cmd.step.dependOn(examples_step);
     run_cmd.setCwd(b.path("."));
 
-    // Creates an executable that will run `test` blocks from the provided module.
-    const mod_tests = b.addTest(.{
-        .root_module = mod,
-    });
-
-    // A run step that will run the test executable.
+    const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
-    // Creates an executable that will run `test` blocks from the executable's
-    // root module.
-    const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
-    });
-
-    // A run step that will run the second test executable.
+    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
-    // A top level step for running all tests.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
-
-    // Just like flags, top level steps are also listed in the `--help` menu.
-    //
-    // The Zig build system is entirely implemented in userland, which means
-    // that it cannot hook into private compiler APIs. All compilation work
-    // orchestrated by the build system will result in other Zig compiler
-    // subcommands being invoked with the right flags defined. You can observe
-    // these invocations when one fails (or you pass a flag to increase
-    // verbosity) to validate assumptions and diagnose problems.
-    //
-    // Lastly, the Zig build system is relatively simple and self-contained,
-    // and reading its source code will allow you to master it.
 }

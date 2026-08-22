@@ -32,6 +32,9 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
+        .onnxruntime = .{
+            .path = "../onnxruntime",
+        },
         .zigimg = .{
             .url = "git+https://github.com/zigimg/zigimg#a7440df3fc41cde7df078b1c5829646c13056d49",
             .hash = "zigimg-0.1.0-8_eo2sPVFwAm8y-DVfaCHNKQIpv9oHl_mbcKbGQZRLrK",
