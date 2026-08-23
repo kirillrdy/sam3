@@ -20,13 +20,9 @@ const ImageRGB = @import("io/image.zig").ImageRGB;
 /// built for this grid, so it is not a resolution the caller gets to pick.
 pub const image_size: usize = 1008;
 
-/// A click, in coordinates normalised to the frame. `label` is 1 for a point
-/// the mask should include and 0 for one it should exclude.
-pub const Point = struct {
-    x: f32,
-    y: f32,
-    label: i64 = 1,
-};
+/// A click, in coordinates normalised to the frame. Defined next door so the
+/// browser client can share it -- see `point.zig`.
+pub const Point = @import("point.zig").Point;
 
 /// Where the two exported graphs and the OpenVINO provider live on disk.
 pub const Paths = struct {
@@ -216,6 +212,16 @@ pub const Model = struct {
 
     /// Runs both graphs over one frame. The caller owns the result.
     pub fn segment(self: *Model, img: ImageRGB, points: []const Point) !Masks {
+        var embedding = try self.encode(img);
+        defer embedding.deinit();
+        return self.decode(embedding, points);
+    }
+
+    /// The vision encoder alone. Split out from `segment` because it is where
+    /// nearly all of the time goes and it does not depend on the prompt: a
+    /// caller answering several clicks about the same frame -- the web UI is
+    /// one -- encodes once and decodes as often as it likes.
+    pub fn encode(self: *Model, img: ImageRGB) !Embedding {
         const pixels = try preprocess(self.allocator, img);
         defer self.allocator.free(pixels);
 
@@ -223,15 +229,19 @@ pub const Model = struct {
         const pixel_values = try onnx.Value.borrowF32(pixels, &pixel_shape);
         defer pixel_values.deinit();
 
-        var embeddings: [embedding_names.len]onnx.Value = undefined;
+        var embedding: Embedding = undefined;
         try self.vision.run(
             &.{vision_input},
             &.{pixel_values},
             &embedding_names,
-            &embeddings,
+            &embedding.levels,
         );
-        defer for (embeddings) |e| e.deinit();
+        return embedding;
+    }
 
+    /// The prompt encoder and mask decoder, over a pyramid `encode` produced.
+    /// The caller owns the result and keeps the pyramid.
+    pub fn decode(self: *Model, embedding: Embedding, points: []const Point) !Masks {
         // The decoder wants pixels of the encoder's own input, not of the frame.
         const coordinates = try self.allocator.alloc(f32, points.len * 2);
         defer self.allocator.free(coordinates);
@@ -264,7 +274,7 @@ pub const Model = struct {
 
         var inputs: [decoder_inputs.len]onnx.Value = undefined;
         inputs[0..3].* = .{ input_points, input_labels, input_boxes };
-        inputs[3..].* = embeddings;
+        inputs[3..].* = embedding.levels;
 
         var results: [decoder_outputs.len]onnx.Value = undefined;
         try self.decoder.run(
@@ -276,6 +286,18 @@ pub const Model = struct {
         defer for (results) |r| r.deinit();
 
         return Masks.take(self.allocator, results[0], results[1], results[2]);
+    }
+};
+
+/// One frame as the vision encoder left it: three levels of feature pyramid,
+/// still in the runtime's own tensors. Around 100 MB, so this is deliberately
+/// something a caller holds on to rather than something `segment` copies out.
+pub const Embedding = struct {
+    levels: [embedding_names.len]onnx.Value,
+
+    pub fn deinit(self: *Embedding) void {
+        for (self.levels) |level| level.deinit();
+        self.* = undefined;
     }
 };
 

@@ -1,7 +1,7 @@
 const std = @import("std");
 const ImageRGB = @import("image.zig").ImageRGB;
 const RGB = @import("image.zig").RGB;
-const Point = @import("../sam3.zig").Point;
+const Point = @import("../point.zig").Point;
 
 /// Tints every pixel the mask claims. `mask` holds logits at the image's own
 /// resolution -- the decoder's output resampled -- and the threshold is zero,

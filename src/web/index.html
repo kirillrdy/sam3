@@ -1,0 +1,193 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>SAM 3</title>
+<style>
+  :root { color-scheme: dark; --bg: #14161a; --panel: #1c1f25; --line: #2c3038; --ink: #e6e8ec; --dim: #969ba5; --accent: #00dc64; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px; background: var(--bg); color: var(--ink);
+         font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; }
+  main { max-width: 1000px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+  h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  h1 span { color: var(--dim); font-weight: 400; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button, label.file { background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+                       border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer; }
+  button:hover, label.file:hover { border-color: var(--dim); }
+  button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  input[type=file] { display: none; }
+  #stage { border: 1px solid var(--line); border-radius: 8px; background: var(--panel);
+           padding: 8px; min-height: 120px; display: flex; justify-content: center; }
+  canvas { max-width: 100%; height: auto; border-radius: 4px; cursor: crosshair; display: none; }
+  #status { color: var(--dim); min-height: 21px; }
+  #masks { display: flex; flex-wrap: wrap; gap: 8px; }
+  #masks button { text-align: left; line-height: 1.35; }
+  #masks small { display: block; color: var(--dim); }
+  footer { color: var(--dim); font-size: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
+  code { color: var(--ink); }
+</style>
+
+<main>
+  <h1>SAM 3 <span>— click an object to segment it</span></h1>
+
+  <div class="bar">
+    <label class="file">Open image<input type="file" id="file" accept="image/*"></label>
+    <button id="sample">Sample image</button>
+    <button id="mode" aria-pressed="true">Clicks add to the mask</button>
+    <button id="clear">Clear points</button>
+  </div>
+
+  <div id="status">Loading the wasm client…</div>
+  <div id="stage"><canvas id="canvas"></canvas></div>
+  <div id="masks"></div>
+
+  <footer>
+    The image is decoded, the mask upsampled and the overlay drawn in
+    <code>client.wasm</code>; the server runs the two ONNX graphs and sends back
+    the raw mask logits. Right-click (or shift-click) marks a point to exclude.
+  </footer>
+</main>
+
+<script>
+// Glue, and nothing else: this file moves bytes between the wasm module and the
+// three browser APIs it cannot reach -- the file input, the canvas and fetch.
+// Every decision about the image, the prompt and the mask is made in Zig.
+const ui = {
+  file: document.getElementById('file'),
+  sample: document.getElementById('sample'),
+  mode: document.getElementById('mode'),
+  clear: document.getElementById('clear'),
+  status: document.getElementById('status'),
+  canvas: document.getElementById('canvas'),
+  masks: document.getElementById('masks'),
+};
+const ctx = ui.canvas.getContext('2d');
+
+let wasm = null;      // the module's exports
+let upload = null;    // the file's bytes, exactly as the server will see them
+let include = true;   // what the next click means
+let busy = false;
+
+const say = (text) => { ui.status.textContent = text; };
+
+// A copy into the module's own memory: there is no way to hand wasm a
+// JavaScript buffer, so it is asked for room and written into.
+function send(bytes) {
+  const ptr = wasm.alloc(bytes.length);
+  if (!ptr) throw new Error('out of memory in the wasm client');
+  new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
+  return ptr;
+}
+
+// `memory.buffer` is detached whenever the module grows its heap, so every view
+// of it is made fresh at the point of use.
+function paint() {
+  const w = wasm.imageWidth(), h = wasm.imageHeight();
+  if (!w || !h) return;
+  ui.canvas.width = w;
+  ui.canvas.height = h;
+  ui.canvas.style.display = 'block';
+  const pixels = new Uint8ClampedArray(wasm.memory.buffer, wasm.framePtr(), w * h * 4);
+  ctx.putImageData(new ImageData(pixels.slice(), w, h), 0, 0);
+}
+
+function listMasks() {
+  ui.masks.replaceChildren();
+  const count = wasm.maskCount();
+  if (!count) return;
+  const best = wasm.bestMask();
+  for (let i = 0; i < count; i++) {
+    const button = document.createElement('button');
+    button.innerHTML = `Mask ${i}${i === best ? ' ★' : ''}` +
+      `<small>IoU ${wasm.maskScore(i).toFixed(3)} · ` +
+      `${(wasm.maskCoverage(i) * 100).toFixed(1)}% of the frame</small>`;
+    button.onclick = () => {
+      wasm.render(i);
+      paint();
+      for (const other of ui.masks.children) other.setAttribute('aria-pressed', other === button);
+    };
+    ui.masks.append(button);
+  }
+  ui.masks.children[best].setAttribute('aria-pressed', 'true');
+}
+
+async function openImage(bytes) {
+  if (!wasm) return say('The wasm client is still loading.');
+  upload = bytes;
+  const ptr = send(bytes);
+  const ok = wasm.loadImage(ptr, bytes.length) === 0;
+  wasm.dealloc(ptr, bytes.length);
+  ui.masks.replaceChildren();
+  if (!ok) return say('That file is not an image this can decode.');
+  paint();
+  say(`${wasm.imageWidth()} × ${wasm.imageHeight()} — click the object you want.`);
+}
+
+async function segment() {
+  if (busy || !upload || wasm.pointCount() === 0) return;
+  busy = true;
+  say('Segmenting… the first click on an image also runs the vision encoder.');
+  try {
+    const query = new TextDecoder().decode(
+      new Uint8Array(wasm.memory.buffer, wasm.queryPtr(), wasm.queryLen()));
+    const response = await fetch('/segment?' + query, { method: 'POST', body: upload });
+    if (!response.ok) return say('Server: ' + (await response.text()));
+
+    const answer = new Uint8Array(await response.arrayBuffer());
+    const ptr = send(answer);
+    const count = wasm.loadMasks(ptr, answer.length);
+    wasm.dealloc(ptr, answer.length);
+    if (count < 0) return say('The server sent something this cannot read.');
+
+    wasm.render(wasm.bestMask());
+    paint();
+    listMasks();
+    say(`${count} hypotheses — object score ${wasm.objectScore().toFixed(3)}.`);
+  } catch (error) {
+    say('Request failed: ' + error.message);
+  } finally {
+    busy = false;
+  }
+}
+
+ui.canvas.addEventListener('contextmenu', (event) => event.preventDefault());
+ui.canvas.addEventListener('mousedown', (event) => {
+  if (busy) return;
+  const rect = ui.canvas.getBoundingClientRect();
+  const positive = include && event.button !== 2 && !event.shiftKey;
+  wasm.addPoint(event.clientX - rect.left, event.clientY - rect.top,
+                rect.width, rect.height, positive ? 1 : 0);
+  wasm.render(-1);
+  paint();
+  segment();
+});
+
+ui.file.onchange = async () => {
+  if (ui.file.files.length) await openImage(new Uint8Array(await ui.file.files[0].arrayBuffer()));
+};
+
+ui.sample.onclick = async () => {
+  const response = await fetch('/example.png');
+  if (!response.ok) return say('This build has no sample image; run `zig build fetch-examples`.');
+  await openImage(new Uint8Array(await response.arrayBuffer()));
+};
+
+ui.mode.onclick = () => {
+  include = !include;
+  ui.mode.setAttribute('aria-pressed', include);
+  ui.mode.textContent = include ? 'Clicks add to the mask' : 'Clicks cut from the mask';
+};
+
+ui.clear.onclick = () => {
+  if (!wasm) return;
+  wasm.clearPoints();
+  ui.masks.replaceChildren();
+  paint();
+  say('Points cleared.');
+};
+
+WebAssembly.instantiateStreaming(fetch('/client.wasm'), {}).then((module) => {
+  wasm = module.instance.exports;
+  say('Open an image, or start with the sample.');
+}, (error) => say('Could not load client.wasm: ' + error.message));
+</script>

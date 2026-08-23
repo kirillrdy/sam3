@@ -33,7 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .onnxruntime = .{
-            .path = "../onnxruntime",
+            .url = "git+https://github.com/kirillrdy/onnxruntime#21549a708193f1c3104c57518f8d4073d863bfc3",
+            .hash = "onnxruntime-1.29.0-fNg4hNKVAQBRmhkIH3a-oJ6-DVHXrGyfmyHQBtJZ-rSJ",
         },
         .zigimg = .{
             .url = "git+https://github.com/zigimg/zigimg#a7440df3fc41cde7df078b1c5829646c13056d49",

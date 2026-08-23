@@ -1,26 +1,39 @@
 //! SAM 3 on ONNX Runtime.
 //!
+//! Two programs over one model: `zig build run` segments the sample image from
+//! the command line, and `zig build serve` puts the same thing behind a
+//! browser, where clicking the picture is the prompt.
+//!
 //! The runtime is built from source by the `onnxruntime` package next door, so
-//! there is nothing to install for the default build. `-Dopenvino=<prefix>`
-//! additionally builds that package's OpenVINO execution provider, which is how
-//! the runtime reaches an Intel NPU:
+//! there is nothing to install for the default build. Asking for a device the
+//! CPU provider cannot serve additionally builds that package's OpenVINO
+//! execution provider, which is how the runtime reaches an Intel NPU:
 //!
-//!     zig build run -Dopenvino=/path/to/openvino
+//!     zig build run -Ddevice=npu
 //!
-//! That build links a system OpenVINO and the host's libstdc++ rather than
+//! The OpenVINO behind that is Intel's own release, which the `onnxruntime`
+//! package downloads and unpacks on its own -- where it puts it, and why it
+//! cannot be an ordinary package dependency, are questions for that package.
+//! Nothing here knows more than which of the two to ask for.
+//!
+//! `-Dopenvino=<prefix>` builds against an installed one instead, and implies
+//! `-Ddevice=npu`, so naming one is the whole of it. `-Dopenvino-lib` and
+//! `-Dopenvino-include` say where inside that prefix to look when its layout is
+//! not the usual one; both are passed straight through.
+//!
+//! Either way the build links that OpenVINO and the host's libstdc++ rather than
 //! Zig's libc++ -- the provider and the runtime hand each other C++ objects
 //! across a dlopen boundary, so both have to match the ABI of the prebuilt
 //! `libopenvino.so`. See the `onnxruntime` package for what that costs.
 //!
 //! At run time the NPU plugin reaches the device through the Level Zero loader,
 //! which it dlopens by name, and the loader in turn dlopens the NPU driver. Both
-//! `libze_loader.so.1` and `libze_intel_npu.so.1` have to be on the library path.
-//! On NixOS they are in two different places -- the loader is an ordinary
-//! package, the driver is a hardware driver -- and neither is anywhere the
-//! dynamic loader looks by itself:
-//!
-//!     LD_LIBRARY_PATH=/run/opengl-driver/lib:/run/current-system/sw/lib \\
-//!         zig build run -Dopenvino=...
+//! `libze_loader.so.1` and `libze_intel_npu.so.1` have to be on the library path,
+//! and on NixOS neither is anywhere the dynamic loader looks by itself. `run` and
+//! `serve` go and find them -- see `npu_library_dirs` -- so neither step needs an
+//! `LD_LIBRARY_PATH` of its own; `-Dnpu-library-path=<dir>` says where when the
+//! search comes up short. A binary run straight out of `zig-out/bin` is on its
+//! own, and does still need the variable set.
 
 const std = @import("std");
 const onnxruntime = @import("onnxruntime");
@@ -30,16 +43,31 @@ const onnxruntime = @import("onnxruntime");
 /// falls back to the CPU at run time and says so.
 const Device = enum { npu, gpu, cpu };
 
+/// What the NPU stack is dlopened by name, and so has to be found by name.
+///
+/// Neither of these is linked by anything the build produces: the NPU plugin
+/// dlopens the Level Zero loader, and the loader dlopens the driver behind it.
+/// Nothing in that chain consults an rpath of ours, which leaves
+/// `LD_LIBRARY_PATH` as the only channel -- so `run` and `serve` set it.
+const npu_libraries = [_][]const u8{ "libze_loader.so.1", "libze_intel_npu.so.1" };
+
+/// Where to look for them, in order, after anything `-Dnpu-library-path` gave.
+///
+/// The two are in different trees on NixOS -- the loader is an ordinary
+/// package, the driver is a hardware driver -- and neither tree is anywhere the
+/// dynamic loader looks by itself. Distributions that put both somewhere on the
+/// default path need none of this, and searching for them there costs a stat.
+const npu_library_dirs = [_][]const u8{
+    "/run/opengl-driver/lib",
+    "/run/current-system/sw/lib",
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib64",
+    "/usr/lib",
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    // ReleaseFast by default: preprocessing a frame and resampling masks back
-    // up to it are the only arithmetic left in this program, but a Debug build
-    // of them is slow enough to look like the model is at fault.
-    const optimize = b.option(
-        std.builtin.OptimizeMode,
-        "optimize",
-        "Prioritize performance, safety, or binary size (default: ReleaseFast)",
-    ) orelse .ReleaseFast;
+    const optimize = b.standardOptimizeOption(.{});
 
     // --- ONNX Runtime -------------------------------------------------------
     //
@@ -59,10 +87,15 @@ pub fn build(b: *std.Build) void {
         "openvino-include",
         "Include directory of the OpenVINO headers, if not <prefix>/include",
     );
+    const openvino_lib = b.option(
+        []const u8,
+        "openvino-lib",
+        "Directory holding libopenvino.so and the plugins, if not <prefix>/lib",
+    );
     const device = b.option(
         Device,
         "device",
-        "Which device to run the model on (default: npu with -Dopenvino, otherwise cpu)",
+        "Which device to run the model on (default: cpu, or npu when -Dopenvino names one). Asking for anything but the CPU is what builds the OpenVINO execution provider",
     ) orelse if (openvino != null) Device.npu else Device.cpu;
 
     const untested_npu = b.option(
@@ -71,20 +104,51 @@ pub fn build(b: *std.Build) void {
         "Use the NPU even on a generation this has not been run on (default: false)",
     ) orelse false;
 
-    if (openvino == null and device != .cpu) {
-        std.log.err("-Ddevice={t} needs -Dopenvino: only the CPU provider is built without it", .{device});
-        std.process.exit(1);
-    }
+    const npu_library_path = b.option(
+        []const []const u8,
+        "npu-library-path",
+        "Directory holding the Level Zero loader or the NPU driver, for when `run` and `serve` do not find them themselves",
+    ) orelse &.{};
 
-    const ort = if (openvino) |prefix| b.dependency("onnxruntime", .{
+    const host = b.option(
+        []const u8,
+        "host",
+        "Address the web UI binds to (default: 127.0.0.1)",
+    ) orelse "127.0.0.1";
+
+    const port = b.option(
+        u16,
+        "port",
+        "Port the web UI listens on (default: 3000)",
+    ) orelse 3000;
+
+    // Whether the provider is built at all, and against what. Naming an
+    // installed OpenVINO is always honoured; otherwise asking for a device the
+    // CPU provider cannot serve is what calls for the one the package next door
+    // downloads. Where that lands, and what it costs to reach, are its business
+    // rather than ours -- all this says is which of the two it is.
+    const with_openvino = openvino != null or device != .cpu;
+
+    const ort = if (!with_openvino) b.dependency("onnxruntime", .{
+        .target = target,
+        .optimize = optimize,
+    }) else if (openvino) |prefix| b.dependency("onnxruntime", .{
         .target = target,
         .optimize = optimize,
         .openvino = prefix,
         .@"openvino-include" = openvino_include orelse b.pathJoin(&.{ prefix, "include" }),
+        .@"openvino-lib" = openvino_lib orelse b.pathJoin(&.{ prefix, "lib" }),
     }) else b.dependency("onnxruntime", .{
         .target = target,
         .optimize = optimize,
+        .@"openvino-fetch" = true,
     });
+
+    // A downloaded OpenVINO sits in the build cache with its own oneTBB beside
+    // it, and none of that is anywhere the dynamic loader looks, so `run` and
+    // `serve` are told where it went. An installed one is the system's problem.
+    const openvino_runtime_paths: []const []const u8 =
+        if (with_openvino and openvino == null) onnxruntime.openvinoRuntimeLibraryPaths(b) else &.{};
 
     const zigimg = b.dependency("zigimg", .{
         .target = target,
@@ -109,6 +173,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = if (optimize == .ReleaseFast) true else null,
             .imports = &.{
                 .{ .name = "sam3", .module = mod },
             },
@@ -118,7 +183,7 @@ pub fn build(b: *std.Build) void {
 
     var provider_path: []const u8 = "";
     var cache_path: []const u8 = "";
-    if (openvino != null) {
+    if (with_openvino) {
         // Compiling the vision encoder for an NPU takes minutes. The provider
         // keeps the result here, so only the first run pays for it -- and it is
         // derived data, so it belongs beside everything else the build cached.
@@ -163,7 +228,8 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/fetch.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = optimize,
+            .strip = if (optimize == .ReleaseFast) true else null,
         }),
     });
 
@@ -266,8 +332,9 @@ pub fn build(b: *std.Build) void {
 
     // Where those two downloads ended up, and which device to ask for, as
     // compile-time constants in the executable. This is the only channel:
-    // `sam3` parses no arguments, so the build steps that fetch the model and
-    // the image are also what say where they are.
+    // neither executable parses arguments, so the build steps that fetch the
+    // model and the image are also what say where they are, and the two share
+    // the table -- each reads the entries it has a use for.
     const exe_options = b.addOptions();
     exe_options.addOption([]const u8, "vision_encoder_path", vision_path);
     exe_options.addOption([]const u8, "decoder_path", decoder_path);
@@ -276,6 +343,8 @@ pub fn build(b: *std.Build) void {
     exe_options.addOption([]const u8, "image_path", cat_path);
     exe_options.addOption([]const u8, "device", @tagName(device));
     exe_options.addOption(bool, "untested_npu", untested_npu);
+    exe_options.addOption([]const u8, "host", host);
+    exe_options.addOption(u16, "port", port);
     exe.root_module.addOptions("build_options", exe_options);
 
     const run_step = b.step("run", "Segment the sample cat image with the real checkpoint");
@@ -294,6 +363,76 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(weights_step);
     run_cmd.step.dependOn(examples_step);
     run_cmd.setCwd(b.path("."));
+    if (with_openvino) addNpuLibraryPath(b, run_cmd, npu_library_path, openvino_runtime_paths);
+
+    // --- Web UI -------------------------------------------------------------
+    //
+    // `zig build serve` puts the same two graphs behind a browser. The client
+    // half is Zig as well: `src/web/client.zig` is compiled to wasm, and it and
+    // the page that loads it are embedded in the server, so the executable is
+    // the whole of the UI -- there is no directory to serve and nothing to
+    // install beside it.
+
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+    });
+
+    const client = b.addExecutable(.{
+        .name = "client",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/client.zig"),
+            .target = wasm_target,
+            .optimize = optimize,
+            .strip = if (optimize == .ReleaseFast) true else null,
+            .imports = &.{
+                .{ .name = "zigimg", .module = b.dependency("zigimg", .{
+                    .target = wasm_target,
+                    .optimize = optimize,
+                }).module("zigimg") },
+            },
+        }),
+    });
+    // A module the page instantiates rather than a program: there is no `main`
+    // to enter through, and the exports are the only thing keeping the code
+    // they reach alive through the linker's garbage collection.
+    client.entry = .disabled;
+    client.rdynamic = true;
+
+    const web_exe = b.addExecutable(.{
+        .name = "sam3-web",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/web/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = if (optimize == .ReleaseFast) true else null,
+            .imports = &.{
+                .{ .name = "sam3", .module = mod },
+            },
+        }),
+    });
+    // What `@embedFile("client_wasm")` picks up, which is also what makes the
+    // server wait for the wasm build.
+    web_exe.root_module.addAnonymousImport("client_wasm", .{
+        .root_source_file = client.getEmittedBin(),
+    });
+    web_exe.root_module.addOptions("build_options", exe_options);
+    if (with_openvino) onnxruntime.linkStdCxx(b, web_exe.root_module);
+    b.installArtifact(web_exe);
+
+    const serve_step = b.step("serve", b.fmt("Serve the web UI on http://{s}:{d}/", .{ host, port }));
+    const serve_cmd = b.addRunArtifact(web_exe);
+    serve_step.dependOn(&serve_cmd.step);
+
+    // Same three reasons as `run`: the installed copy is what sits next to
+    // `libonnxruntime_providers_shared.so`, the model has to have been fetched,
+    // and the sample image is read from the build cache at a path relative to
+    // the project root.
+    serve_cmd.step.dependOn(b.getInstallStep());
+    serve_cmd.step.dependOn(weights_step);
+    serve_cmd.step.dependOn(examples_step);
+    serve_cmd.setCwd(b.path("."));
+    if (with_openvino) addNpuLibraryPath(b, serve_cmd, npu_library_path, openvino_runtime_paths);
 
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
@@ -301,7 +440,91 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    // The wasm client, on the host. Its exports are ordinary functions and the
+    // allocator behind them is `page_allocator` either way, so the sequence the
+    // page drives can be run here -- which is the only way this file is tested,
+    // since a wasm module needs a browser to be run in.
+    const client_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/client.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zigimg", .module = zigimg.module("zigimg") },
+            },
+        }),
+    });
+    const run_client_tests = b.addRunArtifact(client_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_client_tests.step);
+}
+
+/// Point a run step's `LD_LIBRARY_PATH` at the NPU stack.
+///
+/// Each of `npu_libraries` is looked for in `extra` and then in
+/// `npu_library_dirs`, and the directory that has it goes on the path. Only
+/// directories that turned something up are added, so on a machine where the
+/// dynamic loader finds them by itself this adds nothing.
+///
+/// Searching the build machine is sound in a way that baking a path into the
+/// executable would not be: this only ever applies to the build's own `run` and
+/// `serve` steps, which are the same machine by definition.
+fn addNpuLibraryPath(
+    b: *std.Build,
+    run: *std.Build.Step.Run,
+    extra: []const []const u8,
+    openvino: []const []const u8,
+) void {
+    var dirs: std.ArrayList([]const u8) = .empty;
+    defer dirs.deinit(b.allocator);
+
+    // Whatever a downloaded OpenVINO needs goes on the path unconditionally:
+    // the package next door named those directories rather than guessing at
+    // them, so there is nothing to search for and nothing to leave out.
+    dirs.appendSlice(b.allocator, openvino) catch @panic("OOM");
+
+    for (npu_libraries) |library| {
+        var found = false;
+        for (extra) |dir| found = found or hasLibrary(b, dir, library);
+        if (found) continue;
+        for (npu_library_dirs) |dir| {
+            if (!hasLibrary(b, dir, library)) continue;
+            for (dirs.items) |seen| {
+                if (std.mem.eql(u8, seen, dir)) break;
+            } else dirs.append(b.allocator, dir) catch @panic("OOM");
+            break;
+        }
+    }
+
+    var path: std.ArrayList(u8) = .empty;
+    defer path.deinit(b.allocator);
+
+    // Whatever the build was started with comes first: a caller who set
+    // `LD_LIBRARY_PATH` themselves meant it, and the run step inherits it.
+    if (run.getEnvMap().get("LD_LIBRARY_PATH")) |inherited| {
+        if (inherited.len != 0) path.appendSlice(b.allocator, inherited) catch @panic("OOM");
+    }
+    // Then `-Dnpu-library-path`, which was given by hand and so outranks the
+    // search, and then whatever the search turned up.
+    for ([_][]const []const u8{ extra, dirs.items }) |list| {
+        for (list) |dir| {
+            if (path.items.len != 0) path.append(b.allocator, ':') catch @panic("OOM");
+            path.appendSlice(b.allocator, dir) catch @panic("OOM");
+        }
+    }
+    if (path.items.len == 0) return;
+
+    run.setEnvironmentVariable("LD_LIBRARY_PATH", path.items);
+}
+
+/// Whether `dir` holds `library`. A directory that is not there at all is the
+/// ordinary case on any machine that is not the one this was written on, so it
+/// is not worth distinguishing from one that is there without the library.
+fn hasLibrary(b: *std.Build, dir: []const u8, library: []const u8) bool {
+    const path = b.pathJoin(&.{ dir, library });
+    std.Io.Dir.accessAbsolute(b.graph.io, path, .{}) catch return false;
+    return true;
 }
