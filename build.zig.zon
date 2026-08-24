@@ -33,8 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .onnxruntime = .{
-            .url = "git+https://github.com/kirillrdy/onnxruntime#21549a708193f1c3104c57518f8d4073d863bfc3",
-            .hash = "onnxruntime-1.29.0-fNg4hNKVAQBRmhkIH3a-oJ6-DVHXrGyfmyHQBtJZ-rSJ",
+            .url = "git+https://github.com/kirillrdy/onnxruntime#d14f4b7877edeca06d31452b1526e3085bae3979",
+            .hash = "onnxruntime-1.29.0-fNg4hIymAQCAuT6hC5pv6OAeUX9u88Gyu76vUSapVxX3",
         },
         .zigimg = .{
             .url = "git+https://github.com/zigimg/zigimg#a7440df3fc41cde7df078b1c5829646c13056d49",

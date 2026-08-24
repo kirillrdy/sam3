@@ -12,8 +12,8 @@
 const std = @import("std");
 
 const Options = struct {
-    url: []const u8,
-    out: []const u8,
+    url: ?[]const u8 = null,
+    out: ?[]const u8 = null,
     sha256: ?[]const u8 = null,
     token_env: ?[]const u8 = null,
     label: ?[]const u8 = null,
@@ -27,30 +27,25 @@ pub fn main(init: std.process.Init) !void {
     defer args_it.deinit();
     _ = args_it.skip();
 
-    var url: ?[]const u8 = null;
-    var out: ?[]const u8 = null;
-    var sha256: ?[]const u8 = null;
-    var token_env: ?[]const u8 = null;
-    var label: ?[]const u8 = null;
-
+    var opts: Options = .{};
     while (args_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--url")) {
-            url = args_it.next();
+            opts.url = args_it.next();
         } else if (std.mem.eql(u8, arg, "--out")) {
-            out = args_it.next();
+            opts.out = args_it.next();
         } else if (std.mem.eql(u8, arg, "--sha256")) {
-            sha256 = args_it.next();
+            opts.sha256 = args_it.next();
         } else if (std.mem.eql(u8, arg, "--token-env")) {
-            token_env = args_it.next();
+            opts.token_env = args_it.next();
         } else if (std.mem.eql(u8, arg, "--label")) {
-            label = args_it.next();
+            opts.label = args_it.next();
         } else {
             std.debug.print("fetch: unknown argument '{s}'\n", .{arg});
             return error.InvalidArguments;
         }
     }
 
-    if (url == null or out == null) {
+    if (opts.url == null or opts.out == null) {
         std.debug.print(
             \\usage: fetch --url <url> --out <path> [--sha256 <hex>] [--token-env <VAR>] [--label <text>]
             \\
@@ -58,35 +53,27 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArguments;
     }
 
-    const opts = Options{
-        .url = url.?,
-        .out = out.?,
-        .sha256 = sha256,
-        .token_env = token_env,
-        .label = label,
-    };
-
-    const name = opts.label orelse opts.out;
+    const url = opts.url.?;
+    const out = opts.out.?;
+    const name = opts.label orelse out;
 
     if (opts.sha256) |want| {
-        if (try hashFile(io, opts.out)) |have| {
-            if (std.ascii.eqlIgnoreCase(&have, want)) {
-                return;
-            }
+        if (try hashFile(io, out)) |have| {
+            if (std.ascii.eqlIgnoreCase(&have, want)) return;
             std.debug.print("  {s}: present but checksum differs, re-downloading\n", .{name});
         }
     } else {
-        if (fileExists(io, opts.out)) return;
+        if (fileExists(io, out)) return;
     }
 
-    try ensureParentDir(io, opts.out);
+    try ensureParentDir(io, out);
 
     var part_buf: [4096]u8 = undefined;
-    const part_path = try std.fmt.bufPrint(&part_buf, "{s}.part", .{opts.out});
+    const part_path = try std.fmt.bufPrint(&part_buf, "{s}.part", .{out});
 
     std.debug.print("  {s}: downloading\n", .{name});
     const token = if (opts.token_env) |var_name| init.environ_map.get(var_name) else null;
-    try download(gpa, io, opts, part_path, token);
+    try download(gpa, io, url, part_path, token);
 
     if (opts.sha256) |want| {
         const have = (try hashFile(io, part_path)) orelse return error.DownloadDisappeared;
@@ -104,143 +91,97 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const cwd = std.Io.Dir.cwd();
-    try cwd.rename(part_path, cwd, opts.out, io);
-    std.debug.print("  {s}: -> {s}\n", .{ name, opts.out });
+    try cwd.rename(part_path, cwd, out, io);
+    std.debug.print("  {s}: -> {s}\n", .{ name, out });
 }
 
 fn fileExists(io: std.Io, path: []const u8) bool {
-    const cwd = std.Io.Dir.cwd();
-    var file = cwd.openFile(io, path, .{}) catch return false;
-    file.close(io);
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
     return true;
 }
 
-fn download(gpa: std.mem.Allocator, io: std.Io, opts: Options, dest_path: []const u8, token: ?[]const u8) !void {
-    downloadWithCurl(gpa, io, opts, dest_path, token) catch {
-        return downloadZig(gpa, io, opts, dest_path, token);
+fn download(gpa: std.mem.Allocator, io: std.Io, url: []const u8, dest_path: []const u8, token: ?[]const u8) !void {
+    downloadWithCurl(gpa, io, url, dest_path, token) catch {
+        return downloadZig(gpa, io, url, dest_path, token);
     };
 }
 
-fn downloadWithCurl(gpa: std.mem.Allocator, io: std.Io, opts: Options, dest_path: []const u8, token: ?[]const u8) !void {
-    var argv_buf: [10][]const u8 = undefined;
-    var argv_len: usize = 0;
+fn downloadWithCurl(gpa: std.mem.Allocator, io: std.Io, url: []const u8, dest_path: []const u8, token: ?[]const u8) !void {
+    var auth_buf: [4096]u8 = undefined;
+    const argv: []const []const u8 = if (token) |tok|
+        &.{ "curl", "-sSL", "--retry", "3", "-H", try std.fmt.bufPrint(&auth_buf, "Authorization: Bearer {s}", .{tok}), "-o", dest_path, url }
+    else
+        &.{ "curl", "-sSL", "--retry", "3", "-o", dest_path, url };
 
-    argv_buf[argv_len] = "curl";
-    argv_len += 1;
-    argv_buf[argv_len] = "-sSL";
-    argv_len += 1;
-    argv_buf[argv_len] = "--retry";
-    argv_len += 1;
-    argv_buf[argv_len] = "3";
-    argv_len += 1;
-
-    var header_buf: [4096]u8 = undefined;
-    if (token) |tok| {
-        argv_buf[argv_len] = "-H";
-        argv_len += 1;
-        argv_buf[argv_len] = try std.fmt.bufPrint(&header_buf, "Authorization: Bearer {s}", .{tok});
-        argv_len += 1;
-    }
-
-    argv_buf[argv_len] = "-o";
-    argv_len += 1;
-    argv_buf[argv_len] = dest_path;
-    argv_len += 1;
-
-    argv_buf[argv_len] = opts.url;
-    argv_len += 1;
-
-    const result = try std.process.run(gpa, io, .{
-        .argv = argv_buf[0..argv_len],
-    });
+    const result = try std.process.run(gpa, io, .{ .argv = argv });
     defer {
         gpa.free(result.stdout);
         gpa.free(result.stderr);
     }
 
-    switch (result.term) {
-        .exited => |code| {
-            if (code != 0) {
-                return error.HttpRequestFailed;
-            }
-        },
-        else => return error.HttpRequestFailed,
-    }
+    return switch (result.term) {
+        .exited => |code| if (code != 0) error.HttpRequestFailed,
+        else => error.HttpRequestFailed,
+    };
 }
 
-fn downloadZig(gpa: std.mem.Allocator, io: std.Io, opts: Options, dest_path: []const u8, token: ?[]const u8) !void {
-    const cwd = std.Io.Dir.cwd();
-
-    var file = try cwd.createFile(io, dest_path, .{});
+fn downloadZig(gpa: std.mem.Allocator, io: std.Io, url: []const u8, dest_path: []const u8, token: ?[]const u8) !void {
+    var file = try std.Io.Dir.cwd().createFile(io, dest_path, .{});
     defer file.close(io);
 
-    const write_buf = try gpa.alloc(u8, 1 << 20);
-    defer gpa.free(write_buf);
-    var file_writer = file.writer(io, write_buf);
+    var write_buf: [64 * 1024]u8 = undefined;
+    var file_writer = file.writer(io, &write_buf);
 
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
-    // Hugging Face gates some repositories; an access token in the environment
-    // is forwarded as a privileged header so it survives redirects to the CDN
-    // only for the same host.
     var auth_buf: [4096]u8 = undefined;
-    var extra: [1]std.http.Header = undefined;
-    var extra_len: usize = 0;
-
-    if (token) |value_raw| {
-        const value = try std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{value_raw});
-        extra[0] = .{ .name = "authorization", .value = value };
-        extra_len = 1;
-    }
+    const headers: []const std.http.Header = if (token) |tok|
+        &.{.{ .name = "authorization", .value = try std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{tok}) }}
+    else
+        &.{};
 
     const result = try client.fetch(.{
-        .location = .{ .url = opts.url },
+        .location = .{ .url = url },
         .method = .GET,
         .response_writer = &file_writer.interface,
-        .privileged_headers = extra[0..extra_len],
+        .privileged_headers = headers,
     });
 
     try file_writer.interface.flush();
 
     if (result.status != .ok) {
-        std.debug.print("  HTTP {d} for {s}\n", .{ @intFromEnum(result.status), opts.url });
+        std.debug.print("  HTTP {d} for {s}\n", .{ @intFromEnum(result.status), url });
         return error.HttpRequestFailed;
     }
 }
 
 /// SHA-256 of a file as lowercase hex, or null when the file does not exist.
 fn hashFile(io: std.Io, path: []const u8) !?[64]u8 {
-    const cwd = std.Io.Dir.cwd();
-    var file = cwd.openFile(io, path, .{}) catch |err| switch (err) {
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
     defer file.close(io);
 
-    var read_buf: [1 << 20]u8 = undefined;
-    var file_reader = file.reader(io, &read_buf);
+    var buf: [64 * 1024]u8 = undefined;
+    var reader = file.reader(io, &buf);
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    var chunk: [1 << 16]u8 = undefined;
+    var chunk: [64 * 1024]u8 = undefined;
     while (true) {
-        const n = file_reader.interface.readSliceShort(&chunk) catch |err| switch (err) {
-            error.ReadFailed => return error.ReadFailed,
-        };
+        const n = try reader.interface.readSliceShort(&chunk);
         if (n == 0) break;
         hasher.update(chunk[0..n]);
     }
 
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
-
-    var hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&hex, "{x}", .{&digest}) catch unreachable;
-    return hex;
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 fn ensureParentDir(io: std.Io, path: []const u8) !void {
-    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return;
-    if (slash == 0) return;
-    try std.Io.Dir.cwd().createDirPath(io, path[0..slash]);
+    if (std.fs.path.dirname(path)) |dir| {
+        try std.Io.Dir.cwd().createDirPath(io, dir);
+    }
 }

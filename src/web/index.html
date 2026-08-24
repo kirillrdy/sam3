@@ -4,14 +4,12 @@
 <style>
   :root { color-scheme: dark; --bg: #14161a; --panel: #1c1f25; --line: #2c3038; --ink: #e6e8ec; --dim: #969ba5; --accent: #00dc64; }
   * { box-sizing: border-box; }
-  body { margin: 0; padding: 24px; background: var(--bg); color: var(--ink);
+  body { margin: 0; padding: 12px; background: var(--bg); color: var(--ink);
          font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; }
-  main { max-width: 1000px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
-  h1 { font-size: 18px; margin: 0; font-weight: 600; }
-  h1 span { color: var(--dim); font-weight: 400; }
+  main { max-width: 1000px; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
   .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
   button, label.file { background: var(--panel); color: var(--ink); border: 1px solid var(--line);
-                       border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer; }
+                       border-radius: 6px; padding: 3px 10px; font: inherit; cursor: pointer; }
   button:hover, label.file:hover { border-color: var(--dim); }
   button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
   button:disabled { opacity: .4; cursor: default; }
@@ -23,13 +21,9 @@
   #masks { display: flex; flex-wrap: wrap; gap: 8px; }
   #masks button { text-align: left; line-height: 1.35; }
   #masks small { display: block; color: var(--dim); }
-  footer { color: var(--dim); font-size: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
-  code { color: var(--ink); }
 </style>
 
 <main>
-  <h1>SAM 3 <span>— click an object to segment it</span></h1>
-
   <div class="bar">
     <label class="file">Open image<input type="file" id="file" accept="image/*"></label>
     <button id="sample">Sample image</button>
@@ -40,12 +34,6 @@
   <div id="status">Loading the wasm client…</div>
   <div id="stage"><canvas id="canvas"></canvas></div>
   <div id="masks"></div>
-
-  <footer>
-    The image is decoded, the mask upsampled and the overlay drawn in
-    <code>client.wasm</code>; the server runs the two ONNX graphs and sends back
-    the raw mask logits. Right-click (or shift-click) marks a point to exclude.
-  </footer>
 </main>
 
 <script>
@@ -142,7 +130,7 @@ async function segment() {
     wasm.render(wasm.bestMask());
     paint();
     listMasks();
-    say(`${count} hypotheses — object score ${wasm.objectScore().toFixed(3)}.`);
+    say('');
   } catch (error) {
     say('Request failed: ' + error.message);
   } finally {
@@ -188,6 +176,6 @@ ui.clear.onclick = () => {
 
 WebAssembly.instantiateStreaming(fetch('/client.wasm'), {}).then((module) => {
   wasm = module.instance.exports;
-  say('Open an image, or start with the sample.');
+  say('');
 }, (error) => say('Could not load client.wasm: ' + error.message));
 </script>
