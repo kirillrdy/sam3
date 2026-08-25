@@ -1,34 +1,14 @@
-//! What the server sends back when it has segmented a frame.
-//!
-//! One definition, compiled into both ends: the server writes it from native
-//! code and the client reads it from wasm. Everything is little-endian and
-//! unaligned-safe on purpose -- the fields are read out of a byte buffer rather
-//! than pointed at -- so the two ends agree without either of them byte
-//! swapping, which is true of every target this is built for anyway.
-//!
-//! A response is
-//!
-//!     Header
-//!     count f32   predicted IoU, one per hypothesis
-//!     count * width * height f32   mask logits, plane after plane
-//!
-//! The logits are the decoder's own 288x288 output, not the frame's resolution:
-//! upsampling them is the client's job, so a click costs a quarter of a
-//! megabyte over the wire whatever the image is.
-
 const std = @import("std");
 
 pub const magic = [4]u8{ 'S', 'A', 'M', '3' };
 
 pub const Header = extern struct {
     magic: [4]u8 = magic,
-    /// How many mask hypotheses the decoder returned; three, in every export
-    /// seen so far.
+
     count: u32,
     width: u32,
     height: u32,
-    /// The model's confidence that the click landed on an object at all, as a
-    /// logit: positive is present.
+
     object_score: f32,
 
     pub const size = 20;
@@ -57,7 +37,6 @@ pub const Header = extern struct {
         };
     }
 
-    /// Bytes a whole response with this header takes.
     pub fn responseSize(header: Header) usize {
         const scores = @as(usize, header.count) * @sizeOf(f32);
         const planes = @as(usize, header.count) * header.width * header.height * @sizeOf(f32);

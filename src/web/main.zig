@@ -1,10 +1,3 @@
-//! `zig build serve`: the same model the CLI runs, behind a browser.
-//!
-//! The executable carries the whole UI -- the page and the wasm module are
-//! embedded -- so there is nothing to serve from a directory and nothing to
-//! install. As with `sam3` itself, the build is what says where the model and
-//! the sample image are; this takes no arguments.
-
 const std = @import("std");
 const sam3 = @import("sam3");
 const build_options = @import("build_options");
@@ -23,7 +16,6 @@ const openvino_cache_path: ?[:0]const u8 = if (build_options.openvino_cache_path
 else
     terminate(build_options.openvino_cache_path);
 
-/// Where to run, from `-Ddevice` and `-Duntested-npu`.
 const target: sam3.Target = .{
     .device = std.meta.stringToEnum(sam3.DeviceKind, build_options.device).?,
     .untested_npu = build_options.untested_npu,
@@ -33,7 +25,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
     for ([_][:0]const u8{ vision_encoder_path, decoder_path }) |path| {
-        if (std.os.linux.access(path.ptr, std.os.linux.F_OK) != 0) {
+        std.Io.Dir.cwd().access(init.io, path, .{}) catch {
             std.debug.print(
                 \\Error: no model at '{s}'.
                 \\
@@ -42,14 +34,12 @@ pub fn main(init: std.process.Init) !void {
                 \\
             , .{path});
             std.process.exit(1);
-        }
+        };
     }
 
     std.debug.print("\n=== SAM 3 Web UI ===\n\n", .{});
     std.debug.print("  ONNX Runtime: {s}\n", .{sam3.onnx.version()});
 
-    // Both graphs are loaded before the socket is opened, so the first click
-    // waits on the encoder rather than on a 1.7 GiB file being read.
     var model = try sam3.Model.open(allocator, .{
         .vision_encoder = vision_encoder_path,
         .decoder = decoder_path,
@@ -70,13 +60,11 @@ pub fn main(init: std.process.Init) !void {
         .{
             .host = build_options.host,
             .port = build_options.port,
-            .example_path = if (build_options.image_path.len == 0) null else build_options.image_path,
+            .example_path = build_options.example_path,
         },
     );
 }
 
-/// `build_options` strings are plain slices; every path here crosses into the C
-/// API, which wants a sentinel.
 fn terminate(comptime path: []const u8) [:0]const u8 {
     return (path ++ "\x00")[0..path.len :0];
 }

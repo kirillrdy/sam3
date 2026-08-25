@@ -3,9 +3,6 @@ const ImageRGB = @import("image.zig").ImageRGB;
 const RGB = @import("image.zig").RGB;
 const Point = @import("../point.zig").Point;
 
-/// Tints every pixel the mask claims. `mask` holds logits at the image's own
-/// resolution -- the decoder's output resampled -- and the threshold is zero,
-/// which is where `post_process_masks` puts it too.
 pub fn overlayMask(image: *ImageRGB, mask: []const f32, color: RGB, alpha: f32) void {
     std.debug.assert(mask.len == image.width * image.height);
 
@@ -25,8 +22,6 @@ pub fn overlayMask(image: *ImageRGB, mask: []const f32, color: RGB, alpha: f32) 
     }
 }
 
-/// Marks where the prompt was clicked: green for a point the mask should
-/// include, red for one it should exclude.
 pub fn drawPointMarker(image: *ImageRGB, point: Point, radius: usize) void {
     const cx: isize = @intFromFloat(point.x * @as(f32, @floatFromInt(image.width)));
     const cy: isize = @intFromFloat(point.y * @as(f32, @floatFromInt(image.height)));

@@ -1,15 +1,5 @@
-//! Bilinear resampling of a single-channel f32 plane.
-//!
-//! Two places need it and they are the two ends of the pass: the image has to
-//! reach the encoder at 1008x1008, and the mask logits come back at 288x288 and
-//! have to be laid over the original frame. Both are the `align_corners=false`
-//! half-pixel mapping torch uses, which is what the checkpoint was exported
-//! against.
-
 const std = @import("std");
 
-/// Resamples `src` (`src_w` x `src_h`) into a newly allocated `dst_w` x `dst_h`
-/// plane. The caller owns the result.
 pub fn bilinear(
     allocator: std.mem.Allocator,
     src: []const f32,
@@ -49,9 +39,6 @@ pub fn bilinear(
     return dst;
 }
 
-/// The floor of a source coordinate, clamped into the plane. Negative
-/// coordinates happen at the first output pixel of an upsample, where the
-/// half-pixel shift reaches back past the edge.
 fn clampIndex(coordinate: f32, limit: usize) usize {
     if (coordinate <= 0.0) return 0;
     const floored: usize = @intFromFloat(@floor(coordinate));
@@ -75,8 +62,6 @@ test "upsampling interpolates between the source samples" {
     const out = try bilinear(allocator, &src, 2, 1, 4, 1);
     defer allocator.free(out);
 
-    // Half-pixel centres at 0.25/0.5/0.75 of the way across, clamped at the
-    // edges: 0, 1, 3, 4.
     try std.testing.expectEqualSlices(f32, &.{ 0.0, 1.0, 3.0, 4.0 }, out);
 }
 

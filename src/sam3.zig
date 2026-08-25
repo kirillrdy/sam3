@@ -1,38 +1,18 @@
-//! SAM 3's tracker branch, run through ONNX Runtime.
-//!
-//! Meta's checkpoint is exported as two graphs and this drives both of them:
-//! the vision encoder turns a frame into a three-level feature pyramid, and the
-//! prompt encoder and mask decoder turn that pyramid plus a click into mask
-//! logits. The pyramid crosses between them as the runtime's own tensors, so
-//! the 100 MB of features are never copied back through here.
-//!
-//! Nothing in this file knows about devices beyond asking `onnx` for one. The
-//! interesting consequence of the split is that the two graphs are sized very
-//! differently -- 1.7 GiB of encoder against 21 MiB of decoder -- so they do not
-//! always land on the same one.
-
 const std = @import("std");
 const onnx = @import("onnx.zig");
 const resample = @import("resample.zig");
 const ImageRGB = @import("io/image.zig").ImageRGB;
 
-/// What the export was traced at. The vision encoder's position embeddings are
-/// built for this grid, so it is not a resolution the caller gets to pick.
 pub const image_size: usize = 1008;
 
-/// A click, in coordinates normalised to the frame. Defined next door so the
-/// browser client can share it -- see `point.zig`.
 pub const Point = @import("point.zig").Point;
 
-/// Where the two exported graphs and the OpenVINO provider live on disk.
 pub const Paths = struct {
     vision_encoder: [:0]const u8,
     decoder: [:0]const u8,
-    /// `libonnxruntime_providers_openvino.so`, or null for a build without it,
-    /// in which case only the CPU is available.
+
     openvino_provider: ?[:0]const u8 = null,
-    /// Where the provider may keep graphs it has already compiled for the
-    /// device. Null asks it not to, which costs the compile on every run.
+
     cache_dir: ?[:0]const u8 = null,
 };
 
@@ -53,19 +33,8 @@ const decoder_outputs = [_][*:0]const u8{
     "object_score_logits",
 };
 
-/// An Intel NPU generation, as the PCI id the part reports.
 const Npu = struct { id: u32, name: []const u8 };
 
-/// The NPU generations this is known to run on.
-///
-/// The vision encoder is a 1.7 GiB graph, and it has only ever been measured on
-/// Lunar Lake's NPU 4. Meteor Lake and Arrow Lake carry NPU 3 -- around a third
-/// of the throughput, and less room to compile a graph this size into -- and
-/// nothing here has been near one, so they are left out rather than guessed
-/// about. `Target.untested_npu` overrides that for anyone who wants to find out.
-///
-/// A list rather than a `>=` because the ids are not ordered by generation:
-/// Meteor Lake is 0x7d1d and Lunar Lake, two years later, is 0x643e.
 const known_npus = [_]Npu{
     .{ .id = 0x643e, .name = "Lunar Lake" },
     .{ .id = 0xb03e, .name = "Panther Lake" },
@@ -77,12 +46,9 @@ fn npuName(id: u32) ?[]const u8 {
     return null;
 }
 
-/// Where to run the model, and how insistent to be about it.
 pub const Target = struct {
     device: onnx.DeviceKind = .cpu,
-    /// Use an NPU whose generation is not in `known_npus`. Off by default,
-    /// because finding out costs a quarter of an hour of compiling before it
-    /// can even fail.
+
     untested_npu: bool = false,
 };
 
@@ -92,19 +58,11 @@ pub const Model = struct {
     vision: onnx.Session,
     decoder: onnx.Session,
 
-    /// Loads both graphs, on `target` where that device will take them. A graph
-    /// a device turns down falls back to the CPU on its own -- see
-    /// `onnx.Session.open` -- so this succeeds as long as the files are
-    /// readable.
     pub fn open(allocator: std.mem.Allocator, paths: Paths, target: Target) !Model {
         try onnx.init();
 
-        // Never released, here or in `deinit`, and that is deliberate: see the
-        // comment there.
         const env = try onnx.Env.init("sam3");
 
-        // The provider is a library the runtime dlopens rather than links, so
-        // until it is registered the NPU is not in the device list at all.
         if (paths.openvino_provider) |provider| {
             env.registerProvider("OpenVINO", provider) catch {
                 std.debug.print("  ! OpenVINO provider at '{s}' would not load: {s}\n", .{
@@ -115,13 +73,9 @@ pub const Model = struct {
         }
 
         var device = if (target.device == .cpu) null else try env.find(target.device);
-        // Set when the device was there and this turned it down, so the "no
-        // device" advice below does not also fire and blame the library path.
+
         var declined = false;
 
-        // An NPU is only worth the compile on a part this has been run on. The
-        // runtime hands over the PCI id, which is what says which generation
-        // turned up.
         if (device) |d| {
             if (d.kind == .npu) {
                 if (npuName(d.id)) |name| {
@@ -146,20 +100,32 @@ pub const Model = struct {
         if (target.device != .cpu and device == null and !declined) {
             std.debug.print(
                 \\  ! no {t} among the devices the runtime enumerated, so this runs on the CPU.
-                \\    The provider has to be registered (a -Dopenvino build), and the device
-                \\    reachable: an Intel NPU needs libze_loader.so.1 and libze_intel_npu.so.1
-                \\    on the library path. On NixOS those are in two different directories:
-                \\    LD_LIBRARY_PATH=/run/opengl-driver/lib:/run/current-system/sw/lib
+                \\    The provider has to be registered (a -Dopenvino build), and whatever the
+                \\    OpenVINO plugin dlopens to reach the device has to be on the library path:
+                \\{s}
                 \\
                 \\
-            , .{target.device});
+            , .{
+                target.device,
+                switch (target.device) {
+                    .npu =>
+                    \\    an NPU needs libze_loader.so.1 and libze_intel_npu.so.1, which on NixOS
+                    \\    are in two different directories:
+                    \\    LD_LIBRARY_PATH=/run/current-system/sw/lib:/run/opengl-driver/lib
+                    ,
+                    .gpu =>
+                    \\    a GPU needs libOpenCL.so.1 -- the ICD loader, which the build compiles
+                    \\    and installs beside the provider, so it is zig-out/lib that has to be on
+                    \\    the path. The loader then needs a driver to open, which it takes from the
+                    \\    ICD registry: NixOS has no /etc/OpenCL/vendors, so name the driver
+                    \\    hardware.graphics installed instead --
+                    \\    OCL_ICD_FILENAMES=/run/opengl-driver/lib/intel-opencl/libigdrcl.so
+                    ,
+                    .cpu => "",
+                },
+            });
         }
 
-        // Compiling a graph for an NPU takes minutes, and the result depends on
-        // nothing but the graph and the device -- so the provider is given
-        // somewhere to keep it, and every run after the first skips straight to
-        // execution. The V2 entry point refuses the EP's own `cache_dir` and
-        // wants this instead: OpenVINO's per-device property map, as JSON.
         var config_buf: [512]u8 = undefined;
         var option_buf: [1]onnx.Option = undefined;
         var options: []const onnx.Option = &.{};
@@ -176,21 +142,7 @@ pub const Model = struct {
         const vision = try onnx.Session.open(env, paths.vision_encoder, device, options, reportFallback);
         errdefer vision.deinit();
 
-        // The mask decoder stays off the NPU. Intel's NPU compiler takes SIGFPE
-        // compiling this graph -- inside its own one-time initialisation, on
-        // its own thread, with nothing of ours on the stack -- and a crash
-        // inside a prebuilt compiler is not something the fallback in
-        // `Session.open` can catch. It costs little: the decoder is 21 MiB of
-        // weights against the encoder's 1.7 GiB, and the encoder is where the
-        // time goes. Every other device takes it.
-        const decoder_device = if (target.device == .npu) null else device;
-        const decoder = try onnx.Session.open(
-            env,
-            paths.decoder,
-            decoder_device,
-            if (decoder_device == null) &.{} else options,
-            reportFallback,
-        );
+        const decoder = try onnx.Session.open(env, paths.decoder, null, &.{}, reportFallback);
 
         return .{ .allocator = allocator, .env = env, .vision = vision, .decoder = decoder };
     }
@@ -199,28 +151,17 @@ pub const Model = struct {
         std.debug.print("  ! falling back to the CPU: {s}\n", .{message});
     }
 
-    /// Releases the sessions but deliberately not the environment. Releasing
-    /// it unregisters the execution provider library, which dlcloses it and the
-    /// OpenVINO stack under it -- and Intel's compiler libraries down there have
-    /// by then registered `atexit` handlers. Unload them and `exit` jumps into
-    /// unmapped memory. The environment lives as long as the process either
-    /// way, so keeping it is the whole of the fix.
     pub fn deinit(self: *Model) void {
         self.decoder.deinit();
         self.vision.deinit();
     }
 
-    /// Runs both graphs over one frame. The caller owns the result.
     pub fn segment(self: *Model, img: ImageRGB, points: []const Point) !Masks {
         var embedding = try self.encode(img);
         defer embedding.deinit();
         return self.decode(embedding, points);
     }
 
-    /// The vision encoder alone. Split out from `segment` because it is where
-    /// nearly all of the time goes and it does not depend on the prompt: a
-    /// caller answering several clicks about the same frame -- the web UI is
-    /// one -- encodes once and decodes as often as it likes.
     pub fn encode(self: *Model, img: ImageRGB) !Embedding {
         const pixels = try preprocess(self.allocator, img);
         defer self.allocator.free(pixels);
@@ -239,10 +180,7 @@ pub const Model = struct {
         return embedding;
     }
 
-    /// The prompt encoder and mask decoder, over a pyramid `encode` produced.
-    /// The caller owns the result and keeps the pyramid.
     pub fn decode(self: *Model, embedding: Embedding, points: []const Point) !Masks {
-        // The decoder wants pixels of the encoder's own input, not of the frame.
         const coordinates = try self.allocator.alloc(f32, points.len * 2);
         defer self.allocator.free(coordinates);
         const labels = try self.allocator.alloc(i64, points.len);
@@ -259,9 +197,6 @@ pub const Model = struct {
         const point_shape = [_]i64{ 1, 1, point_count, 2 };
         const label_shape = [_]i64{ 1, 1, point_count };
 
-        // The graph takes both prompt kinds and picks between them, so a
-        // point-only call still has to pass boxes -- as an empty tensor, which
-        // is what the export's own no-box path is written against.
         const no_boxes: [4]f32 = @splat(0.0);
         const box_shape = [_]i64{ 1, 0, 4 };
 
@@ -289,9 +224,6 @@ pub const Model = struct {
     }
 };
 
-/// One frame as the vision encoder left it: three levels of feature pyramid,
-/// still in the runtime's own tensors. Around 100 MB, so this is deliberately
-/// something a caller holds on to rather than something `segment` copies out.
 pub const Embedding = struct {
     levels: [embedding_names.len]onnx.Value,
 
@@ -301,25 +233,21 @@ pub const Embedding = struct {
     }
 };
 
-/// The decoder's answer to one click: several competing mask hypotheses -- the
-/// part, the subpart and the whole -- each with the IoU the model predicts for
-/// it, at the decoder's own resolution.
 pub const Masks = struct {
     allocator: std.mem.Allocator,
-    /// `count` planes of `width` x `height` logits, one after another.
+
     logits: []f32,
     scores: []f32,
     count: usize,
     width: usize,
     height: usize,
-    /// The model's confidence that the click landed on an object at all, as a
-    /// logit: positive is present.
+
     object_score: f32,
 
     fn take(allocator: std.mem.Allocator, iou: onnx.Value, masks: onnx.Value, object: onnx.Value) !Masks {
         var dims: [8]i64 = undefined;
         const shape = try masks.shape(&dims);
-        // [batch, prompt, hypothesis, height, width]
+
         std.debug.assert(shape.len == 5);
 
         const count: usize = @intCast(shape[2]);
@@ -351,8 +279,6 @@ pub const Masks = struct {
         return self.logits[index * stride ..][0..stride];
     }
 
-    /// The hypothesis the model rates highest, which is the one to show when
-    /// only one mask is wanted.
     pub fn best(self: Masks) usize {
         var winner: usize = 0;
         for (self.scores, 0..) |score, i| {
@@ -362,10 +288,6 @@ pub const Masks = struct {
     }
 };
 
-/// Frame to `pixel_values`: RGB bytes to planar f32, resized to the encoder's
-/// input and normalised the way `Sam3ImageProcessorFast` does -- rescale by
-/// 1/255, then mean and standard deviation of 0.5, which is a plain map onto
-/// [-1, 1].
 fn preprocess(allocator: std.mem.Allocator, img: ImageRGB) ![]f32 {
     const plane_size = image_size * image_size;
     const out = try allocator.alloc(f32, 3 * plane_size);

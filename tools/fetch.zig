@@ -1,14 +1,3 @@
-//! Downloader used by the `zig build fetch-weights` and `zig build fetch-examples`
-//! steps, so pulling Meta's checkpoint and the playground sample images needs
-//! nothing but Zig — no curl, no shell.
-//!
-//! Usage:
-//!   fetch --url <url> --out <path> [--sha256 <hex>] [--token-env <VAR>] [--label <text>]
-//!
-//! With `--sha256` the download is verified and the file is only moved into
-//! place once it matches; an existing file that already matches is left alone,
-//! which makes the build steps idempotent and cheap to re-run.
-
 const std = @import("std");
 
 const Options = struct {
@@ -156,7 +145,6 @@ fn downloadZig(gpa: std.mem.Allocator, io: std.Io, url: []const u8, dest_path: [
     }
 }
 
-/// SHA-256 of a file as lowercase hex, or null when the file does not exist.
 fn hashFile(io: std.Io, path: []const u8) !?[64]u8 {
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,

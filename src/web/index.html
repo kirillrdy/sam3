@@ -37,9 +37,6 @@
 </main>
 
 <script>
-// Glue, and nothing else: this file moves bytes between the wasm module and the
-// three browser APIs it cannot reach -- the file input, the canvas and fetch.
-// Every decision about the image, the prompt and the mask is made in Zig.
 const ui = {
   file: document.getElementById('file'),
   sample: document.getElementById('sample'),
@@ -51,15 +48,13 @@ const ui = {
 };
 const ctx = ui.canvas.getContext('2d');
 
-let wasm = null;      // the module's exports
-let upload = null;    // the file's bytes, exactly as the server will see them
-let include = true;   // what the next click means
+let wasm = null;
+let upload = null;
+let include = true;
 let busy = false;
 
 const say = (text) => { ui.status.textContent = text; };
 
-// A copy into the module's own memory: there is no way to hand wasm a
-// JavaScript buffer, so it is asked for room and written into.
 function send(bytes) {
   const ptr = wasm.alloc(bytes.length);
   if (!ptr) throw new Error('out of memory in the wasm client');
@@ -67,8 +62,6 @@ function send(bytes) {
   return ptr;
 }
 
-// `memory.buffer` is detached whenever the module grows its heap, so every view
-// of it is made fresh at the point of use.
 function paint() {
   const w = wasm.imageWidth(), h = wasm.imageHeight();
   if (!w || !h) return;
