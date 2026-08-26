@@ -9,8 +9,8 @@
 
     .dependencies = .{
         .onnxruntime = .{
-            .url = "git+https://github.com/kirillrdy/onnxruntime#eb14ba3e9b136e70813cbde66cce574fab0a63fc",
-            .hash = "onnxruntime-1.29.0-fNg4hFBjAQDILiO1JlyRX6WX52dySAos77zGKXbYPZaq",
+            .url = "git+https://github.com/kirillrdy/onnxruntime#1865a42ce0a2107753f93ed0f45e59d31b39deff",
+            .hash = "onnxruntime-1.29.0-fNg4hEfGAgCwUK7ynXAsYj3UBUz6yu1Uyi-eTLkBMjVe",
         },
         .zigimg = .{
             .url = "git+https://github.com/nothke/zigimg#581795265e1caee099baae32883c0f9d4f28f81a",

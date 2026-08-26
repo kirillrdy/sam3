@@ -8,8 +8,9 @@
          font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; }
   main { max-width: 1000px; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
   .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-  button, label.file { background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+  button, label.file, input[type=text] { background: var(--panel); color: var(--ink); border: 1px solid var(--line);
                        border-radius: 6px; padding: 3px 10px; font: inherit; cursor: pointer; }
+  input[type=text] { cursor: text; min-width: 220px; }
   button:hover, label.file:hover { border-color: var(--dim); }
   button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
   button:disabled { opacity: .4; cursor: default; }
@@ -30,6 +31,10 @@
     <button id="mode" aria-pressed="true">Clicks add to the mask</button>
     <button id="clear">Clear points</button>
   </div>
+  <div class="bar">
+    <input id="concept" type="text" maxlength="160" placeholder="Find objects, e.g. cat or red car">
+    <button id="find">Find by word</button>
+  </div>
 
   <div id="status">Loading the wasm client…</div>
   <div id="stage"><canvas id="canvas"></canvas></div>
@@ -42,6 +47,8 @@ const ui = {
   sample: document.getElementById('sample'),
   mode: document.getElementById('mode'),
   clear: document.getElementById('clear'),
+  concept: document.getElementById('concept'),
+  find: document.getElementById('find'),
   status: document.getElementById('status'),
   canvas: document.getElementById('canvas'),
   masks: document.getElementById('masks'),
@@ -80,7 +87,7 @@ function listMasks() {
   for (let i = 0; i < count; i++) {
     const button = document.createElement('button');
     button.innerHTML = `Mask ${i}${i === best ? ' ★' : ''}` +
-      `<small>IoU ${wasm.maskScore(i).toFixed(3)} · ` +
+      `<small>Score ${wasm.maskScore(i).toFixed(3)} · ` +
       `${(wasm.maskCoverage(i) * 100).toFixed(1)}% of the frame</small>`;
     button.onclick = () => {
       wasm.render(i);
@@ -131,6 +138,40 @@ async function segment() {
   }
 }
 
+async function lookup() {
+  const text = ui.concept.value.trim();
+  if (busy || !upload || !text) return;
+  busy = true;
+  say(`Looking for “${text}”… the first lookup on an image also runs the vision encoder.`);
+  try {
+    const response = await fetch('/lookup?text=' + encodeURIComponent(text), {
+      method: 'POST', body: upload
+    });
+    if (!response.ok) return say('Server: ' + (await response.text()));
+
+    const answer = new Uint8Array(await response.arrayBuffer());
+    const ptr = send(answer);
+    const count = wasm.loadMasks(ptr, answer.length);
+    wasm.dealloc(ptr, answer.length);
+    if (count < 0) return say('The server sent something this cannot read.');
+    if (count === 0) {
+      ui.masks.replaceChildren();
+      wasm.render(-1);
+      paint();
+      return say(`No objects matched “${text}”.`);
+    }
+
+    wasm.render(wasm.bestMask());
+    paint();
+    listMasks();
+    say(`${count} object${count === 1 ? '' : 's'} matched “${text}”.`);
+  } catch (error) {
+    say('Request failed: ' + error.message);
+  } finally {
+    busy = false;
+  }
+}
+
 ui.canvas.addEventListener('contextmenu', (event) => event.preventDefault());
 ui.canvas.addEventListener('mousedown', (event) => {
   if (busy) return;
@@ -166,6 +207,11 @@ ui.clear.onclick = () => {
   paint();
   say('Points cleared.');
 };
+
+ui.find.onclick = lookup;
+ui.concept.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') lookup();
+});
 
 WebAssembly.instantiateStreaming(fetch('/client.wasm'), {}).then((module) => {
   wasm = module.instance.exports;

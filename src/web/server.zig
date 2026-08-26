@@ -40,6 +40,7 @@ pub fn run(
         .options = options,
     };
     defer server.dropCache();
+    defer server.dropConceptCache();
 
     const address = try Io.net.IpAddress.parseIp4(options.host, options.port);
     var listener = try address.listen(io, .{ .reuse_address = true });
@@ -72,10 +73,15 @@ const Server = struct {
     mutex: Io.Mutex = .init,
 
     cache: ?Cache = null,
+    concept_cache: ?ConceptCache = null,
 
     const Cache = struct {
         hash: u64,
         embedding: sam3.Embedding,
+    };
+    const ConceptCache = struct {
+        hash: u64,
+        embedding: sam3.ConceptEmbedding,
     };
 
     fn converse(self: *Server, stream: Io.net.Stream) void {
@@ -105,6 +111,9 @@ const Server = struct {
 
         if (request.head.method == .POST and std.mem.eql(u8, path, "/segment")) {
             return self.segment(request, query, body_buffer);
+        }
+        if (request.head.method == .POST and std.mem.eql(u8, path, "/lookup")) {
+            return self.lookup(request, query, body_buffer);
         }
         if (request.head.method != .GET and request.head.method != .HEAD) {
             return request.respond("method not allowed\n", .{
@@ -205,6 +214,10 @@ const Server = struct {
         if (self.cache) |cached| {
             if (cached.hash == hash) return cached.embedding;
         }
+        // Both encoder embeddings are large GPU allocations. Retain only the
+        // prompting mode currently in use so switching modes cannot exhaust
+        // device memory.
+        self.dropConceptCache();
 
         var img = try image_io.decode(self.gpa, body);
         defer img.deinit();
@@ -222,11 +235,114 @@ const Server = struct {
         return embedding;
     }
 
+    fn lookup(
+        self: *Server,
+        request: *std.http.Server.Request,
+        query: []const u8,
+        body_buffer: []u8,
+    ) !void {
+        var phrase_buffer: [256]u8 = undefined;
+        const phrase = parseText(query, &phrase_buffer) catch
+            return request.respond("bad text prompt\n", .{ .status = .bad_request });
+        if (phrase.len == 0) {
+            return request.respond("no text prompt\n", .{ .status = .bad_request });
+        }
+
+        const body_reader = try request.readerExpectContinue(body_buffer);
+        const body = body_reader.allocRemaining(self.gpa, .limited(max_upload)) catch
+            return request.respond("upload too large\n", .{
+                .status = .payload_too_large,
+                .keep_alive = false,
+            });
+        defer self.gpa.free(body);
+
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+
+        const embedding = self.encodeConcept(body) catch |err| {
+            std.debug.print("  ! concept encoder failed: {t}: {s}\n", .{ err, sam3.onnx.lastError() });
+            return request.respond("could not encode that image\n", .{ .status = .bad_request });
+        };
+
+        const started = Io.Timestamp.now(self.io, .awake);
+        var masks = self.model.lookup(embedding, phrase, 0.5) catch |err| {
+            std.debug.print("  ! text lookup failed: {t}: {s}\n", .{ err, sam3.onnx.lastError() });
+            return request.respond("text lookup failed\n", .{ .status = .internal_server_error });
+        };
+        defer masks.deinit();
+        std.debug.print("  \"{s}\" -> {d} object(s) in {d:.2} s\n", .{
+            phrase,
+            masks.count,
+            secondsSince(self.io, started),
+        });
+
+        const payload = try serialize(self.gpa, masks);
+        defer self.gpa.free(payload);
+        return request.respond(payload, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/octet-stream" },
+                .{ .name = "cache-control", .value = "no-store" },
+            },
+        });
+    }
+
+    fn encodeConcept(self: *Server, body: []const u8) !sam3.ConceptEmbedding {
+        const hash = std.hash.Wyhash.hash(0, body);
+        if (self.concept_cache) |cached| {
+            if (cached.hash == hash) return cached.embedding;
+        }
+        self.dropCache();
+
+        var img = try image_io.decode(self.gpa, body);
+        defer img.deinit();
+
+        const started = Io.Timestamp.now(self.io, .awake);
+        const embedding = try self.model.encodeConcept(img);
+        std.debug.print("  concept-encoded {d}x{d} in {d:.2} s\n", .{
+            img.width,
+            img.height,
+            secondsSince(self.io, started),
+        });
+
+        self.dropConceptCache();
+        self.concept_cache = .{ .hash = hash, .embedding = embedding };
+        return embedding;
+    }
+
     fn dropCache(self: *Server) void {
         if (self.cache) |*cached| cached.embedding.deinit();
         self.cache = null;
     }
+
+    fn dropConceptCache(self: *Server) void {
+        if (self.concept_cache) |*cached| cached.embedding.deinit();
+        self.concept_cache = null;
+    }
 };
+
+fn parseText(query: []const u8, out: []u8) ![]const u8 {
+    var fields = std.mem.splitScalar(u8, query, '&');
+    while (fields.next()) |field| {
+        if (!std.mem.startsWith(u8, field, "text=")) continue;
+        const encoded = field[5..];
+        var written: usize = 0;
+        var i: usize = 0;
+        while (i < encoded.len) {
+            if (written == out.len) return error.TextTooLong;
+            if (encoded[i] == '%') {
+                if (i + 2 >= encoded.len) return error.BadEscape;
+                out[written] = try std.fmt.parseInt(u8, encoded[i + 1 .. i + 3], 16);
+                i += 3;
+            } else {
+                out[written] = if (encoded[i] == '+') ' ' else encoded[i];
+                i += 1;
+            }
+            written += 1;
+        }
+        return std.mem.trim(u8, out[0..written], " \t\r\n");
+    }
+    return "";
+}
 
 fn parsePoints(query: []const u8, out: []sam3.Point) ![]const sam3.Point {
     var count: usize = 0;
@@ -306,4 +422,11 @@ test "a malformed point is refused rather than guessed at" {
 
     var small: [1]sam3.Point = undefined;
     try std.testing.expectError(error.TooManyPoints, parsePoints("p=0,0,1&p=1,1,1", &small));
+}
+
+test "a URL-encoded text prompt is decoded" {
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("red car", try parseText("text=red%20car", &buffer));
+    try std.testing.expectEqualStrings("two cats", try parseText("x=1&text=two+cats", &buffer));
+    try std.testing.expectError(error.BadEscape, parseText("text=bad%2", &buffer));
 }

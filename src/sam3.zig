@@ -1,6 +1,8 @@
 const std = @import("std");
-const onnx = @import("onnx.zig");
+const builtin = @import("builtin");
+pub const onnx = @import("onnx.zig");
 const resample = @import("resample.zig");
+const tokenizer = @import("tokenizer.zig");
 const ImageRGB = @import("io/image.zig").ImageRGB;
 
 pub const image_size: usize = 1008;
@@ -10,8 +12,13 @@ pub const Point = @import("point.zig").Point;
 pub const Paths = struct {
     vision_encoder: [:0]const u8,
     decoder: [:0]const u8,
+    concept_vision_encoder: [:0]const u8,
+    concept_text_encoder: [:0]const u8,
+    concept_decoder: [:0]const u8,
+    concept_tokenizer_json: []const u8,
 
     openvino_provider: ?[:0]const u8 = null,
+    webgpu_provider: ?[:0]const u8 = null,
 
     cache_dir: ?[:0]const u8 = null,
 };
@@ -33,6 +40,30 @@ const decoder_outputs = [_][*:0]const u8{
     "object_score_logits",
 };
 
+const concept_embedding_names = [_][*:0]const u8{
+    "fpn_hidden_state_0",
+    "fpn_hidden_state_1",
+    "fpn_hidden_state_2",
+    "fpn_hidden_state_3",
+    "fpn_position_encoding_0",
+    "fpn_position_encoding_1",
+    "fpn_position_encoding_2",
+    "fpn_position_encoding_3",
+};
+const concept_decoder_inputs = [_][*:0]const u8{
+    "fpn_hidden_state_0",
+    "fpn_hidden_state_1",
+    "fpn_hidden_state_2",
+    "fpn_position_encoding_2",
+    "text_features",
+    "attention_mask",
+};
+const concept_decoder_outputs = [_][*:0]const u8{
+    "pred_masks",
+    "pred_boxes",
+    "pred_logits",
+};
+
 const Npu = struct { id: u32, name: []const u8 };
 
 const known_npus = [_]Npu{
@@ -52,36 +83,53 @@ pub const Target = struct {
     untested_npu: bool = false,
 };
 
+fn registerProvider(env: onnx.Env, name: [:0]const u8, path: ?[:0]const u8) void {
+    const provider = path orelse return;
+    env.registerProvider(name, provider) catch {
+        std.debug.print("  ! {s} provider at '{s}' would not load: {s}\n", .{
+            name,
+            provider,
+            onnx.lastError(),
+        });
+    };
+}
+
 pub const Model = struct {
     allocator: std.mem.Allocator,
     env: onnx.Env,
     vision: onnx.Session,
     decoder: onnx.Session,
+    concept_vision: onnx.Session,
+    concept_text: onnx.Session,
+    concept_decoder: onnx.Session,
+    concept_tokenizer: tokenizer.Tokenizer,
 
     pub fn open(allocator: std.mem.Allocator, paths: Paths, target: Target) !Model {
         try onnx.init();
 
         const env = try onnx.Env.init("sam3");
+        errdefer env.deinit();
 
-        if (paths.openvino_provider) |provider| {
-            env.registerProvider("OpenVINO", provider) catch {
-                std.debug.print("  ! OpenVINO provider at '{s}' would not load: {s}\n", .{
-                    provider,
-                    onnx.lastError(),
-                });
-            };
-        }
+        registerProvider(env, "OpenVINO", paths.openvino_provider);
+        registerProvider(env, "webgpu", paths.webgpu_provider);
 
-        var device = if (target.device == .cpu) null else try env.find(target.device);
+        var accelerator: ?onnx.Accelerator = if (target.device == .cpu)
+            null
+        else if (builtin.os.tag.isDarwin() and target.device != .webgpu)
+            .{ .coreml = target.device }
+        else if (try env.find(target.device)) |device|
+            .{ .device = device }
+        else
+            null;
 
         var declined = false;
 
-        if (device) |d| {
-            if (d.kind == .npu) {
-                if (npuName(d.id)) |name| {
-                    std.debug.print("  NPU:          Intel {s} (0x{x:0>4})\n", .{ name, d.id });
+        if (accelerator) |selected| {
+            if (selected == .device and selected.device.kind == .npu) {
+                if (npuName(selected.device.id)) |name| {
+                    std.debug.print("  NPU:          Intel {s} (0x{x:0>4})\n", .{ name, selected.device.id });
                 } else if (target.untested_npu) {
-                    std.debug.print("  NPU:          unrecognised generation 0x{x:0>4}, trying it anyway\n", .{d.id});
+                    std.debug.print("  NPU:          unrecognised generation 0x{x:0>4}, trying it anyway\n", .{selected.device.id});
                 } else {
                     std.debug.print(
                         \\  ! the NPU here (0x{x:0>4}) is a generation this has not been run on,
@@ -90,14 +138,14 @@ pub const Model = struct {
                         \\    never been tried. Build with -Duntested-npu to use it regardless.
                         \\
                         \\
-                    , .{d.id});
-                    device = null;
+                    , .{selected.device.id});
+                    accelerator = null;
                     declined = true;
                 }
             }
         }
 
-        if (target.device != .cpu and device == null and !declined) {
+        if (target.device != .cpu and accelerator == null and !declined) {
             std.debug.print(
                 \\  ! no {t} among the devices the runtime enumerated, so this runs on the CPU.
                 \\    The provider has to be registered (a -Dopenvino build), and whatever the
@@ -121,30 +169,80 @@ pub const Model = struct {
                     \\    hardware.graphics installed instead --
                     \\    OCL_ICD_FILENAMES=/run/opengl-driver/lib/intel-opencl/libigdrcl.so
                     ,
+                    .webgpu =>
+                    \\    WebGPU needs a working Vulkan driver. On Linux, Dawn selects a Vulkan
+                    \\    adapter, so verify the GPU with `vulkaninfo --summary`.
+                    ,
                     .cpu => "",
                 },
             });
         }
 
         var config_buf: [512]u8 = undefined;
-        var option_buf: [1]onnx.Option = undefined;
+        var option_buf: [8]onnx.Option = undefined;
         var options: []const onnx.Option = &.{};
-        if (device != null) if (paths.cache_dir) |dir| {
-            const config = try std.fmt.bufPrintZ(
-                &config_buf,
-                "{{\"{s}\":{{\"CACHE_DIR\":\"{s}\"}}}}",
-                .{ target.device.openvinoName(), dir },
-            );
-            option_buf[0] = .{ .key = "load_config", .value = config.ptr };
-            options = option_buf[0..1];
+        if (accelerator) |selected| switch (selected) {
+            .device => if (target.device != .webgpu) {
+                if (paths.cache_dir) |dir| {
+                    const config = try std.fmt.bufPrintZ(
+                        &config_buf,
+                        "{{\"{s}\":{{\"CACHE_DIR\":\"{s}\"}}}}",
+                        .{ target.device.openvinoName(), dir },
+                    );
+                    option_buf[0] = .{ .key = "load_config", .value = config.ptr };
+                    options = option_buf[0..1];
+                }
+            },
+            .coreml => |device| {
+                option_buf[0] = .{
+                    .key = "MLComputeUnits",
+                    .value = switch (device) {
+                        .npu => "CPUAndNeuralEngine",
+                        .gpu => "CPUAndGPU",
+                        .webgpu => unreachable,
+                        .cpu => unreachable,
+                    },
+                };
+                option_buf[1] = .{ .key = "ModelFormat", .value = "MLProgram" };
+                option_buf[2] = .{ .key = "RequireStaticInputShapes", .value = "1" };
+                option_buf[3] = .{ .key = "AllowLowPrecisionAccumulationOnGPU", .value = "1" };
+                var count: usize = 4;
+                if (paths.cache_dir) |dir| {
+                    const cache_dir = try std.fmt.bufPrintZ(&config_buf, "{s}", .{dir});
+                    option_buf[count] = .{ .key = "ModelCacheDirectory", .value = cache_dir.ptr };
+                    count += 1;
+                }
+                options = option_buf[0..count];
+            },
         };
 
-        const vision = try onnx.Session.open(env, paths.vision_encoder, device, options, reportFallback);
+        const vision = try onnx.Session.open(env, paths.vision_encoder, accelerator, options, reportFallback);
         errdefer vision.deinit();
 
         const decoder = try onnx.Session.open(env, paths.decoder, null, &.{}, reportFallback);
+        errdefer decoder.deinit();
 
-        return .{ .allocator = allocator, .env = env, .vision = vision, .decoder = decoder };
+        const concept_vision = try onnx.Session.open(env, paths.concept_vision_encoder, accelerator, options, reportFallback);
+        errdefer concept_vision.deinit();
+        // The text graph has a large weight set for a tiny input, so moving it
+        // to the GPU costs more VRAM than it saves time. The smaller decoder
+        // benefits from the selected accelerator.
+        const concept_text = try onnx.Session.open(env, paths.concept_text_encoder, null, &.{}, reportFallback);
+        errdefer concept_text.deinit();
+        const concept_decoder = try onnx.Session.open(env, paths.concept_decoder, accelerator, options, reportFallback);
+        errdefer concept_decoder.deinit();
+        const concept_tokenizer = try tokenizer.Tokenizer.init(allocator, paths.concept_tokenizer_json);
+
+        return .{
+            .allocator = allocator,
+            .env = env,
+            .vision = vision,
+            .decoder = decoder,
+            .concept_vision = concept_vision,
+            .concept_text = concept_text,
+            .concept_decoder = concept_decoder,
+            .concept_tokenizer = concept_tokenizer,
+        };
     }
 
     fn reportFallback(message: []const u8) void {
@@ -152,8 +250,13 @@ pub const Model = struct {
     }
 
     pub fn deinit(self: *Model) void {
+        self.concept_tokenizer.deinit();
+        self.concept_decoder.deinit();
+        self.concept_text.deinit();
+        self.concept_vision.deinit();
         self.decoder.deinit();
         self.vision.deinit();
+        self.env.deinit();
     }
 
     pub fn segment(self: *Model, img: ImageRGB, points: []const Point) !Masks {
@@ -222,12 +325,75 @@ pub const Model = struct {
 
         return Masks.take(self.allocator, results[0], results[1], results[2]);
     }
+
+    pub fn encodeConcept(self: *Model, img: ImageRGB) !ConceptEmbedding {
+        const pixels = try preprocessConcept(self.allocator, img);
+        defer self.allocator.free(pixels);
+
+        const pixel_shape = [_]i64{ 1, 3, image_size, image_size };
+        const pixel_values = try onnx.Value.borrowF32(pixels, &pixel_shape);
+        defer pixel_values.deinit();
+
+        var embedding: ConceptEmbedding = undefined;
+        try self.concept_vision.run(
+            &.{vision_input},
+            &.{pixel_values},
+            &concept_embedding_names,
+            &embedding.levels,
+        );
+        return embedding;
+    }
+
+    pub fn lookup(self: *Model, embedding: ConceptEmbedding, phrase: []const u8, threshold: f32) !Masks {
+        const encoding = try self.concept_tokenizer.encode(phrase);
+        const token_shape = [_]i64{ 1, tokenizer.max_tokens };
+        const ids = try onnx.Value.borrowI64(&encoding.ids, &token_shape);
+        defer ids.deinit();
+        const attention = try onnx.Value.borrowI64(&encoding.attention, &token_shape);
+        defer attention.deinit();
+
+        var text_features: [1]onnx.Value = undefined;
+        try self.concept_text.run(
+            &.{ "input_ids", "attention_mask" },
+            &.{ ids, attention },
+            &.{"text_features"},
+            &text_features,
+        );
+        defer text_features[0].deinit();
+
+        const inputs = [_]onnx.Value{
+            embedding.levels[0],
+            embedding.levels[1],
+            embedding.levels[2],
+            embedding.levels[6],
+            text_features[0],
+            attention,
+        };
+        var results: [concept_decoder_outputs.len]onnx.Value = undefined;
+        try self.concept_decoder.run(
+            &concept_decoder_inputs,
+            &inputs,
+            &concept_decoder_outputs,
+            &results,
+        );
+        defer for (results) |result| result.deinit();
+        return Masks.takeConcept(self.allocator, results[0], results[2], threshold);
+    }
 };
 
 pub const Embedding = struct {
     levels: [embedding_names.len]onnx.Value,
 
     pub fn deinit(self: *Embedding) void {
+        for (self.levels) |level| level.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const ConceptEmbedding = struct {
+    levels: [concept_embedding_names.len]onnx.Value,
+
+    pub fn deinit(self: *ConceptEmbedding) void {
         for (self.levels) |level| level.deinit();
         self.* = undefined;
     }
@@ -269,6 +435,50 @@ pub const Masks = struct {
         };
     }
 
+    fn takeConcept(allocator: std.mem.Allocator, masks: onnx.Value, scores_value: onnx.Value, threshold: f32) !Masks {
+        var dims: [8]i64 = undefined;
+        const shape = try masks.shape(&dims);
+        if (shape.len != 4 or shape[0] != 1) return error.UnexpectedConceptMaskShape;
+
+        const available: usize = @intCast(shape[1]);
+        const height: usize = @intCast(shape[2]);
+        const width: usize = @intCast(shape[3]);
+        const planes = try masks.dataF32();
+        const raw_scores = try scores_value.dataF32();
+        if (raw_scores.len < available) return error.UnexpectedConceptScoreShape;
+
+        var count: usize = 0;
+        for (raw_scores[0..available]) |logit| {
+            const score = sigmoid(logit);
+            if (score >= threshold) count += 1;
+        }
+
+        const logits = try allocator.alloc(f32, count * width * height);
+        errdefer allocator.free(logits);
+        const scores = try allocator.alloc(f32, count);
+        errdefer allocator.free(scores);
+
+        const stride = width * height;
+        var out: usize = 0;
+        for (raw_scores[0..available], 0..) |logit, i| {
+            const score = sigmoid(logit);
+            if (score < threshold) continue;
+            scores[out] = score;
+            @memcpy(logits[out * stride ..][0..stride], planes[i * stride ..][0..stride]);
+            out += 1;
+        }
+
+        return .{
+            .allocator = allocator,
+            .logits = logits,
+            .scores = scores,
+            .count = count,
+            .width = width,
+            .height = height,
+            .object_score = if (count == 0) 0 else max(scores),
+        };
+    }
+
     pub fn deinit(self: *Masks) void {
         self.allocator.free(self.logits);
         self.allocator.free(self.scores);
@@ -280,6 +490,7 @@ pub const Masks = struct {
     }
 
     pub fn best(self: Masks) usize {
+        if (self.count == 0) return 0;
         var winner: usize = 0;
         for (self.scores, 0..) |score, i| {
             if (score > self.scores[winner]) winner = i;
@@ -288,7 +499,30 @@ pub const Masks = struct {
     }
 };
 
+fn sigmoid(x: f32) f32 {
+    return 1.0 / (1.0 + @exp(-x));
+}
+
+fn max(values: []const f32) f32 {
+    var result = values[0];
+    for (values[1..]) |value| result = @max(result, value);
+    return result;
+}
+
 fn preprocess(allocator: std.mem.Allocator, img: ImageRGB) ![]f32 {
+    return preprocessNormalized(allocator, img, @splat(0.5), @splat(0.5));
+}
+
+fn preprocessConcept(allocator: std.mem.Allocator, img: ImageRGB) ![]f32 {
+    return preprocessNormalized(
+        allocator,
+        img,
+        .{ 0.485, 0.456, 0.406 },
+        .{ 0.229, 0.224, 0.225 },
+    );
+}
+
+fn preprocessNormalized(allocator: std.mem.Allocator, img: ImageRGB, mean: [3]f32, deviation: [3]f32) ![]f32 {
     const plane_size = image_size * image_size;
     const out = try allocator.alloc(f32, 3 * plane_size);
     errdefer allocator.free(out);
@@ -312,7 +546,7 @@ fn preprocess(allocator: std.mem.Allocator, img: ImageRGB) ![]f32 {
         defer allocator.free(resized);
 
         const target = out[channel * plane_size ..][0..plane_size];
-        for (target, resized) |*v, r| v.* = (r - 0.5) / 0.5;
+        for (target, resized) |*v, r| v.* = (r - mean[channel]) / deviation[channel];
     }
     return out;
 }

@@ -47,12 +47,14 @@ pub fn version() []const u8 {
 pub const DeviceKind = enum {
     npu,
     gpu,
+    webgpu,
     cpu,
 
     pub fn openvinoName(self: DeviceKind) [:0]const u8 {
         return switch (self) {
             .npu => "NPU",
             .gpu => "GPU",
+            .webgpu => unreachable,
             .cpu => "CPU",
         };
     }
@@ -61,6 +63,7 @@ pub const DeviceKind = enum {
         return switch (self) {
             .npu => c.OrtHardwareDeviceType_NPU,
             .gpu => c.OrtHardwareDeviceType_GPU,
+            .webgpu => c.OrtHardwareDeviceType_GPU,
             .cpu => c.OrtHardwareDeviceType_CPU,
         };
     }
@@ -71,6 +74,18 @@ pub const Device = struct {
 
     id: u32,
     handle: *const c.OrtEpDevice,
+};
+
+pub const Accelerator = union(enum) {
+    device: Device,
+    coreml: DeviceKind,
+
+    fn kind(self: Accelerator) DeviceKind {
+        return switch (self) {
+            .device => |device| device.kind,
+            .coreml => |device| device,
+        };
+    }
 };
 
 pub const Option = struct {
@@ -123,13 +138,13 @@ pub const Session = struct {
     pub fn open(
         env: Env,
         model_path: [:0]const u8,
-        device: ?Device,
+        accelerator: ?Accelerator,
         options: []const Option,
         on_fallback: ?*const fn (message: []const u8) void,
     ) Error!Session {
-        if (device) |d| {
-            if (tryOpen(env, model_path, d, options)) |ptr| {
-                return .{ .ptr = ptr, .device = d.kind };
+        if (accelerator) |selected| {
+            if (tryOpen(env, model_path, selected, options)) |ptr| {
+                return .{ .ptr = ptr, .device = selected.kind() };
             } else |_| {
                 if (on_fallback) |report| report(lastError());
             }
@@ -140,7 +155,7 @@ pub const Session = struct {
     fn tryOpen(
         env: Env,
         model_path: [:0]const u8,
-        device: ?Device,
+        accelerator: ?Accelerator,
         options: []const Option,
     ) Error!*c.OrtSession {
         var session_options: ?*c.OrtSessionOptions = null;
@@ -149,24 +164,43 @@ pub const Session = struct {
 
         try check(api.AddFreeDimensionOverrideByName.?(session_options, "batch_size", 1));
 
-        if (device) |d| {
-            var keys: [4][*:0]const u8 = undefined;
-            var values: [4][*:0]const u8 = undefined;
+        if (accelerator) |selected| {
+            if (selected.kind() == .webgpu) {
+                // SAM 3 uses static tensor shapes. Exact-size reuse avoids the
+                // substantial VRAM overhead of WebGPU's bucketed default.
+                try check(api.AddSessionConfigEntry.?(
+                    session_options,
+                    "ep.webgpuexecutionprovider.storageBufferCacheMode",
+                    "simple",
+                ));
+            }
+
+            var keys: [8][*:0]const u8 = undefined;
+            var values: [8][*:0]const u8 = undefined;
             std.debug.assert(options.len <= keys.len);
             for (options, 0..) |option, i| {
                 keys[i] = option.key;
                 values[i] = option.value;
             }
 
-            try check(api.SessionOptionsAppendExecutionProvider_V2.?(
-                session_options,
-                env.ptr,
-                @ptrCast(&d.handle),
-                1,
-                @ptrCast(&keys),
-                @ptrCast(&values),
-                options.len,
-            ));
+            switch (selected) {
+                .device => |d| try check(api.SessionOptionsAppendExecutionProvider_V2.?(
+                    session_options,
+                    env.ptr,
+                    @ptrCast(&d.handle),
+                    1,
+                    @ptrCast(&keys),
+                    @ptrCast(&values),
+                    options.len,
+                )),
+                .coreml => try check(api.SessionOptionsAppendExecutionProvider.?(
+                    session_options,
+                    "CoreML",
+                    @ptrCast(&keys),
+                    @ptrCast(&values),
+                    options.len,
+                )),
+            }
         }
 
         var ptr: ?*c.OrtSession = null;
