@@ -1,0 +1,19 @@
+.{
+    .name = .engine,
+
+    .version = "0.0.0",
+
+    .fingerprint = 0xe8a81a8d965b7cd4,
+
+    .minimum_zig_version = "0.16.0",
+
+    .dependencies = .{
+        .cuda = .{ .path = "../cuda" },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

@@ -1,9 +1,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
-pub const onnx = @import("onnx.zig");
+/// Selected by build.zig. The current implementation is ONNX Runtime; the
+/// native CUDA engine implements this same session/value boundary.
+pub const onnx = @import("runtime");
 const resample = @import("resample.zig");
 const tokenizer = @import("tokenizer.zig");
 const ImageRGB = @import("io/image.zig").ImageRGB;
+const gpu = @import("gpu");
 
 pub const image_size: usize = 1008;
 
@@ -81,6 +84,10 @@ pub const Target = struct {
     device: onnx.DeviceKind = .cpu,
 
     untested_npu: bool = false,
+
+    /// Preprocess images on an NVIDIA GPU rather than the CPU. Only a build
+    /// with -Dcuda has the code for it.
+    cuda: bool = false,
 };
 
 fn registerProvider(env: onnx.Env, name: [:0]const u8, path: ?[:0]const u8) void {
@@ -104,10 +111,13 @@ pub const Model = struct {
     concept_decoder: onnx.Session,
     concept_tokenizer: tokenizer.Tokenizer,
 
-    pub fn open(allocator: std.mem.Allocator, paths: Paths, target: Target) !Model {
-        try onnx.init();
+    /// Null when preprocessing runs on the CPU.
+    preprocessor: ?gpu.Preprocessor,
 
-        const env = try onnx.Env.init("sam3");
+    pub fn open(allocator: std.mem.Allocator, io: std.Io, paths: Paths, target: Target) !Model {
+        try onnx.init(allocator, io);
+
+        const env = try onnx.Env.init(allocator, io, "sam3");
         errdefer env.deinit();
 
         registerProvider(env, "OpenVINO", paths.openvino_provider);
@@ -119,6 +129,8 @@ pub const Model = struct {
             .{ .coreml = target.device }
         else if (try env.find(target.device)) |device|
             .{ .device = device }
+        else if ((target.device == .gpu or target.device == .npu) and paths.openvino_provider != null)
+            .{ .openvino = target.device }
         else
             null;
 
@@ -193,6 +205,15 @@ pub const Model = struct {
                     options = option_buf[0..1];
                 }
             },
+            .openvino => if (paths.cache_dir) |dir| {
+                const config = try std.fmt.bufPrintZ(
+                    &config_buf,
+                    "{{\"{s}\":{{\"CACHE_DIR\":\"{s}\"}}}}",
+                    .{ target.device.openvinoName(), dir },
+                );
+                option_buf[0] = .{ .key = "load_config", .value = config.ptr };
+                options = option_buf[0..1];
+            },
             .coreml => |device| {
                 option_buf[0] = .{
                     .key = "MLComputeUnits",
@@ -242,7 +263,24 @@ pub const Model = struct {
             .concept_text = concept_text,
             .concept_decoder = concept_decoder,
             .concept_tokenizer = concept_tokenizer,
+            .preprocessor = if (target.cuda) openPreprocessor() else null,
         };
+    }
+
+    /// The GPU only handles preprocessing, so failing to reach it costs a few
+    /// milliseconds rather than the run: say so and stay on the CPU.
+    fn openPreprocessor() ?gpu.Preprocessor {
+        if (!gpu.available) {
+            std.debug.print("  ! this build has no CUDA support, so images are preprocessed on the CPU.\n    Rebuild with -Dcuda.\n", .{});
+            return null;
+        }
+        var preprocessor = gpu.Preprocessor.init(image_size) catch {
+            std.debug.print("  ! no CUDA device for preprocessing, so it runs on the CPU: {s}\n", .{gpu.lastError()});
+            return null;
+        };
+        var name_buf: [128]u8 = undefined;
+        std.debug.print("  CUDA:         {s}\n", .{preprocessor.deviceName(&name_buf) catch "NVIDIA GPU"});
+        return preprocessor;
     }
 
     fn reportFallback(message: []const u8) void {
@@ -250,6 +288,7 @@ pub const Model = struct {
     }
 
     pub fn deinit(self: *Model) void {
+        if (self.preprocessor) |*preprocessor| preprocessor.deinit();
         self.concept_tokenizer.deinit();
         self.concept_decoder.deinit();
         self.concept_text.deinit();
@@ -266,7 +305,7 @@ pub const Model = struct {
     }
 
     pub fn encode(self: *Model, img: ImageRGB) !Embedding {
-        const pixels = try preprocess(self.allocator, img);
+        const pixels = try self.preprocess(img);
         defer self.allocator.free(pixels);
 
         const pixel_shape = [_]i64{ 1, 3, image_size, image_size };
@@ -327,7 +366,7 @@ pub const Model = struct {
     }
 
     pub fn encodeConcept(self: *Model, img: ImageRGB) !ConceptEmbedding {
-        const pixels = try preprocessConcept(self.allocator, img);
+        const pixels = try self.preprocessConcept(img);
         defer self.allocator.free(pixels);
 
         const pixel_shape = [_]i64{ 1, 3, image_size, image_size };
@@ -378,6 +417,41 @@ pub const Model = struct {
         );
         defer for (results) |result| result.deinit();
         return Masks.takeConcept(self.allocator, results[0], results[2], threshold);
+    }
+
+    /// Public so `zig build compare` can run the two preprocessing paths
+    /// against each other; the pipeline calls it on its own.
+    pub fn preprocess(self: *Model, img: ImageRGB) ![]f32 {
+        return self.preprocessNormalized(img, @splat(0.5), @splat(0.5));
+    }
+
+    fn preprocessConcept(self: *Model, img: ImageRGB) ![]f32 {
+        return self.preprocessNormalized(
+            img,
+            .{ 0.485, 0.456, 0.406 },
+            .{ 0.229, 0.224, 0.225 },
+        );
+    }
+
+    /// Resizes and normalizes an image into the tensor the encoder takes, on
+    /// the GPU when one was opened for it. A GPU that fails part way through a
+    /// session hands the work back to the CPU for the rest of it.
+    fn preprocessNormalized(self: *Model, img: ImageRGB, mean: [3]f32, deviation: [3]f32) ![]f32 {
+        if (self.preprocessor) |*preprocessor| {
+            const out = try self.allocator.alloc(f32, 3 * image_size * image_size);
+            if (preprocessor.run(img.data, img.width, img.height, mean, deviation, out)) {
+                return out;
+            } else |err| {
+                self.allocator.free(out);
+                std.debug.print("  ! CUDA preprocessing failed ({t}), moving it to the CPU: {s}\n", .{
+                    err,
+                    gpu.lastError(),
+                });
+                preprocessor.deinit();
+                self.preprocessor = null;
+            }
+        }
+        return preprocessCpu(self.allocator, img, mean, deviation);
     }
 };
 
@@ -509,20 +583,8 @@ fn max(values: []const f32) f32 {
     return result;
 }
 
-fn preprocess(allocator: std.mem.Allocator, img: ImageRGB) ![]f32 {
-    return preprocessNormalized(allocator, img, @splat(0.5), @splat(0.5));
-}
-
-fn preprocessConcept(allocator: std.mem.Allocator, img: ImageRGB) ![]f32 {
-    return preprocessNormalized(
-        allocator,
-        img,
-        .{ 0.485, 0.456, 0.406 },
-        .{ 0.229, 0.224, 0.225 },
-    );
-}
-
-fn preprocessNormalized(allocator: std.mem.Allocator, img: ImageRGB, mean: [3]f32, deviation: [3]f32) ![]f32 {
+/// The CPU path, and the reference the CUDA kernel is checked against.
+fn preprocessCpu(allocator: std.mem.Allocator, img: ImageRGB, mean: [3]f32, deviation: [3]f32) ![]f32 {
     const plane_size = image_size * image_size;
     const out = try allocator.alloc(f32, 3 * plane_size);
     errdefer allocator.free(out);

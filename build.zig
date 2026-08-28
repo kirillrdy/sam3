@@ -1,7 +1,11 @@
 const std = @import("std");
 const onnxruntime = @import("onnxruntime");
+const cuda_build = @import("cuda");
 
-const Device = enum { cpu, npu, gpu, webgpu };
+/// Where the model runs. Every one but `cuda` is an ONNX Runtime execution
+/// provider; `cuda` swaps the executor itself for the in-tree graph runtime,
+/// which talks to the NVIDIA driver directly.
+const Device = enum { cpu, npu, gpu, webgpu, cuda };
 
 const webgpu_version = "0.2.1";
 const webgpu_url = "https://files.pythonhosted.org/packages/f4/c4/f7de789c43f8a25468c0e5d4a69c28cfb3c29c84c2556c1e6e7dd4c4cee4/onnxruntime_ep_webgpu-0.2.1-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl";
@@ -61,8 +65,24 @@ pub fn build(b: *std.Build) void {
     const device = b.option(
         Device,
         "device",
-        "Which device to run the model on: cpu, Intel npu/gpu, or cross-vendor webgpu (default: cpu)",
+        "Which device to run the model on: cpu, Intel npu/gpu, cross-vendor webgpu, or nvidia cuda (default: cpu)",
     ) orelse .cpu;
+
+    // The CUDA build is the one that leaves ONNX Runtime behind entirely, so
+    // it decides which executor the `runtime` module below resolves to.
+    const native_runtime = device == .cuda;
+
+    const with_cuda = b.option(
+        bool,
+        "cuda",
+        "Preprocess images on an NVIDIA GPU through the CUDA driver API, on a build that is otherwise ONNX Runtime's (default: false; implied by -Ddevice=cuda)",
+    ) orelse false;
+
+    const cuda_arch = b.option(
+        []const u8,
+        "sm",
+        "Compute capability the CUDA kernels are built for (default: " ++ cuda_build.default_arch ++ ")",
+    ) orelse cuda_build.default_arch;
 
     const untested_npu = b.option(
         bool,
@@ -95,13 +115,13 @@ pub fn build(b: *std.Build) void {
     ) orelse 3000;
 
     const with_openvino = (device == .npu or device == .gpu) and target.result.os.tag == .linux;
-    const with_coreml = device != .cpu and target.result.os.tag.isDarwin();
+    const with_coreml = !native_runtime and device != .cpu and target.result.os.tag.isDarwin();
     const with_webgpu = device == .webgpu;
     if (with_webgpu and (target.result.os.tag != .linux or target.result.cpu.arch != .x86_64)) {
         std.log.err("the pinned WebGPU provider currently supports x86_64-linux only", .{});
         std.process.exit(1);
     }
-    const ort = b.dependency("onnxruntime", .{
+    const ort = if (native_runtime) null else b.dependency("onnxruntime", .{
         .target = target,
         .optimize = optimize,
         .openvino = with_openvino,
@@ -126,7 +146,51 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    mod.linkLibrary(ort.artifact("onnxruntime"));
+    // Keep the model layer independent of the executor: it imports `runtime`
+    // and never learns which one it got. ONNX Runtime stays the default
+    // because it runs anywhere. The CUDA engine covers every operator both
+    // prompting paths reach, but only on an NVIDIA GPU.
+    if (native_runtime) {
+        const engine = b.dependency("engine", .{
+            .target = target,
+            .optimize = optimize,
+            .sm = cuda_arch,
+        });
+        mod.addImport("runtime", engine.module("engine"));
+    } else {
+        const ort_runtime = b.createModule(.{
+            .root_source_file = b.path("src/onnx.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        ort_runtime.linkLibrary(ort.?.artifact("onnxruntime"));
+        mod.addImport("runtime", ort_runtime);
+    }
+
+    // The GPU preprocessing path is a swappable module, so nothing else in
+    // sam3 needs to know whether this build can talk to a GPU at all.
+    if (with_cuda or native_runtime) {
+        const cuda_dep = b.dependency("cuda", .{ .target = target, .optimize = optimize });
+        const kernels = cuda_build.addPtxFor(b, cuda_dep, .{
+            .root_source_file = b.path("src/gpu/kernels.zig"),
+            .arch = cuda_arch,
+            .optimize = optimize,
+        });
+        const backend = b.createModule(.{
+            .root_source_file = b.path("src/gpu/cuda.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "cuda", .module = cuda_dep.module("cuda") }},
+        });
+        backend.addAnonymousImport("kernels.ptx", .{ .root_source_file = kernels });
+        mod.addImport("gpu", backend);
+    } else {
+        mod.addImport("gpu", b.createModule(.{
+            .root_source_file = b.path("src/gpu/disabled.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+    }
 
     var openvino_provider_path: []const u8 = "";
     var provider_cache_path: []const u8 = "";
@@ -136,12 +200,16 @@ pub fn build(b: *std.Build) void {
         onnxruntime.linkStdCxx(b, mod);
 
         b.getInstallStep().dependOn(&b.addInstallArtifact(
-            ort.artifact("onnxruntime_providers_shared"),
+            ort.?.artifact("onnxruntime_providers_shared"),
             .{ .dest_dir = .{ .override = .bin } },
         ).step);
 
-        const provider = b.addInstallArtifact(ort.artifact("onnxruntime_providers_openvino"), .{});
+        const provider = b.addInstallArtifact(ort.?.artifact("onnxruntime_providers_openvino"), .{});
         b.getInstallStep().dependOn(&provider.step);
+        b.getInstallStep().dependOn(&b.addInstallArtifact(
+            ort.artifact("onnxruntime_providers_openvino"),
+            .{ .dest_dir = .{ .override = .bin } },
+        ).step);
         openvino_provider_path = b.getInstallPath(.lib, "libonnxruntime_providers_openvino.so");
     }
     if (with_coreml) {
@@ -149,7 +217,7 @@ pub fn build(b: *std.Build) void {
     }
 
     if (device == .gpu and with_openvino) {
-        b.installArtifact(ort.artifact("OpenCL"));
+        b.installArtifact(ort.?.artifact("OpenCL"));
         runtime_paths.append(b.allocator, b.getInstallPath(.lib, "")) catch @panic("OOM");
     }
     if (with_webgpu) {
@@ -371,8 +439,11 @@ pub fn build(b: *std.Build) void {
     server_options.addOption([]const u8, "webgpu_provider_path", webgpu_provider_path);
     server_options.addOption([]const u8, "provider_cache_path", provider_cache_path);
     server_options.addOption([]const u8, "example_path", example_path);
-    server_options.addOption([]const u8, "device", @tagName(device));
+    // The application names devices the way an execution provider does, and
+    // the in-tree runtime enumerates exactly one of them: an NVIDIA GPU.
+    server_options.addOption([]const u8, "device", if (native_runtime) "gpu" else @tagName(device));
     server_options.addOption(bool, "untested_npu", untested_npu);
+    server_options.addOption(bool, "cuda", with_cuda or native_runtime);
     server_options.addOption([]const u8, "host", host);
     server_options.addOption(u16, "port", port);
 
@@ -419,6 +490,29 @@ pub fn build(b: *std.Build) void {
     web_exe.root_module.addOptions("build_options", server_options);
     if (with_openvino or with_webgpu) onnxruntime.linkStdCxx(b, web_exe.root_module);
     b.installArtifact(web_exe);
+
+    const compare_exe = b.addExecutable(.{
+        .name = "sam3-compare",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/compare/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "sam3", .module = mod }},
+        }),
+    });
+    compare_exe.root_module.addOptions("build_options", server_options);
+    if (with_openvino or with_webgpu) onnxruntime.linkStdCxx(b, compare_exe.root_module);
+
+    const compare_step = b.step(
+        "compare",
+        "Segment one image twice, preprocessing on the CPU and on the GPU, and diff the results",
+    );
+    const compare_cmd = b.addRunArtifact(compare_exe);
+    compare_cmd.step.dependOn(weights_step);
+    compare_cmd.step.dependOn(examples_step);
+    compare_cmd.setCwd(b.path("."));
+    if (b.args) |args| compare_cmd.addArgs(args);
+    compare_step.dependOn(&compare_cmd.step);
 
     const run_step = b.step("run", b.fmt("Run the web UI on http://{s}:{d}/", .{ host, port }));
     const run_cmd = b.addRunArtifact(web_exe);

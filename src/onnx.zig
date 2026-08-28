@@ -31,7 +31,7 @@ fn check(status: ?*c.OrtStatus) Error!void {
     return Error.OnnxRuntime;
 }
 
-pub fn init() Error!void {
+pub fn init(_: std.mem.Allocator, _: std.Io) Error!void {
     const base = c.OrtGetApiBase();
     api = base.*.GetApi.?(c.ORT_API_VERSION) orelse return Error.UnsupportedApiVersion;
 
@@ -79,11 +79,13 @@ pub const Device = struct {
 pub const Accelerator = union(enum) {
     device: Device,
     coreml: DeviceKind,
+    openvino: DeviceKind,
 
     fn kind(self: Accelerator) DeviceKind {
         return switch (self) {
             .device => |device| device.kind,
             .coreml => |device| device,
+            .openvino => |device| device,
         };
     }
 };
@@ -96,7 +98,7 @@ pub const Option = struct {
 pub const Env = struct {
     ptr: *c.OrtEnv,
 
-    pub fn init(name: [:0]const u8) Error!Env {
+    pub fn init(_: std.mem.Allocator, _: std.Io, name: [:0]const u8) Error!Env {
         var ptr: ?*c.OrtEnv = null;
         try check(api.CreateEnv.?(c.ORT_LOGGING_LEVEL_WARNING, name.ptr, &ptr));
         return .{ .ptr = ptr.? };
@@ -200,6 +202,17 @@ pub const Session = struct {
                     @ptrCast(&values),
                     options.len,
                 )),
+                .openvino => |device| {
+                    std.debug.assert(options.len < keys.len);
+                    keys[options.len] = "device_type";
+                    values[options.len] = device.openvinoName().ptr;
+                    try check(api.SessionOptionsAppendExecutionProvider_OpenVINO_V2.?(
+                        session_options,
+                        @ptrCast(&keys),
+                        @ptrCast(&values),
+                        options.len + 1,
+                    ));
+                },
             }
         }
 

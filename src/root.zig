@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const onnx = @import("onnx.zig");
+pub const onnx = @import("runtime");
 pub const sam3 = @import("sam3.zig");
 pub const resample = @import("resample.zig");
 pub const image = @import("io/image.zig");

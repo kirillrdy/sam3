@@ -18,6 +18,7 @@ const provider_cache_path = terminateOptional(build_options.provider_cache_path)
 const target: sam3.Target = .{
     .device = std.meta.stringToEnum(sam3.DeviceKind, build_options.device).?,
     .untested_npu = build_options.untested_npu,
+    .cuda = build_options.cuda,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -44,7 +45,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     std.debug.print("\n=== SAM 3 Web UI ===\n\n", .{});
-    std.debug.print("  ONNX Runtime: {s}\n", .{sam3.onnx.version()});
+    std.debug.print("  Model runtime: {s}\n", .{sam3.onnx.version()});
 
     const tokenizer_json = try std.Io.Dir.cwd().readFileAlloc(
         init.io,
@@ -54,7 +55,7 @@ pub fn main(init: std.process.Init) !void {
     );
     defer allocator.free(tokenizer_json);
 
-    var model = try sam3.Model.open(allocator, .{
+    var model = try sam3.Model.open(allocator, init.io, .{
         .vision_encoder = vision_encoder_path,
         .decoder = decoder_path,
         .concept_vision_encoder = concept_vision_path,

@@ -182,13 +182,13 @@ const Server = struct {
         defer self.mutex.unlock(self.io);
 
         const embedding = self.encode(body) catch |err| {
-            std.debug.print("  ! could not encode the frame: {t}\n", .{err});
-            return request.respond("could not read that image\n", .{ .status = .bad_request });
+            std.debug.print("  ! could not encode the frame: {t}: {s}\n", .{ err, sam3.onnx.lastError() });
+            return request.respond("image encoder failed\n", .{ .status = .internal_server_error });
         };
 
         const started = Io.Timestamp.now(self.io, .awake);
         var masks = self.model.decode(embedding, prompt) catch |err| {
-            std.debug.print("  ! decoder failed: {t}\n", .{err});
+            std.debug.print("  ! decoder failed: {t}: {s}\n", .{ err, sam3.onnx.lastError() });
             return request.respond("segmentation failed\n", .{ .status = .internal_server_error });
         };
         defer masks.deinit();
