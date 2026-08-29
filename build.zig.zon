@@ -9,10 +9,9 @@
 
     .dependencies = .{
         .cuda = .{ .path = "cuda" },
+        .opencl = .{ .path = "opencl" },
+        .metal = .{ .path = "metal" },
         .engine = .{ .path = "engine" },
-        .onnxruntime = .{
-            .path = "../onnxruntime",
-        },
         .zigimg = .{
             .url = "git+https://github.com/nothke/zigimg#581795265e1caee099baae32883c0f9d4f28f81a",
             .hash = "zigimg-0.1.0-8_eo2jPCFwDJF89NMU5gJjpTRoFdda26viRcdxyJP0Ks",
@@ -21,6 +20,8 @@
     .paths = .{
         "build.zig",
         "cuda",
+        "opencl",
+        "metal",
         "engine",
         "build.zig.zon",
         "src",

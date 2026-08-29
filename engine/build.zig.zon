@@ -9,6 +9,8 @@
 
     .dependencies = .{
         .cuda = .{ .path = "../cuda" },
+        .opencl = .{ .path = "../opencl" },
+        .metal = .{ .path = "../metal" },
     },
 
     .paths = .{

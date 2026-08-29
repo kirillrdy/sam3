@@ -85,9 +85,9 @@ pub const Target = struct {
 
     untested_npu: bool = false,
 
-    /// Preprocess images on an NVIDIA GPU rather than the CPU. Only a build
-    /// with -Dcuda has the code for it.
+    /// Preprocess images on a GPU rather than the CPU.
     cuda: bool = false,
+    gpu: bool = false,
 };
 
 fn registerProvider(env: onnx.Env, name: [:0]const u8, path: ?[:0]const u8) void {
@@ -263,7 +263,7 @@ pub const Model = struct {
             .concept_text = concept_text,
             .concept_decoder = concept_decoder,
             .concept_tokenizer = concept_tokenizer,
-            .preprocessor = if (target.cuda) openPreprocessor() else null,
+            .preprocessor = if (target.cuda or target.gpu) openPreprocessor() else null,
         };
     }
 
@@ -271,15 +271,15 @@ pub const Model = struct {
     /// milliseconds rather than the run: say so and stay on the CPU.
     fn openPreprocessor() ?gpu.Preprocessor {
         if (!gpu.available) {
-            std.debug.print("  ! this build has no CUDA support, so images are preprocessed on the CPU.\n    Rebuild with -Dcuda.\n", .{});
+            std.debug.print("  ! this build has no GPU preprocessing support, so images are preprocessed on the CPU.\n", .{});
             return null;
         }
         var preprocessor = gpu.Preprocessor.init(image_size) catch {
-            std.debug.print("  ! no CUDA device for preprocessing, so it runs on the CPU: {s}\n", .{gpu.lastError()});
+            std.debug.print("  ! no GPU device for preprocessing, so it runs on the CPU: {s}\n", .{gpu.lastError()});
             return null;
         };
         var name_buf: [128]u8 = undefined;
-        std.debug.print("  CUDA:         {s}\n", .{preprocessor.deviceName(&name_buf) catch "NVIDIA GPU"});
+        std.debug.print("  GPU:          {s}\n", .{preprocessor.deviceName(&name_buf) catch "GPU"});
         return preprocessor;
     }
 

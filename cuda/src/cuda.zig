@@ -8,6 +8,7 @@ pub const Error = error{Cuda};
 
 /// An address in device memory. Kernel pointer parameters take this.
 pub const DevicePtr = u64;
+pub const null_ptr: DevicePtr = 0;
 pub const Device = c_int;
 
 const Result = c_uint;

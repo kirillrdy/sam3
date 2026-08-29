@@ -2,10 +2,9 @@ const std = @import("std");
 const onnxruntime = @import("onnxruntime");
 const cuda_build = @import("cuda");
 
-/// Where the model runs. Every one but `cuda` is an ONNX Runtime execution
-/// provider; `cuda` swaps the executor itself for the in-tree graph runtime,
-/// which talks to the NVIDIA driver directly.
-const Device = enum { cpu, npu, gpu, webgpu, cuda };
+/// Where the model runs. `cuda`, `opencl`, and `metal` select the in-tree graph runtime;
+/// the other values are ONNX Runtime execution providers.
+const Device = enum { cpu, npu, gpu, opencl, metal, webgpu, cuda };
 
 const webgpu_version = "0.2.1";
 const webgpu_url = "https://files.pythonhosted.org/packages/f4/c4/f7de789c43f8a25468c0e5d4a69c28cfb3c29c84c2556c1e6e7dd4c4cee4/onnxruntime_ep_webgpu-0.2.1-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl";
@@ -65,12 +64,17 @@ pub fn build(b: *std.Build) void {
     const device = b.option(
         Device,
         "device",
-        "Which device to run the model on: cpu, Intel npu/gpu, cross-vendor webgpu, or nvidia cuda (default: cpu)",
+        "Which device to run the model on: cpu, Intel npu/gpu, native Intel opencl, Apple metal, cross-vendor webgpu, or nvidia cuda (default: cpu)",
     ) orelse .cpu;
 
-    // The CUDA build is the one that leaves ONNX Runtime behind entirely, so
-    // it decides which executor the `runtime` module below resolves to.
-    const native_runtime = device == .cuda;
+    const is_cuda = device == .cuda;
+    const is_opencl = device == .opencl;
+    const is_metal = device == .metal;
+    const native_runtime = is_cuda or is_opencl or is_metal;
+    if (is_metal and !target.result.os.tag.isDarwin()) {
+        std.log.err("the Metal backend requires an Apple target", .{});
+        std.process.exit(1);
+    }
 
     const with_cuda = b.option(
         bool,
@@ -83,6 +87,15 @@ pub fn build(b: *std.Build) void {
         "sm",
         "Compute capability the CUDA kernels are built for (default: " ++ cuda_build.default_arch ++ ")",
     ) orelse cuda_build.default_arch;
+
+    // What the in-tree runtime stores a float tensor as. Half is the default
+    // on OpenCL and Metal, where nearly every operator is bound by how many
+    // bytes it moves, and is the precision GPU execution providers use anyway.
+    const half = b.option(
+        bool,
+        "half",
+        "Store float tensors on the device as halves (default: true with -Ddevice=opencl or metal)",
+    ) orelse (is_opencl or is_metal);
 
     const untested_npu = b.option(
         bool,
@@ -147,14 +160,17 @@ pub fn build(b: *std.Build) void {
     });
 
     // Keep the model layer independent of the executor: it imports `runtime`
-    // and never learns which one it got. ONNX Runtime stays the default
-    // because it runs anywhere. The CUDA engine covers every operator both
-    // prompting paths reach, but only on an NVIDIA GPU.
+    // and never learns which one it got. ONNX Runtime is used for CPU/NPU;
+    // the native engine runs directly on the GPU (NVIDIA CUDA, Intel OpenCL,
+    // or Apple Metal).
     if (native_runtime) {
+        const BackendEnum = enum { cuda, opencl, metal };
         const engine = b.dependency("engine", .{
             .target = target,
             .optimize = optimize,
+            .backend = if (is_cuda) BackendEnum.cuda else if (is_opencl) BackendEnum.opencl else BackendEnum.metal,
             .sm = cuda_arch,
+            .half = half,
         });
         mod.addImport("runtime", engine.module("engine"));
     } else {
@@ -167,9 +183,74 @@ pub fn build(b: *std.Build) void {
         mod.addImport("runtime", ort_runtime);
     }
 
+    const text_trace = b.addExecutable(.{
+        .name = "text-trace",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/text-trace.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "sam3", .module = mod }},
+        }),
+    });
+    const run_text_trace = b.addRunArtifact(text_trace);
+    if (b.args) |args| run_text_trace.addArgs(args);
+    b.step("trace-text", "Write the text encoder output for diagnosis").dependOn(&run_text_trace.step);
+
+    const tensor_probe = b.addExecutable(.{
+        .name = "tensor-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/tensor-probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "sam3", .module = mod }},
+        }),
+    });
+    const run_tensor_probe = b.addRunArtifact(tensor_probe);
+    if (b.args) |args| run_tensor_probe.addArgs(args);
+    b.step("probe", "TEMP: dump named intermediate tensors").dependOn(&run_tensor_probe.step);
+
+    const concept_trace = b.addExecutable(.{
+        .name = "concept-vision-trace",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/concept-vision-trace.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "sam3", .module = mod }},
+        }),
+    });
+    const run_concept_trace = b.addRunArtifact(concept_trace);
+    if (b.args) |args| run_concept_trace.addArgs(args);
+    b.step("trace-concept", "Write the concept vision encoder outputs for diagnosis").dependOn(&run_concept_trace.step);
+
+    const decoder_trace = b.addExecutable(.{
+        .name = "concept-decoder-trace",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/concept-decoder-trace.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "sam3", .module = mod }},
+        }),
+    });
+    const run_decoder_trace = b.addRunArtifact(decoder_trace);
+    if (b.args) |args| run_decoder_trace.addArgs(args);
+    b.step("trace-decoder", "Run the concept decoder from captured inputs").dependOn(&run_decoder_trace.step);
+
+    const test_lookup = b.addExecutable(.{
+        .name = "test-lookup",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/test-lookup.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "sam3", .module = mod }},
+        }),
+    });
+    const run_test_lookup = b.addRunArtifact(test_lookup);
+    if (b.args) |args| run_test_lookup.addArgs(args);
+    b.step("test-lookup", "Run test lookup on cat.png").dependOn(&run_test_lookup.step);
+
     // The GPU preprocessing path is a swappable module, so nothing else in
     // sam3 needs to know whether this build can talk to a GPU at all.
-    if (with_cuda or native_runtime) {
+    if (with_cuda or is_cuda) {
         const cuda_dep = b.dependency("cuda", .{ .target = target, .optimize = optimize });
         const kernels = cuda_build.addPtxFor(b, cuda_dep, .{
             .root_source_file = b.path("src/gpu/kernels.zig"),
@@ -183,6 +264,15 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "cuda", .module = cuda_dep.module("cuda") }},
         });
         backend.addAnonymousImport("kernels.ptx", .{ .root_source_file = kernels });
+        mod.addImport("gpu", backend);
+    } else if (is_opencl) {
+        const opencl_dep = b.dependency("opencl", .{ .target = target, .optimize = optimize });
+        const backend = b.createModule(.{
+            .root_source_file = b.path("src/gpu/opencl.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "opencl", .module = opencl_dep.module("opencl") }},
+        });
         mod.addImport("gpu", backend);
     } else {
         mod.addImport("gpu", b.createModule(.{
@@ -207,7 +297,7 @@ pub fn build(b: *std.Build) void {
         const provider = b.addInstallArtifact(ort.?.artifact("onnxruntime_providers_openvino"), .{});
         b.getInstallStep().dependOn(&provider.step);
         b.getInstallStep().dependOn(&b.addInstallArtifact(
-            ort.artifact("onnxruntime_providers_openvino"),
+            ort.?.artifact("onnxruntime_providers_openvino"),
             .{ .dest_dir = .{ .override = .bin } },
         ).step);
         openvino_provider_path = b.getInstallPath(.lib, "libonnxruntime_providers_openvino.so");
@@ -440,10 +530,10 @@ pub fn build(b: *std.Build) void {
     server_options.addOption([]const u8, "provider_cache_path", provider_cache_path);
     server_options.addOption([]const u8, "example_path", example_path);
     // The application names devices the way an execution provider does, and
-    // the in-tree runtime enumerates exactly one of them: an NVIDIA GPU.
+    // the in-tree runtime enumerates exactly one GPU.
     server_options.addOption([]const u8, "device", if (native_runtime) "gpu" else @tagName(device));
     server_options.addOption(bool, "untested_npu", untested_npu);
-    server_options.addOption(bool, "cuda", with_cuda or native_runtime);
+    server_options.addOption(bool, "cuda", with_cuda or is_cuda or is_opencl);
     server_options.addOption([]const u8, "host", host);
     server_options.addOption(u16, "port", port);
 

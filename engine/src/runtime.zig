@@ -1,11 +1,13 @@
-//! Session boundary used by the SAM 3 application. Graph parsing and CUDA
+//! Session boundary used by the SAM 3 application. Graph parsing and GPU
 //! ownership live here so the application does not know which executor backs
 //! a model. The node executor is deliberately kept behind `Session.run`.
 
 const std = @import("std");
-const cuda = @import("cuda");
 const onnx = @import("onnx.zig");
-const cuda_device = @import("device.zig");
+const device_mod = @import("device.zig");
+const driver = device_mod.driver;
+/// What a float tensor is stored as on the device; see `device.Element`.
+const Element = device_mod.Element;
 
 pub const Error = error{
     NativeRuntime,
@@ -22,7 +24,7 @@ pub const Error = error{
 /// is compiled for the GPU and cannot be imported here, so these mirror the
 /// enums it declares and must be kept in step with them.
 const Binary = enum(u32) { add, sub, mul, div, pow, min, max, equal, less, greater };
-const Unary = enum(u32) { neg, erf, exp, sqrt, reciprocal, sigmoid, tanh, relu, abs, floor, sin, cos, log, sign, is_nan };
+const Unary = enum(u32) { neg, erf, exp, sqrt, reciprocal, sigmoid, tanh, relu, abs, floor, sin, cos, log, sign, is_nan, gelu };
 
 /// Comparisons run on the host, over the i64 tensors a graph does its shape
 /// arithmetic with, so they are their own list rather than `Binary` entries.
@@ -30,11 +32,63 @@ const Compare = enum { equal, greater, greater_equal, less, less_equal };
 
 /// Matches `kernels.max_rank`: the stride arrays a launch carries are fixed.
 const max_rank = 8;
+const metadata_words = 4 * max_rank;
+// The largest bundled graph has about 1,500 nodes. Keeping one slot per
+// metadata-producing launch avoids wrapping (and therefore synchronizing)
+// during a normal run while costing only 512 KiB of host memory.
+const metadata_slots = 4096;
 
 /// The block tile `kernels.matmul` is written around, mirrored here so the
 /// host can size the grid. A block of 16x16 threads covers this much of C.
 const matmul_tile_m = 128;
 const matmul_tile_n = 64;
+
+/// The same for `kernels.matmulXmx`, whose work group is 16 sub-groups of 16
+/// lanes. Kept in step with DP_TILE_M and DP_TILE_N there.
+const matmul_xmx_tile_m = 256;
+const matmul_xmx_tile_n = 128;
+const matmul_xmx_subgroups = 32;
+
+/// The same for `kernels.matmulTensor`, whose work group is four SIMD groups of
+/// 32 lanes. Kept in step with TN_TILE_M and TN_TILE_N there.
+const matmul_tensor_tile_m = 128;
+const matmul_tensor_tile_n = 64;
+const matmul_tensor_subgroups = 8;
+
+/// The same for `kernels.conv2dGemmTensor`, whose work group is eight SIMD
+/// groups of 32 lanes. Kept in step with TC_TILE_M and TC_TILE_N there.
+const conv_tensor_tile_m = 128;
+const conv_tensor_tile_n = 64;
+const conv_tensor_subgroups = 16;
+
+/// The same for `kernels.matmulSimd`, whose work group is eight SIMD groups of
+/// 32 lanes. Kept in step with SG_TILE_M and SG_TILE_N there.
+const matmul_simd_tile_m = 64;
+const matmul_simd_tile_n = 64;
+const matmul_simd_subgroups = 16;
+
+/// The same for `kernels.matmulXmxBlock`, whose work group is 16 sub-groups of
+/// 16 lanes. Kept in step with TD_TILE_M and TD_TILE_N there.
+const matmul_block_tile_m = 128;
+const matmul_block_tile_n = 128;
+const matmul_block_subgroups = 16;
+
+/// How much cache the work group swizzle plans a block around. Well under the
+/// 8 MiB this GPU has: C streams through it at the same time, nothing pins
+/// either operand there, and measured end to end anything from 1 to 12 MiB
+/// lands within the run to run spread, so the small end is the honest guess.
+const matmul_cache_budget = 2 << 20;
+
+/// The shape `kernels.attention` is written for, mirroring FA_HEAD, FA_KSTEP,
+/// FA_SUBGROUPS and FA_QTILE there.
+const attention_head = 64;
+const attention_key_step = 16;
+const attention_subgroups = 16;
+const attention_query_tile = 8 * attention_subgroups;
+
+/// How many elements one work item of a vector kernel carries, mirroring
+/// LANE_STEP in `kernels.cl`.
+const lane_step = 4;
 
 var error_buffer: [1024]u8 = undefined;
 var error_length: usize = 0;
@@ -46,47 +100,26 @@ fn setError(comptime format: []const u8, args: anytype) void {
 
 pub fn lastError() []const u8 {
     // Not every failure comes from a graph node: allocations, copies and the
-    // end-of-run synchronize fail with `error.Cuda` and only the driver has
+    // end-of-run synchronize fail with driver error and only the driver has
     // anything to say about them.
-    if (error_length == 0) return cuda.lastError();
+    if (error_length == 0) return driver.lastError();
     return error_buffer[0..error_length];
 }
 
 pub fn init(_: std.mem.Allocator, _: std.Io) !void {}
 
 pub fn version() []const u8 {
-    return "native CUDA";
+    return if (@hasDecl(driver, "is_opencl"))
+        "native OpenCL"
+    else if (@hasDecl(driver, "is_metal"))
+        "native Metal"
+    else
+        "native CUDA";
 }
 
 pub const DeviceKind = enum {
-    npu,
     gpu,
-    webgpu,
     cpu,
-
-    pub fn openvinoName(self: DeviceKind) [:0]const u8 {
-        return switch (self) {
-            .npu => "NPU",
-            .gpu => "GPU",
-            .webgpu => "WEBGPU",
-            .cpu => "CPU",
-        };
-    }
-};
-
-pub const Device = struct {
-    kind: DeviceKind,
-    id: u32,
-};
-
-pub const Accelerator = union(enum) {
-    device: Device,
-    coreml: DeviceKind,
-};
-
-pub const Option = struct {
-    key: [*:0]const u8,
-    value: [*:0]const u8,
 };
 
 /// Device memory a graph is done with, kept for the next node that wants the
@@ -99,9 +132,9 @@ pub const Option = struct {
 /// Buckets are exact sizes. A graph runs the same shapes over and over, so the
 /// pool converges on that working set instead of growing.
 const Pool = struct {
-    buckets: std.AutoHashMapUnmanaged(usize, std.ArrayListUnmanaged(cuda.DevicePtr)) = .empty,
+    buckets: std.AutoHashMapUnmanaged(usize, std.ArrayListUnmanaged(driver.DevicePtr)) = .empty,
 
-    fn take(self: *Pool, count: usize) !cuda.Buffer(f32) {
+    fn take(self: *Pool, count: usize) !driver.Buffer(Element) {
         if (self.buckets.getPtr(count)) |bucket| {
             if (bucket.items.len != 0) {
                 const ptr = bucket.items[bucket.items.len - 1];
@@ -109,12 +142,12 @@ const Pool = struct {
                 return .{ .ptr = ptr, .len = count };
             }
         }
-        return cuda.Buffer(f32).alloc(count);
+        return driver.Buffer(Element).alloc(count);
     }
 
     /// Returning a buffer must not fail, so a pool that cannot record it just
     /// gives it back to the driver.
-    fn give(self: *Pool, allocator: std.mem.Allocator, buffer: cuda.Buffer(f32)) void {
+    fn give(self: *Pool, allocator: std.mem.Allocator, buffer: driver.Buffer(Element)) void {
         if (buffer.len == 0) return;
         const entry = self.buckets.getOrPut(allocator, buffer.len) catch return buffer.free();
         if (!entry.found_existing) entry.value_ptr.* = .empty;
@@ -124,25 +157,125 @@ const Pool = struct {
     fn deinit(self: *Pool, allocator: std.mem.Allocator) void {
         var buckets = self.buckets.iterator();
         while (buckets.next()) |entry| {
-            for (entry.value_ptr.items) |ptr| (cuda.Buffer(f32){ .ptr = ptr, .len = entry.key_ptr.* }).free();
+            for (entry.value_ptr.items) |ptr| (driver.Buffer(Element){ .ptr = ptr, .len = entry.key_ptr.* }).free();
             entry.value_ptr.deinit(allocator);
         }
         self.buckets.deinit(allocator);
     }
 };
 
+/// Per-operator timing for one graph, switched on with SAM3_PROFILE=1. Each
+/// node is timed behind its own synchronize, so a profiled run is slower than
+/// a normal one but every number belongs to exactly one operator.
+const Profile = struct {
+    const Row = struct {
+        op: []const u8,
+        nanoseconds: u64 = 0,
+        calls: usize = 0,
+        slowest: u64 = 0,
+        slowest_node: usize = 0,
+    };
+
+    rows: std.StringHashMapUnmanaged(Row) = .empty,
+
+    var cached_enabled: ?bool = null;
+
+    fn enabled() bool {
+        if (cached_enabled == null) cached_enabled = std.c.getenv("SAM3_PROFILE") != null;
+        return cached_enabled.?;
+    }
+
+    fn record(self: *Profile, allocator: std.mem.Allocator, op: []const u8, node: usize, elapsed: u64) void {
+        const entry = self.rows.getOrPut(allocator, op) catch return;
+        if (!entry.found_existing) entry.value_ptr.* = .{ .op = op };
+        entry.value_ptr.nanoseconds += elapsed;
+        entry.value_ptr.calls += 1;
+        if (elapsed > entry.value_ptr.slowest) {
+            entry.value_ptr.slowest = elapsed;
+            entry.value_ptr.slowest_node = node;
+        }
+    }
+
+    fn milliseconds(nanoseconds: u64) f64 {
+        return @as(f64, @floatFromInt(nanoseconds)) / std.time.ns_per_ms;
+    }
+
+    fn report(self: *Profile, allocator: std.mem.Allocator) void {
+        var rows: std.ArrayList(Row) = .empty;
+        defer rows.deinit(allocator);
+        var total: u64 = 0;
+        var values = self.rows.valueIterator();
+        while (values.next()) |row| {
+            total += row.nanoseconds;
+            rows.append(allocator, row.*) catch return;
+        }
+        std.mem.sort(Row, rows.items, {}, struct {
+            fn lessThan(_: void, a: Row, b: Row) bool {
+                return a.nanoseconds > b.nanoseconds;
+            }
+        }.lessThan);
+
+        std.debug.print("\n  profile: {d:.1} ms on the GPU\n", .{milliseconds(total)});
+        std.debug.print("    {s:<22}{s:>10}{s:>8}{s:>8}{s:>12}{s:>8}\n", .{
+            "operator", "total ms", "share", "calls", "slowest ms", "node",
+        });
+        for (rows.items) |row| {
+            std.debug.print("    {s:<22}{d:>10.1}{d:>7.1}%{d:>8}{d:>12.2}{d:>8}\n", .{
+                row.op,
+                milliseconds(row.nanoseconds),
+                100 * @as(f64, @floatFromInt(row.nanoseconds)) / @as(f64, @floatFromInt(@max(total, 1))),
+                row.calls,
+                milliseconds(row.slowest),
+                row.slowest_node,
+            });
+        }
+        std.debug.print("\n", .{});
+    }
+
+    fn deinit(self: *Profile, allocator: std.mem.Allocator) void {
+        self.rows.deinit(allocator);
+    }
+};
+
 const State = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    gpu: cuda_device.Device,
+    gpu: device_mod.Device,
     /// Shapes and strides for the current launch. Bounded by the maximum rank,
     /// so one small allocation serves every node.
-    metadata: cuda.Buffer(u32),
+    metadata: driver.Buffer(u32),
+    /// Stable host storage for queued metadata writes. OpenCL and Metal require
+    /// the source of a non-blocking write to remain unchanged until it completes.
+    metadata_staging: []u32,
+    metadata_cursor: usize = 0,
     /// Index arrays for Gather and ScatterND. Unlike shapes these have no
     /// fixed bound, so the buffer grows to the largest a graph has asked for.
-    indices: cuda.Buffer(u32) = .{ .ptr = 0, .len = 0 },
+    indices: driver.Buffer(u32) = .{ .ptr = driver.null_ptr, .len = 0 },
     /// Intermediate tensors, recycled between nodes.
     pool: Pool = .{},
+
+    fn uploadMetadata(self: *State, values: []const u32) !void {
+        if (values.len > metadata_words) return Error.RankTooLarge;
+        if (self.metadata_cursor == metadata_slots) {
+            // Extremely large graphs can wrap the staging area safely. Normal
+            // SAM runs fit without this fallback synchronization.
+            try self.gpu.synchronize();
+            self.metadata_cursor = 0;
+        }
+        const start = self.metadata_cursor * metadata_words;
+        const staging = self.metadata_staging[start..][0..values.len];
+        @memcpy(staging, values);
+        if (@hasDecl(driver, "is_opencl") or @hasDecl(driver, "is_metal")) {
+            try self.metadata.uploadAsync(staging);
+        } else {
+            try self.metadata.upload(staging);
+        }
+        self.metadata_cursor += 1;
+    }
+
+    fn metadataComplete(self: *State) void {
+        self.metadata_cursor = 0;
+    }
 };
 
 pub const Env = struct {
@@ -151,15 +284,18 @@ pub const Env = struct {
     pub fn init(allocator: std.mem.Allocator, io: std.Io, _: [:0]const u8) !Env {
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
-        var gpu = try cuda_device.Device.init(0);
+        var gpu = try device_mod.Device.init(0);
         errdefer gpu.deinit();
-        const metadata = try cuda.Buffer(u32).alloc(128);
+        const metadata = try driver.Buffer(u32).alloc(metadata_words);
         errdefer metadata.free();
+        const metadata_staging = try allocator.alloc(u32, metadata_words * metadata_slots);
+        errdefer allocator.free(metadata_staging);
         state.* = .{
             .allocator = allocator,
             .io = io,
             .gpu = gpu,
             .metadata = metadata,
+            .metadata_staging = metadata_staging,
         };
         return .{ .state = state };
     }
@@ -169,6 +305,7 @@ pub const Env = struct {
         self.state.pool.deinit(allocator);
         self.state.indices.free();
         self.state.metadata.free();
+        allocator.free(self.state.metadata_staging);
         self.state.gpu.deinit();
         allocator.destroy(self.state);
     }
@@ -197,6 +334,22 @@ pub const Session = struct {
             .env = env.state,
             .graph = try onnx.Graph.open(env.state.allocator, env.state.io, model_path),
         };
+        errdefer {
+            var buffers = state.constants.valueIterator();
+            while (buffers.next()) |buffer| buffer.free();
+            state.constants.deinit(env.state.allocator);
+            var shuffled = state.shuffled.valueIterator();
+            while (shuffled.next()) |buffer| buffer.free();
+            state.shuffled.deinit(env.state.allocator);
+            state.graph.deinit();
+        }
+        try env.state.gpu.makeCurrent();
+        try state.preloadInitializers();
+        errdefer {
+            state.fused.deinit(env.state.allocator);
+            state.folded.deinit(env.state.allocator);
+        }
+        try state.findFusions();
         return .{ .state = state };
     }
 
@@ -205,6 +358,11 @@ pub const Session = struct {
         var buffers = self.state.constants.valueIterator();
         while (buffers.next()) |buffer| buffer.free();
         self.state.constants.deinit(allocator);
+        var shuffled = self.state.shuffled.valueIterator();
+        while (shuffled.next()) |buffer| buffer.free();
+        self.state.shuffled.deinit(allocator);
+        self.state.fused.deinit(allocator);
+        self.state.folded.deinit(allocator);
         self.state.graph.deinit();
         allocator.destroy(self.state);
     }
@@ -221,7 +379,7 @@ pub const Session = struct {
 };
 
 const Storage = struct {
-    buffer: cuda.Buffer(f32),
+    buffer: driver.Buffer(Element),
     references: usize = 1,
 };
 
@@ -231,7 +389,7 @@ const Tensor = struct {
     data: union(enum) {
         host: []const u8,
         gpu: *Storage,
-        constant_gpu: cuda.Buffer(f32),
+        constant_gpu: driver.Buffer(Element),
     },
 
     fn count(self: Tensor) !usize {
@@ -274,7 +432,7 @@ const Tensor = struct {
         };
     }
 
-    fn gpuBuffer(self: Tensor) !cuda.Buffer(f32) {
+    fn gpuBuffer(self: Tensor) !driver.Buffer(Element) {
         if (self.dtype != .f32) return Error.UnsupportedDataType;
         return switch (self.data) {
             .gpu => |storage| storage.buffer,
@@ -284,10 +442,70 @@ const Tensor = struct {
     }
 };
 
+/// A scaled dot product attention, recognized once when the graph is opened.
+/// The node it is recorded against is the second matrix product, the one whose
+/// output the rest of the graph reads; the other two are on `folded`, and the
+/// score matrix they passed between them is never allocated.
+/// Several operators the graph spells out that one kernel does whole,
+/// recognized once when the graph is opened. It is recorded against the last
+/// node of the group -- the one whose output the rest of the graph reads --
+/// and the others go on `folded`, so the tensors they passed between them are
+/// never allocated.
+const Fusion = struct {
+    kind: Kind,
+    /// What the surviving node reads in place of what the graph says.
+    operands: [3][]const u8,
+    arity: u8,
+    /// The two products a fused attention falls back to. The shapes are not
+    /// known until the graph runs, so one whose shapes turn out not to suit
+    /// the kernel runs these after all. Unused by the others.
+    product: usize = 0,
+    softmax: usize = 0,
+    /// What a fused attention multiplies its scores by, where the graph
+    /// scaled Q and K before the product and the kernel can do it after.
+    scale: f32 = 1,
+    /// The operators a fused rotary embedding stands for, in graph order, for
+    /// the same reason: shapes that turn out not to suit its kernel run them
+    /// after all. Unused by the others.
+    swallowed: [15]u32 = @splat(0),
+    swallowed_len: u8 = 0,
+
+    const Kind = enum {
+        attention,
+        gelu,
+        rotary,
+        biased_product,
+        biased_product_gelu,
+
+        /// What the profile calls it, since the graph has no such operator.
+        fn label(self: Kind) []const u8 {
+            return switch (self) {
+                .attention => "Attention",
+                .gelu => "Gelu",
+                .rotary => "Rotary",
+                .biased_product => "MatMulAdd",
+                .biased_product_gelu => "MatMulAddGelu",
+            };
+        }
+    };
+
+    fn inputs(self: *const Fusion) []const []const u8 {
+        return self.operands[0..self.arity];
+    }
+};
+
 const SessionState = struct {
     env: *State,
     graph: onnx.Graph,
-    constants: std.StringHashMapUnmanaged(cuda.Buffer(f32)) = .empty,
+    constants: std.StringHashMapUnmanaged(driver.Buffer(Element)) = .empty,
+    /// Transposed convolution weights, reordered once into the row per output
+    /// channel and tap that the matrix product wants.
+    shuffled: std.StringHashMapUnmanaged(driver.Buffer(Element)) = .empty,
+    initializers_preloaded: bool = false,
+    /// Node index of the surviving operator to what it stands for.
+    fused: std.AutoHashMapUnmanaged(usize, Fusion) = .empty,
+    /// Node indices the fusion swallowed, which `run` walks past.
+    folded: std.AutoHashMapUnmanaged(usize, void) = .empty,
 
     fn run(
         self: *SessionState,
@@ -301,6 +519,14 @@ const SessionState = struct {
         // previous run's message.
         error_length = 0;
         try self.env.gpu.makeCurrent();
+        errdefer {
+            self.env.gpu.synchronize() catch {};
+            self.env.metadataComplete();
+        }
+
+        // Session.open normally did this already. Keep the guard here so a
+        // future construction path cannot restore lazy, mid-graph uploads.
+        try self.preloadInitializers();
 
         var arena_state: std.heap.ArenaAllocator = .init(self.env.allocator);
         defer arena_state.deinit();
@@ -311,11 +537,16 @@ const SessionState = struct {
 
         var uses: std.StringHashMapUnmanaged(usize) = .empty;
         defer uses.deinit(arena);
-        for (self.graph.nodes) |node| for (node.inputs) |name| {
-            if (name.len == 0) continue;
-            const entry = try uses.getOrPut(arena, name);
-            entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
-        };
+        // A folded node reads nothing and produces nothing; the node that
+        // swallowed it reads what it read.
+        for (self.graph.nodes, 0..) |node, index| {
+            if (self.folded.contains(index)) continue;
+            for (self.effectiveInputs(index, node)) |name| {
+                if (name.len == 0) continue;
+                const entry = try uses.getOrPut(arena, name);
+                entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+            }
+        }
         for (output_names) |name_z| {
             const name = std.mem.span(name_z);
             const entry = try uses.getOrPut(arena, name);
@@ -326,7 +557,7 @@ const SessionState = struct {
             const tensor = try arena.create(Tensor);
             if (value.dtype == .f32) {
                 const storage = try self.newStorage(value.bytes.len / @sizeOf(f32));
-                try storage.buffer.upload(@alignCast(std.mem.bytesAsSlice(f32, value.bytes)));
+                try uploadFloats(arena, storage.buffer, @alignCast(std.mem.bytesAsSlice(f32, value.bytes)));
                 tensor.* = .{ .dtype = .f32, .dims = value.dims, .data = .{ .gpu = storage } };
             } else {
                 tensor.* = .{ .dtype = value.dtype, .dims = value.dims, .data = .{ .host = value.bytes } };
@@ -334,9 +565,18 @@ const SessionState = struct {
             try values.put(arena, std.mem.span(name_z), tensor);
         }
 
+        const profiling = Profile.enabled();
+        var profile: Profile = .{};
+        defer if (profiling) {
+            profile.report(self.env.allocator);
+            profile.deinit(self.env.allocator);
+        };
+
         for (self.graph.nodes, 0..) |node, node_index| {
-            self.execute(arena, &values, node) catch |err| {
-                const detail = if (err == error.Cuda) cuda.lastError() else "";
+            if (self.folded.contains(node_index)) continue;
+            const started = if (profiling) std.Io.Timestamp.now(self.env.io, .awake) else undefined;
+            self.execute(arena, &values, node, node_index) catch |err| {
+                const detail = if (err == error.Cuda or err == error.OpenCL or err == error.Metal) driver.lastError() else "";
                 setError("node {d} {s} ({s}): {t}{s}{s}", .{
                     node_index,
                     node.op_type,
@@ -347,7 +587,17 @@ const SessionState = struct {
                 });
                 return err;
             };
-            for (node.inputs) |name| {
+            if (profiling) {
+                try self.env.gpu.synchronize();
+                const now = std.Io.Timestamp.now(self.env.io, .awake);
+                profile.record(
+                    self.env.allocator,
+                    if (self.fused.get(node_index)) |plan| plan.kind.label() else node.op_type,
+                    node_index,
+                    @intCast(now.nanoseconds - started.nanoseconds),
+                );
+            }
+            for (self.effectiveInputs(node_index, node)) |name| {
                 if (name.len == 0) continue;
                 const remaining = uses.getPtr(name) orelse continue;
                 remaining.* -= 1;
@@ -356,6 +606,7 @@ const SessionState = struct {
         }
 
         try self.env.gpu.synchronize();
+        self.env.metadataComplete();
         for (output_names, outputs) |name_z, *output| {
             const name = std.mem.span(name_z);
             const tensor = values.get(name) orelse return Error.MissingValue;
@@ -367,12 +618,438 @@ const SessionState = struct {
         }
     }
 
+    /// Finds every `MatMul -> Softmax -> MatMul` an attention is spelled as,
+    /// and records it against the second product. The scale these exports
+    /// apply is already folded into Q and K by the time the first product sees
+    /// them, so the three nodes are the whole of it.
+    ///
+    /// The shapes are not known until the graph runs, so this only decides
+    /// which nodes could fuse; `attention` checks the shapes it was handed and
+    /// falls back to the three operators if they are not what the kernel is
+    /// written for.
+    fn findFusions(self: *SessionState) !void {
+        const allocator = self.env.allocator;
+
+        var producer: std.StringHashMapUnmanaged(usize) = .empty;
+        defer producer.deinit(allocator);
+        var uses: std.StringHashMapUnmanaged(usize) = .empty;
+        defer uses.deinit(allocator);
+        for (self.graph.nodes, 0..) |node, index| {
+            for (node.outputs) |name| if (name.len != 0) try producer.put(allocator, name, index);
+            for (node.inputs) |name| {
+                if (name.len == 0) continue;
+                const entry = try uses.getOrPut(allocator, name);
+                entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+            }
+        }
+        // A graph output read by nobody else still has to be produced.
+        for (self.graph.outputs) |output| {
+            const entry = try uses.getOrPut(allocator, output.name);
+            entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+        }
+
+        for (self.graph.nodes, 0..) |node, index| {
+            if (!std.mem.eql(u8, node.op_type, "MatMul") or node.inputs.len != 2) continue;
+            const scores = node.inputs[0];
+            const softmax_at = producer.get(scores) orelse continue;
+            const middle = self.graph.nodes[softmax_at];
+            if (!std.mem.eql(u8, middle.op_type, "Softmax")) continue;
+            if (middle.int("axis", -1) != -1) continue;
+            if ((uses.get(scores) orelse 0) != 1) continue;
+
+            const paired = middle.inputs[0];
+            const product_at = producer.get(paired) orelse continue;
+            const first = self.graph.nodes[product_at];
+            if (!std.mem.eql(u8, first.op_type, "MatMul") or first.inputs.len != 2) continue;
+            if ((uses.get(paired) orelse 0) != 1) continue;
+
+            try self.fused.put(allocator, index, .{
+                .kind = .attention,
+                .operands = .{ first.inputs[0], first.inputs[1], node.inputs[1] },
+                .arity = 3,
+                .product = product_at,
+                .softmax = softmax_at,
+            });
+            try self.folded.put(allocator, product_at, {});
+            try self.folded.put(allocator, softmax_at, {});
+        }
+
+        // A product the graph follows with a bias, which the product can add on
+        // the way out instead of a second pass reading and writing all of it.
+        for (self.graph.nodes, 0..) |node, index| {
+            if (!std.mem.eql(u8, node.op_type, "Add") or node.inputs.len != 2) continue;
+            for (0..2) |side| {
+                const bias = node.inputs[side];
+                const sum = node.inputs[1 - side];
+                if ((uses.get(sum) orelse 0) != 1) continue;
+                const tensor = self.graph.constant(bias) orelse continue;
+                if (tensor.dtype != .f32 or tensor.dims.len != 1) continue;
+                const at = producer.get(sum) orelse continue;
+                if (self.folded.contains(at) or self.fused.contains(at)) continue;
+                const dot = self.graph.nodes[at];
+                if (!std.mem.eql(u8, dot.op_type, "MatMul") or dot.inputs.len != 2) continue;
+                // The bias runs along the columns the product writes.
+                const weights = self.graph.constant(dot.inputs[1]) orelse continue;
+                if (weights.dims.len == 0 or weights.dims[weights.dims.len - 1] != tensor.dims[0]) continue;
+
+                try self.fused.put(allocator, index, .{
+                    .kind = .biased_product,
+                    .operands = .{ dot.inputs[0], dot.inputs[1], bias },
+                    .arity = 3,
+                });
+                try self.folded.put(allocator, at, {});
+                break;
+            }
+        }
+
+        for (self.graph.nodes, 0..) |_, index| {
+            var swallowed: [4]usize = undefined;
+            const source = self.geluAt(index, producer, uses, &swallowed) orelse continue;
+            try self.fused.put(allocator, index, .{
+                .kind = .gelu,
+                .operands = .{ source, "", "" },
+                .arity = 1,
+            });
+            for (swallowed) |at| try self.folded.put(allocator, at, {});
+        }
+
+        // These exports split the attention scale between Q and K, a pass over
+        // each of them for one multiplication the scores can carry instead.
+        var scaled = self.fused.iterator();
+        while (scaled.next()) |entry| {
+            const plan = entry.value_ptr;
+            if (plan.kind != .attention) continue;
+            for (plan.operands[0..2], 0..) |name, side| {
+                if ((uses.get(name) orelse 0) != 1) continue;
+                const at = producer.get(name) orelse continue;
+                if (self.folded.contains(at) or self.fused.contains(at)) continue;
+                const scale = self.scalarOperand(self.graph.nodes[at], "Mul") orelse continue;
+                plan.operands[side] = scale.tensor;
+                plan.scale *= scale.value;
+                plan.swallowed[plan.swallowed_len] = @intCast(at);
+                plan.swallowed_len += 1;
+                try self.folded.put(allocator, at, {});
+            }
+        }
+
+        // The rotary embedding, where there is a kernel for it. A CUDA build
+        // has none, and a pattern recorded there would have nothing to run.
+        if (self.env.gpu.rope != null) {
+            for (self.graph.nodes, 0..) |_, index| {
+                const plan = self.rotaryAt(index, producer, uses) orelse continue;
+                try self.fused.put(allocator, index, plan);
+                for (plan.swallowed[0..plan.swallowed_len]) |at| try self.folded.put(allocator, at, {});
+            }
+        }
+
+        // A product whose bias is followed by nothing but the activation can
+        // do that on the way out as well, which is a whole tensor neither
+        // written nor read again -- 49 MB a layer in the encoder MLP.
+        for (self.graph.nodes, 0..) |_, index| {
+            const activation = self.fused.getPtr(index) orelse continue;
+            if (activation.kind != .gelu) continue;
+            const source = activation.operands[0];
+            const at = producer.get(source) orelse continue;
+            const shifted = self.fused.get(at) orelse continue;
+            if (shifted.kind != .biased_product) continue;
+            // The activation reads it twice and is the only thing that does,
+            // which `geluAt` has already established.
+            activation.* = .{
+                .kind = .biased_product_gelu,
+                .operands = shifted.operands,
+                .arity = shifted.arity,
+            };
+            _ = self.fused.remove(at);
+            try self.folded.put(allocator, at, {});
+        }
+    }
+
+    const Producers = std.StringHashMapUnmanaged(usize);
+    const Uses = std.StringHashMapUnmanaged(usize);
+
+    /// The one value a scalar constant holds, if `name` names one.
+    fn scalarConstant(self: *SessionState, name: []const u8) ?f32 {
+        const tensor = self.graph.constant(name) orelse return null;
+        if (tensor.dtype != .f32 or tensor.elementCount() != 1) return null;
+        return tensor.f32s()[0];
+    }
+
+    /// A commutative binary node against a scalar constant: which input is the
+    /// tensor, and what the constant is.
+    fn scalarOperand(self: *SessionState, node: onnx.Node, op: []const u8) ?struct { tensor: []const u8, value: f32 } {
+        if (!std.mem.eql(u8, node.op_type, op) or node.inputs.len != 2) return null;
+        for (0..2) |side| {
+            if (self.scalarConstant(node.inputs[side])) |value| {
+                return .{ .tensor = node.inputs[1 - side], .value = value };
+            }
+        }
+        return null;
+    }
+
+    /// Whether node `index` is the last of the five operators these exports
+    /// spell GELU as -- `0.5 * t * (1 + erf(t / sqrt 2))` -- and if so, what
+    /// `t` is. The shape is a diamond rather than a chain: `t` feeds both the
+    /// division and the multiplication that closes it, so every intermediate
+    /// has to be read once and `t` itself exactly twice, or something outside
+    /// wants a value the fused kernel would not leave behind.
+    fn geluAt(
+        self: *SessionState,
+        index: usize,
+        producer: Producers,
+        uses: Uses,
+        swallowed: *[4]usize,
+    ) ?[]const u8 {
+        const half = self.scalarOperand(self.graph.nodes[index], "Mul") orelse return null;
+        if (@abs(half.value - 0.5) > 1e-6) return null;
+        if ((uses.get(half.tensor) orelse 0) != 1) return null;
+
+        const product_at = producer.get(half.tensor) orelse return null;
+        const closing = self.graph.nodes[product_at];
+        if (!std.mem.eql(u8, closing.op_type, "Mul") or closing.inputs.len != 2) return null;
+
+        for (0..2) |side| {
+            const shifted = closing.inputs[side];
+            const source = closing.inputs[1 - side];
+            if ((uses.get(shifted) orelse 0) != 1) continue;
+            if ((uses.get(source) orelse 0) != 2) continue;
+
+            const shift_at = producer.get(shifted) orelse continue;
+            const one = self.scalarOperand(self.graph.nodes[shift_at], "Add") orelse continue;
+            if (@abs(one.value - 1.0) > 1e-6) continue;
+            if ((uses.get(one.tensor) orelse 0) != 1) continue;
+
+            const erf_at = producer.get(one.tensor) orelse continue;
+            const erf = self.graph.nodes[erf_at];
+            if (!std.mem.eql(u8, erf.op_type, "Erf") or erf.inputs.len != 1) continue;
+            if ((uses.get(erf.inputs[0]) orelse 0) != 1) continue;
+
+            const scale_at = producer.get(erf.inputs[0]) orelse continue;
+            const scale = self.graph.nodes[scale_at];
+            if (!std.mem.eql(u8, scale.op_type, "Div") or scale.inputs.len != 2) continue;
+            if (!std.mem.eql(u8, scale.inputs[0], source)) continue;
+            const root = self.scalarConstant(scale.inputs[1]) orelse continue;
+            if (@abs(root - std.math.sqrt2) > 1e-5) continue;
+
+            swallowed.* = .{ product_at, shift_at, erf_at, scale_at };
+            return source;
+        }
+        return null;
+    }
+
+    /// The eleven operators a rotary embedding is spelled as, if `index` is
+    /// the Add that ends one:
+    ///
+    ///     Add(Mul(x, cos),
+    ///         Mul(Reshape(Concat(Unsqueeze(Neg(Squeeze(Split(Reshape(x))[1]))),
+    ///                            Unsqueeze(Squeeze(Split(Reshape(x))[0])))),
+    ///             sin))
+    ///
+    /// The reshapes and the split turn the last axis into pairs, and the
+    /// concatenation puts each pair back with the two swapped and the first
+    /// negated. Every intermediate has to be read by exactly one node, or
+    /// folding it away would take a value something else still wants; `x`
+    /// itself is read twice and stays.
+    fn rotaryAt(self: *SessionState, index: usize, producer: Producers, uses: Uses) ?Fusion {
+        if (self.fused.contains(index) or self.folded.contains(index)) return null;
+        const node = self.graph.nodes[index];
+        if (!std.mem.eql(u8, node.op_type, "Add") or node.inputs.len != 2) return null;
+
+        for (0..2) |side| {
+            const straight_at = self.onlyProducer(node.inputs[side], "Mul", producer, uses) orelse continue;
+            const turned_at = self.onlyProducer(node.inputs[1 - side], "Mul", producer, uses) orelse continue;
+            const straight = self.tableProduct(straight_at) orelse continue;
+            const turned = self.tableProduct(turned_at) orelse continue;
+            const back_at = self.onlyProducer(turned.value, "Reshape", producer, uses) orelse continue;
+            // The reshape that ends the turn is the only thing that reads the
+            // concatenation's value. The graph also asks it for its shape, to
+            // build that very reshape's target -- arithmetic that has nothing
+            // left to answer once the group is gone, so `deadShapeChain`
+            // collects it rather than leaving it behind reading a tensor that
+            // is no longer written.
+            const seam = self.graph.nodes[back_at].inputs[0];
+            const join_at = producer.get(seam) orelse continue;
+            const join = self.graph.nodes[join_at];
+            if (!std.mem.eql(u8, join.op_type, "Concat")) continue;
+            if (join.inputs.len != 2 or join.int("axis", 0) != -1) continue;
+            var asked: [4]u32 = undefined;
+            const asked_len: u8 = switch (uses.get(seam) orelse 0) {
+                1 => 0,
+                2 => self.deadShapeChain(seam, back_at, uses, &asked) orelse continue,
+                else => continue,
+            };
+
+            const lift_negated_at = self.onlyProducer(join.inputs[0], "Unsqueeze", producer, uses) orelse continue;
+            const lift_at = self.onlyProducer(join.inputs[1], "Unsqueeze", producer, uses) orelse continue;
+            if (!self.lastAxis(self.graph.nodes[lift_negated_at]) or !self.lastAxis(self.graph.nodes[lift_at])) continue;
+
+            const negate_at = self.onlyProducer(self.graph.nodes[lift_negated_at].inputs[0], "Neg", producer, uses) orelse continue;
+            const second_at = self.onlyProducer(self.graph.nodes[negate_at].inputs[0], "Squeeze", producer, uses) orelse continue;
+            const first_at = self.onlyProducer(self.graph.nodes[lift_at].inputs[0], "Squeeze", producer, uses) orelse continue;
+            if (!self.lastAxis(self.graph.nodes[second_at]) or !self.lastAxis(self.graph.nodes[first_at])) continue;
+
+            const second = self.graph.nodes[second_at].inputs[0];
+            const first = self.graph.nodes[first_at].inputs[0];
+            const split_at = producer.get(first) orelse continue;
+            if (split_at != (producer.get(second) orelse continue)) continue;
+            const halves = self.graph.nodes[split_at];
+            if (!std.mem.eql(u8, halves.op_type, "Split") or halves.outputs.len != 2) continue;
+            if (halves.int("axis", 0) != -1) continue;
+            // The two halves in the order the turn wants them: the second of
+            // each pair negated in front of the first.
+            if (!std.mem.eql(u8, halves.outputs[0], first) or !std.mem.eql(u8, halves.outputs[1], second)) continue;
+
+            const pairs_at = self.onlyProducer(halves.inputs[0], "Reshape", producer, uses) orelse continue;
+            if (!std.mem.eql(u8, self.graph.nodes[pairs_at].inputs[0], straight.value)) continue;
+
+            var swallowed: [15]u32 = @splat(0);
+            const core = [_]u32{
+                @intCast(straight_at), @intCast(turned_at),       @intCast(back_at),
+                @intCast(join_at),     @intCast(lift_negated_at), @intCast(lift_at),
+                @intCast(negate_at),   @intCast(second_at),       @intCast(first_at),
+                @intCast(split_at),    @intCast(pairs_at),
+            };
+            @memcpy(swallowed[0..core.len], &core);
+            @memcpy(swallowed[core.len..][0..asked_len], asked[0..asked_len]);
+            const length: u8 = @intCast(core.len + asked_len);
+            for (swallowed[0..length]) |at| {
+                if (self.fused.contains(at) or self.folded.contains(at)) return null;
+            }
+            // In graph order, so the fallback can run them as the graph would.
+            std.mem.sort(u32, swallowed[0..length], {}, std.sort.asc(u32));
+
+            return .{
+                .kind = .rotary,
+                .operands = .{ straight.value, straight.table, turned.table },
+                .arity = 3,
+                .swallowed = swallowed,
+                .swallowed_len = length,
+            };
+        }
+        return null;
+    }
+
+    /// The `Shape -> ... -> Reshape` an export builds a reshape's target with,
+    /// walked from the reader of `name` that is not `sink` to `sink` itself.
+    /// Every step has to produce one value that only the next step reads, so
+    /// that folding the group away leaves none of it behind. Returns how many
+    /// nodes it wrote into `steps`.
+    fn deadShapeChain(
+        self: *SessionState,
+        name: []const u8,
+        sink: usize,
+        uses: Uses,
+        steps: *[4]u32,
+    ) ?u8 {
+        var at = self.readerBesides(name, sink) orelse return null;
+        var count: u8 = 0;
+        while (count < steps.len) {
+            const node = self.graph.nodes[at];
+            const shaping = std.mem.eql(u8, node.op_type, "Shape") or
+                std.mem.eql(u8, node.op_type, "Slice") or
+                std.mem.eql(u8, node.op_type, "Concat") or
+                std.mem.eql(u8, node.op_type, "Gather") or
+                std.mem.eql(u8, node.op_type, "Unsqueeze");
+            if (!shaping or node.outputs.len != 1 or node.outputs[0].len == 0) return null;
+            if ((uses.get(node.outputs[0]) orelse 0) != 1) return null;
+            steps[count] = @intCast(at);
+            count += 1;
+            const next = self.readerBesides(node.outputs[0], at) orelse return null;
+            if (next == sink) return count;
+            at = next;
+        }
+        return null;
+    }
+
+    /// The one node that reads `name` other than `besides`, if there is
+    /// exactly one. Walking the graph for it is affordable because only a
+    /// fusion asks, and only once, when the graph is opened.
+    fn readerBesides(self: *SessionState, name: []const u8, besides: usize) ?usize {
+        var found: ?usize = null;
+        for (self.graph.nodes, 0..) |node, index| {
+            if (index == besides) continue;
+            for (node.inputs) |reads| {
+                if (!std.mem.eql(u8, reads, name)) continue;
+                if (found != null) return null;
+                found = index;
+                break;
+            }
+        }
+        return found;
+    }
+    /// The node that produced `name`, if it is one of `op` and nothing else
+    /// reads what it produced.
+    fn onlyProducer(
+        self: *SessionState,
+        name: []const u8,
+        op: []const u8,
+        producer: Producers,
+        uses: Uses,
+    ) ?usize {
+        if ((uses.get(name) orelse 0) != 1) return null;
+        const at = producer.get(name) orelse return null;
+        if (!std.mem.eql(u8, self.graph.nodes[at].op_type, op)) return null;
+        return at;
+    }
+
+    /// A product of one tensor by one constant table, which is what both
+    /// halves of a rotary embedding are.
+    fn tableProduct(self: *SessionState, at: usize) ?struct { value: []const u8, table: []const u8 } {
+        const node = self.graph.nodes[at];
+        if (node.inputs.len != 2) return null;
+        for (0..2) |side| {
+            if (self.graph.constant(node.inputs[1 - side]) != null) continue;
+            const table = self.graph.constant(node.inputs[side]) orelse continue;
+            if (table.dtype != .f32) continue;
+            return .{ .value = node.inputs[1 - side], .table = node.inputs[side] };
+        }
+        return null;
+    }
+
+    /// Whether a Squeeze or an Unsqueeze names the last axis, which is the
+    /// only one a rotary embedding touches.
+    fn lastAxis(self: *SessionState, node: onnx.Node) bool {
+        if (node.inputs.len < 2) return false;
+        const axes = self.graph.constant(node.inputs[1]) orelse return false;
+        if (axes.dtype != .i64 or axes.elementCount() != 1) return false;
+        return axes.i64s()[0] == -1;
+    }
+
+    /// What a fused node reads, which is not what the graph says it reads.
+    fn effectiveInputs(self: *SessionState, index: usize, node: onnx.Node) []const []const u8 {
+        const plan = self.fused.getPtr(index) orelse return node.inputs;
+        return plan.inputs();
+    }
+
+    fn preloadInitializers(self: *SessionState) !void {
+        if (self.initializers_preloaded) return;
+        for (self.graph.initializers) |source| {
+            if (source.dtype != .f32 or source.name.len == 0) continue;
+            const entry = try self.constants.getOrPut(self.env.allocator, source.name);
+            if (entry.found_existing) continue;
+            entry.value_ptr.* = try driver.Buffer(Element).alloc(source.elementCount());
+            errdefer {
+                entry.value_ptr.free();
+                _ = self.constants.remove(source.name);
+            }
+            try uploadFloats(self.env.allocator, entry.value_ptr.*, source.f32s());
+        }
+        self.initializers_preloaded = true;
+    }
+
     fn execute(
         self: *SessionState,
         arena: std.mem.Allocator,
         values: *std.StringHashMapUnmanaged(*Tensor),
         node: onnx.Node,
+        index: usize,
     ) !void {
+        if (self.fused.get(index)) |plan| return switch (plan.kind) {
+            .attention => self.attention(arena, values, node, plan),
+            .gelu => self.unaryOf(arena, values, try self.input(arena, values, plan.operands[0]), node.outputs[0], .gelu),
+            .rotary => self.rotary(arena, values, node, plan),
+            .biased_product => self.matmulOf(arena, values, plan.operands[0], plan.operands[1], plan.operands[2], .none, node.outputs[0]),
+            .biased_product_gelu => self.matmulOf(arena, values, plan.operands[0], plan.operands[1], plan.operands[2], .gelu, node.outputs[0]),
+        };
         if (std.mem.eql(u8, node.op_type, "Conv")) return self.conv(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "ConvTranspose")) return self.convTranspose(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "Split")) return self.split(arena, values, node);
@@ -468,9 +1145,9 @@ const SessionState = struct {
         if (source.dtype == .f32) {
             const entry = try self.constants.getOrPut(self.env.allocator, name);
             if (!entry.found_existing) {
-                entry.value_ptr.* = try cuda.Buffer(f32).alloc(source.elementCount());
+                entry.value_ptr.* = try driver.Buffer(Element).alloc(source.elementCount());
                 errdefer _ = self.constants.remove(name);
-                try entry.value_ptr.upload(source.f32s());
+                try uploadFloats(self.env.allocator, entry.value_ptr.*, source.f32s());
             }
             tensor.* = .{ .dtype = .f32, .dims = source.dims, .data = .{ .constant_gpu = entry.value_ptr.* } };
         } else {
@@ -480,14 +1157,42 @@ const SessionState = struct {
         return tensor;
     }
 
+    /// A transposed convolution's weight in the order the matrix product wants
+    /// it: a row per output channel and tap, by input channel, where the graph
+    /// stores it input channel first. Reordered on the host once and kept for
+    /// the life of the session, like any other constant.
+    fn shuffledWeight(self: *SessionState, name: []const u8) !driver.Buffer(Element) {
+        if (self.shuffled.get(name)) |buffer| return buffer;
+        const source = self.graph.constant(name) orelse return Error.MissingValue;
+        if (source.dtype != .f32 or source.dims.len != 4) return Error.UnsupportedDataType;
+        const in_channels: usize = @intCast(source.dims[0]);
+        const rows: usize = @intCast(source.dims[1] * source.dims[2] * source.dims[3]);
+        const values = source.f32s();
+        if (values.len != in_channels * rows) return Error.InvalidShape;
+
+        const reordered = try self.env.allocator.alloc(Element, values.len);
+        defer self.env.allocator.free(reordered);
+        for (0..in_channels) |channel| {
+            const from = values[channel * rows ..][0..rows];
+            for (from, 0..) |value, row| reordered[row * in_channels + channel] = @floatCast(value);
+        }
+
+        const buffer = try driver.Buffer(Element).alloc(values.len);
+        errdefer buffer.free();
+        try buffer.upload(reordered);
+        try self.shuffled.put(self.env.allocator, name, buffer);
+        return buffer;
+    }
+
     /// A quantized weight matrix is not float data and never becomes a tensor,
     /// so it goes to the device as raw bytes, once, and is addressed directly.
-    fn constantBytes(self: *SessionState, name: []const u8) !cuda.DevicePtr {
+    fn constantBytes(self: *SessionState, name: []const u8) !driver.DevicePtr {
         if (self.constants.get(name)) |buffer| return buffer.ptr;
         const source = self.graph.constant(name) orelse return Error.MissingValue;
-        const buffer = try cuda.Buffer(f32).alloc((source.data.len + 3) / 4);
+        const stride = @sizeOf(Element);
+        const buffer = try driver.Buffer(Element).alloc((source.data.len + stride - 1) / stride);
         errdefer buffer.free();
-        const bytes: cuda.Buffer(u8) = .{ .ptr = buffer.ptr, .len = buffer.len * 4 };
+        const bytes: driver.Buffer(u8) = .{ .ptr = buffer.ptr, .len = buffer.len * stride };
         try bytes.upload(source.data);
         try self.constants.put(self.env.allocator, name, buffer);
         return buffer.ptr;
@@ -576,15 +1281,40 @@ const SessionState = struct {
                 @intCast(ph0),            @intCast(pw0),       @intCast(dh),
                 @intCast(dw),
             };
-            try self.env.metadata.upload(&meta);
+            try self.env.uploadMetadata(&meta);
             const rows = weight.dims[0];
             const pixels = out_h * out_w;
             const depth = weight.dims[1] * weight.dims[2] * weight.dims[3];
-            try self.env.gpu.conv2d_gemm.launch(.{
-                .x = @intCast(@divFloor(pixels + matmul_tile_n - 1, matmul_tile_n)),
-                .y = @intCast(@divFloor(rows + matmul_tile_m - 1, matmul_tile_m)),
+            const engines: enum { tensor, xmx, staged } = if (self.env.gpu.conv2d_gemm_tensor != null)
+                .tensor
+            else if (self.env.gpu.conv2d_gemm_xmx != null)
+                .xmx
+            else
+                .staged;
+            const kernel = switch (engines) {
+                .tensor => self.env.gpu.conv2d_gemm_tensor.?,
+                .xmx => self.env.gpu.conv2d_gemm_xmx.?,
+                .staged => self.env.gpu.conv2d_gemm,
+            };
+            const tile_m: i64 = switch (engines) {
+                .tensor => conv_tensor_tile_m,
+                .xmx => matmul_xmx_tile_m,
+                .staged => matmul_tile_m,
+            };
+            const tile_n: i64 = switch (engines) {
+                .tensor => conv_tensor_tile_n,
+                .xmx => matmul_xmx_tile_n,
+                .staged => matmul_tile_n,
+            };
+            try kernel.launch(.{
+                .x = @intCast(@divFloor(pixels + tile_n - 1, tile_n)),
+                .y = @intCast(@divFloor(rows + tile_m - 1, tile_m)),
                 .z = @intCast(x.dims[0]),
-            }, .{ .x = 16, .y = 16 }, .{
+            }, .{ .x = 16, .y = switch (engines) {
+                .tensor => conv_tensor_subgroups,
+                .xmx => matmul_xmx_subgroups,
+                .staged => 16,
+            } }, .{
                 xb.ptr,
                 wb.ptr,
                 bias_buffer.ptr,
@@ -604,7 +1334,7 @@ const SessionState = struct {
             @intCast(sh),        @intCast(sw),        @intCast(ph0),            @intCast(pw0),
             @intCast(dh),        @intCast(dw),        @intCast(groups),
         };
-        try self.env.metadata.upload(&meta);
+        try self.env.uploadMetadata(&meta);
         const block: u32 = 256;
         try self.env.gpu.conv2d.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{
             xb.ptr,                    wb.ptr,   bias_buffer.ptr, storage.buffer.ptr, self.env.metadata.ptr,
@@ -637,11 +1367,80 @@ const SessionState = struct {
             @intCast(weight.dims[2]), @intCast(weight.dims[3]), @intCast(sh),
             @intCast(sw),             @intCast(ph0),            @intCast(pw0),
         };
-        try self.env.metadata.upload(&meta);
+        try self.env.uploadMetadata(&meta);
         const xb = try x.gpuBuffer();
         const wb = try weight.gpuBuffer();
         const bias = if (node.inputs.len > 2 and node.inputs[2].len != 0) try self.input(arena, values, node.inputs[2]) else null;
         const bias_buffer = if (bias) |b| try b.gpuBuffer() else xb;
+        if (sh == weight.dims[2] and sw == weight.dims[3] and
+            ph0 == 0 and pw0 == 0 and ph1 == 0 and pw1 == 0)
+        {
+            const pixels = x.dims[2] * x.dims[3];
+            const features = weight.dims[1] * weight.dims[2] * weight.dims[3];
+
+            // A non-overlapping transposed convolution is a matrix product
+            // followed by a pixel shuffle. Where the weight can be reordered
+            // into the product's terms, that product is the fast one -- on the
+            // matrix engines, reading whole rows -- and the shuffle is one
+            // pass; `convTranspose2dGemm` below gathers both operands as it
+            // stages them instead, and cannot use either.
+            if (self.env.gpu.pixel_shuffle) |shuffle| taken: {
+                if (self.graph.constant(node.inputs[1]) == null) break :taken;
+                const reordered = self.shuffledWeight(node.inputs[1]) catch break :taken;
+                const staged = try self.newStorage(@intCast(x.dims[0] * features * pixels));
+                defer self.releaseStorage(staged);
+                try self.product(.{
+                    .a = reordered.ptr,
+                    .b = xb.ptr,
+                    .c = staged.buffer.ptr,
+                    .m = @intCast(features),
+                    .n = @intCast(pixels),
+                    .k = @intCast(x.dims[1]),
+                    .b_batch = @intCast(x.dims[1] * pixels),
+                    .c_batch = @intCast(features * pixels),
+                    .batches = @intCast(x.dims[0]),
+                });
+                const block: u32 = 256;
+                try shuffle.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{
+                    staged.buffer.ptr,
+                    bias_buffer.ptr,
+                    storage.buffer.ptr,
+                    @as(u32, @intCast(weight.dims[1])),
+                    @as(u32, @intCast(x.dims[2])),
+                    @as(u32, @intCast(x.dims[3])),
+                    @as(u32, @intCast(weight.dims[2])),
+                    @as(u32, @intCast(weight.dims[3])),
+                    @as(u32, @intCast(count)),
+                    @as(u32, if (bias != null) 1 else 0),
+                });
+                return self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
+            }
+
+            // Computing a whole output tile per workgroup avoids repeating the
+            // channel reduction for every scalar output in the generic kernel.
+            try self.env.gpu.conv_transpose2d_gemm.launch(.{
+                .x = @intCast(@divFloor(features + matmul_tile_n - 1, matmul_tile_n)),
+                .y = @intCast(@divFloor(pixels + matmul_tile_m - 1, matmul_tile_m)),
+                .z = @intCast(x.dims[0]),
+            }, .{ .x = 16, .y = 16 }, .{
+                xb.ptr,
+                wb.ptr,
+                bias_buffer.ptr,
+                storage.buffer.ptr,
+                @as(u32, @intCast(x.dims[2])),
+                @as(u32, @intCast(x.dims[3])),
+                @as(u32, @intCast(weight.dims[1])),
+                @as(u32, @intCast(out_h)),
+                @as(u32, @intCast(out_w)),
+                @as(u32, @intCast(weight.dims[2])),
+                @as(u32, @intCast(weight.dims[3])),
+                @as(u32, @intCast(pixels)),
+                @as(u32, @intCast(features)),
+                @as(u32, @intCast(x.dims[1])),
+                @as(u32, if (bias != null) 1 else 0),
+            });
+            return self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
+        }
         const block: u32 = 256;
         try self.env.gpu.conv_transpose2d.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{
             xb.ptr,                    wb.ptr,                               bias_buffer.ptr, storage.buffer.ptr, self.env.metadata.ptr,
@@ -705,18 +1504,70 @@ const SessionState = struct {
                     metadata[d] = @intCast(dim);
                     metadata[x.dims.len + d] = dense[d];
                 }
-                try self.env.metadata.upload(metadata[0 .. 2 * x.dims.len]);
                 const source_offset = axis_offset * dense[axis];
                 const xb = try x.gpuBuffer();
-                const block: u32 = 256;
-                try self.env.gpu.copy.launch(.{ .x = @intCast((part_count + block - 1) / block) }, .{ .x = block }, .{
-                    xb.ptr, storage.buffer.ptr, self.env.metadata.ptr, @as(u32, @intCast(x.dims.len)), @as(u32, @intCast(part_count)), @as(u32, @intCast(source_offset)), @as(u32, 0),
-                });
+                try self.strided(xb.ptr, storage.buffer.ptr, metadata[0 .. 2 * x.dims.len], part_count, source_offset, 0);
                 try self.put(arena, values, output_name, .{ .dtype = .f32, .dims = part_dims, .data = .{ .gpu = storage } });
             } else return Error.UnsupportedDataType;
 
             axis_offset += @intCast(part_len);
         }
+    }
+
+    /// The copy behind Transpose, Split, Slice and Expand: output element `i`
+    /// comes from `src` walked by the strides `metadata` carries after its
+    /// dims. Where the innermost axis is contiguous on both sides -- which is
+    /// nearly every permutation these graphs ask for, the head dimension
+    /// staying put -- one work item carries a whole group instead of one
+    /// element. `metadata` is rewritten to say so.
+    fn strided(
+        self: *SessionState,
+        src: driver.DevicePtr,
+        dst: driver.DevicePtr,
+        given: []u32,
+        count: usize,
+        src_offset: usize,
+        dst_offset: usize,
+    ) !void {
+        const metadata = collapseAxes(given);
+        const rank = metadata.len / 2;
+        const block: u32 = 256;
+        grouped: {
+            const kernel = self.env.gpu.copy_vec orelse break :grouped;
+            if (rank == 0) break :grouped;
+            if (metadata[2 * rank - 1] != 1) break :grouped;
+            if (metadata[rank - 1] % lane_step != 0) break :grouped;
+            if (src_offset % lane_step != 0 or dst_offset % lane_step != 0) break :grouped;
+            // A stride that is not a whole number of groups would put a work
+            // item astride two of them. Slice spells a reversed axis as a
+            // negative stride, whose bit pattern fails this too.
+            for (metadata[rank .. 2 * rank - 1]) |stride| {
+                if (stride % lane_step != 0) break :grouped;
+            }
+            metadata[rank - 1] /= lane_step;
+            metadata[2 * rank - 1] = lane_step;
+            try self.env.uploadMetadata(metadata);
+            const groups = count / lane_step;
+            return kernel.launch(.{ .x = @intCast((groups + block - 1) / block) }, .{ .x = block }, .{
+                src,
+                dst,
+                self.env.metadata.ptr,
+                @as(u32, @intCast(rank)),
+                @as(u32, @intCast(groups)),
+                @as(u32, @intCast(src_offset)),
+                @as(u32, @intCast(dst_offset)),
+            });
+        }
+        try self.env.uploadMetadata(metadata);
+        try self.env.gpu.copy.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{
+            src,
+            dst,
+            self.env.metadata.ptr,
+            @as(u32, @intCast(rank)),
+            @as(u32, @intCast(count)),
+            @as(u32, @intCast(src_offset)),
+            @as(u32, @intCast(dst_offset)),
+        });
     }
 
     fn releaseStorage(self: *SessionState, storage: *Storage) void {
@@ -795,7 +1646,7 @@ const SessionState = struct {
     fn ensureIndices(self: *SessionState, count: usize) !void {
         if (self.env.indices.len >= count) return;
         if (self.env.indices.len != 0) self.env.indices.free();
-        self.env.indices = try cuda.Buffer(u32).alloc(count);
+        self.env.indices = try driver.Buffer(u32).alloc(count);
     }
 
     fn reshape(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
@@ -901,13 +1752,8 @@ const SessionState = struct {
         var metadata: [16]u32 = @splat(0);
         for (dims, 0..) |dim, i| metadata[i] = @intCast(dim);
         for (0..rank) |i| metadata[rank + i] = @intCast(source_strides[i]);
-        try self.env.metadata.upload(metadata[0 .. 2 * rank]);
         const xb = try x.gpuBuffer();
-        const block: u32 = 256;
-        try self.env.gpu.copy.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{
-            xb.ptr,                    storage.buffer.ptr, self.env.metadata.ptr, @as(u32, @intCast(rank)),
-            @as(u32, @intCast(count)), @as(u32, 0),        @as(u32, 0),
-        });
+        try self.strided(xb.ptr, storage.buffer.ptr, metadata[0 .. 2 * rank], count, 0, 0);
         try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
     }
 
@@ -1048,12 +1894,8 @@ const SessionState = struct {
         const count = try elementCount(dims);
         const storage = try self.newStorage(count);
         errdefer self.releaseStorage(storage);
-        try self.env.metadata.upload(metadata[0 .. 2 * x.dims.len]);
         const xb = try x.gpuBuffer();
-        const block: u32 = 256;
-        try self.env.gpu.copy.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{
-            xb.ptr, storage.buffer.ptr, self.env.metadata.ptr, @as(u32, @intCast(x.dims.len)), @as(u32, @intCast(count)), @as(u32, @intCast(source_offset)), @as(u32, 0),
-        });
+        try self.strided(xb.ptr, storage.buffer.ptr, metadata[0 .. 2 * x.dims.len], count, source_offset, 0);
         try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
     }
 
@@ -1080,7 +1922,7 @@ const SessionState = struct {
         const count = try elementCount(dims);
         const storage = try self.newStorage(count);
         errdefer self.releaseStorage(storage);
-        try self.env.metadata.upload(metadata[0 .. 4 * x.dims.len]);
+        try self.env.uploadMetadata(metadata[0 .. 4 * x.dims.len]);
         const xb = try x.gpuBuffer();
         const block: u32 = 256;
         const fill = if (node.inputs.len > 2 and node.inputs[2].len != 0)
@@ -1100,9 +1942,295 @@ const SessionState = struct {
         try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
     }
 
+    /// C = A x B, on the matrix engines when the GPU has them. Both kernels
+    /// take the same arguments and differ only in how much of C a work group
+    /// covers, so the choice is confined to this one place.
+    const Product = struct {
+        a: driver.DevicePtr,
+        b: driver.DevicePtr,
+        c: driver.DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        a_batch: u32 = 0,
+        b_batch: u32 = 0,
+        c_batch: u32,
+        batches: u32 = 1,
+        b_transposed: bool = false,
+        /// Added by column on the way out, where an Add the graph put after
+        /// the product has been folded into it.
+        bias: driver.DevicePtr = driver.null_ptr,
+        has_bias: bool = false,
+        /// Applied after the bias, where the activation that followed the
+        /// product has been folded in as well.
+        activation: Activation = .none,
+    };
+
+    const Activation = enum(u32) { none, gelu };
+
+    fn product(self: *SessionState, args: Product) !void {
+        // A 2D block load reads a plane whose base is 64 byte aligned, in rows
+        // a multiple of 16 bytes wide and at least 64 wide, and it has nowhere
+        // to put a transposed right operand. Where all of that holds the
+        // blocked kernel runs about twice as fast; where it does not, the
+        // staged one takes the product unchanged.
+        const blocked = suited: {
+            if (Element != f16 or args.b_transposed) break :suited null;
+            const kernel = self.env.gpu.matmul_xmx_block orelse break :suited null;
+            if (args.k % 8 != 0 or args.n % 8 != 0) break :suited null;
+            if (args.k < 32 or args.n < 32) break :suited null;
+            if (args.a_batch % 32 != 0 or args.b_batch % 32 != 0) break :suited null;
+            break :suited kernel;
+        };
+
+        const engines: enum { tensor, blocked, xmx, simd, staged } = if (self.env.gpu.matmul_tensor != null)
+            .tensor
+        else if (blocked != null)
+            .blocked
+        else if (self.env.gpu.matmul_xmx != null)
+            .xmx
+        else if (self.env.gpu.matmul_simd != null)
+            .simd
+        else
+            .staged;
+        const kernel = switch (engines) {
+            .tensor => self.env.gpu.matmul_tensor.?,
+            .blocked => blocked.?,
+            .xmx => self.env.gpu.matmul_xmx.?,
+            .simd => self.env.gpu.matmul_simd.?,
+            .staged => self.env.gpu.matmul,
+        };
+        const tile_m: u32 = switch (engines) {
+            .tensor => matmul_tensor_tile_m,
+            .blocked => matmul_block_tile_m,
+            .xmx => matmul_xmx_tile_m,
+            .simd => matmul_simd_tile_m,
+            .staged => matmul_tile_m,
+        };
+        const tile_n: u32 = switch (engines) {
+            .tensor => matmul_tensor_tile_n,
+            .blocked => matmul_block_tile_n,
+            .xmx => matmul_xmx_tile_n,
+            .simd => matmul_simd_tile_n,
+            .staged => matmul_tile_n,
+        };
+        const subgroups: u32 = switch (engines) {
+            .tensor => matmul_tensor_subgroups,
+            .blocked => matmul_block_subgroups,
+            .xmx => matmul_xmx_subgroups,
+            .simd => matmul_simd_subgroups,
+            .staged => 16,
+        };
+        const tiles_m = (args.m + tile_m - 1) / tile_m;
+        const tiles_n = (args.n + tile_n - 1) / tile_n;
+
+        // Both operands span k, so the rows and columns of C a work group
+        // block can cover with its operands still in cache fall as k rises.
+        // Split what fits evenly between the two, and never go below one tile.
+        const span = matmul_cache_budget / (@sizeOf(Element) * @max(args.k, 1));
+        const block_m = std.math.clamp(span / (2 * tile_m), 1, tiles_m);
+        const block_n = std.math.clamp(span / (2 * tile_n), 1, tiles_n);
+        const blocks_m = (tiles_m + block_m - 1) / block_m;
+        const blocks_n = (tiles_n + block_n - 1) / block_n;
+
+        try kernel.launch(.{
+            // A whole number of blocks: the work groups that overhang C on the
+            // far edges return before they touch anything.
+            .x = blocks_m * block_m * blocks_n * block_n,
+            .z = args.batches,
+        }, .{ .x = 16, .y = subgroups }, .{
+            args.a,
+            args.b,
+            args.c,
+            args.m,
+            args.n,
+            args.k,
+            args.a_batch,
+            args.b_batch,
+            args.c_batch,
+            @as(u32, if (args.b_transposed) 1 else 0),
+            if (args.has_bias) args.bias else args.a,
+            @as(u32, if (args.has_bias) 1 else 0),
+            @intFromEnum(args.activation),
+            block_m,
+            block_n,
+        });
+    }
+
+    /// x turned by the rotary embedding tables, in one pass over it rather
+    /// than the eleven operators the graph spells it with. `node` is the Add
+    /// those end in, the one the rest of the graph reads.
+    fn rotary(
+        self: *SessionState,
+        arena: std.mem.Allocator,
+        values: *std.StringHashMapUnmanaged(*Tensor),
+        node: onnx.Node,
+        plan: Fusion,
+    ) !void {
+        const x = try self.input(arena, values, plan.operands[0]);
+        const cosine = try self.input(arena, values, plan.operands[1]);
+        const sine = try self.input(arena, values, plan.operands[2]);
+
+        if (self.env.gpu.rope) |kernel| suited: {
+            if (x.dtype != .f32 or cosine.dtype != .f32 or sine.dtype != .f32) break :suited;
+            if (x.dims.len == 0 or @rem(x.dims[x.dims.len - 1], 2) != 0) break :suited;
+            if (!std.mem.eql(i64, cosine.dims, sine.dims)) break :suited;
+            // Both tables have to be the tail of x, repeating over everything
+            // in front of it; anything else is not the embedding this stands
+            // for whatever the operators around it looked like.
+            const period = repeatingPeriod(cosine.dims, x.dims) orelse break :suited;
+            const count = try elementCount(x.dims);
+
+            const dims = try arena.dupe(i64, x.dims);
+            const storage = try self.newStorage(count);
+            errdefer self.releaseStorage(storage);
+            const xb = try x.gpuBuffer();
+            const cb = try cosine.gpuBuffer();
+            const sb = try sine.gpuBuffer();
+            const block: u32 = 256;
+            if (self.env.gpu.rope_vec) |vec| taken: {
+                const table_groups = groupPeriod(count, period) orelse break :taken;
+                const groups: u32 = @intCast(count / lane_step);
+                try vec.launch(.{ .x = (groups + block - 1) / block }, .{ .x = block }, .{
+                    xb.ptr, cb.ptr,       sb.ptr,      storage.buffer.ptr,
+                    groups, table_groups, @as(f32, 1),
+                });
+                return self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
+            }
+            try kernel.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{
+                xb.ptr,
+                cb.ptr,
+                sb.ptr,
+                storage.buffer.ptr,
+                @as(u32, @intCast(count)),
+                @as(u32, @intCast(period)),
+                @as(f32, 1),
+            });
+            return self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
+        }
+
+        // Not what the kernel was written for: run the operators the fusion
+        // swallowed, in the order the graph has them, and then this one. They
+        // are named rather than dispatched through `execute` because that
+        // would make the two functions' error sets depend on each other.
+        for (plan.swallowed[0..plan.swallowed_len]) |at| {
+            const step = self.graph.nodes[at];
+            if (std.mem.eql(u8, step.op_type, "Mul")) {
+                try self.binary(arena, values, step, .mul);
+            } else if (std.mem.eql(u8, step.op_type, "Neg")) {
+                try self.unary(arena, values, step, .neg);
+            } else if (std.mem.eql(u8, step.op_type, "Reshape")) {
+                try self.reshape(arena, values, step);
+            } else if (std.mem.eql(u8, step.op_type, "Split")) {
+                try self.split(arena, values, step);
+            } else if (std.mem.eql(u8, step.op_type, "Squeeze")) {
+                try self.squeeze(arena, values, step);
+            } else if (std.mem.eql(u8, step.op_type, "Unsqueeze")) {
+                try self.unsqueeze(arena, values, step);
+            } else if (std.mem.eql(u8, step.op_type, "Concat")) {
+                try self.concat(arena, values, step);
+            } else return Error.UnsupportedOperator;
+        }
+        try self.binary(arena, values, node, .add);
+        for (plan.swallowed[0..plan.swallowed_len]) |at| {
+            for (self.graph.nodes[at].outputs) |name| {
+                if (name.len == 0) continue;
+                if (values.get(name)) |tensor| self.release(tensor);
+            }
+        }
+    }
+
+    /// Scaled dot product attention: the product against the keys, the softmax
+    /// over them and the product against the values, as one kernel that never
+    /// writes the score matrix down. `node` is the second product, the one the
+    /// rest of the graph reads.
+    fn attention(
+        self: *SessionState,
+        arena: std.mem.Allocator,
+        values: *std.StringHashMapUnmanaged(*Tensor),
+        node: onnx.Node,
+        plan: Fusion,
+    ) !void {
+        const q = try self.input(arena, values, plan.operands[0]);
+        const k = try self.input(arena, values, plan.operands[1]);
+        const v = try self.input(arena, values, plan.operands[2]);
+
+        // The blocked kernel reads its operands where they lie; the staged one
+        // is what a driver without the 2D block loads falls back to. They take
+        // the same arguments and produce the same tensor.
+        if (self.env.gpu.attention_block orelse self.env.gpu.attention) |kernel| suited: {
+            if (q.dtype != .f32 or k.dtype != .f32 or v.dtype != .f32) break :suited;
+            const rank = q.dims.len;
+            if (rank < 2 or k.dims.len != rank or v.dims.len != rank) break :suited;
+            for (q.dims[0 .. rank - 2], k.dims[0 .. rank - 2], v.dims[0 .. rank - 2]) |a, b, c| {
+                if (a != b or a != c) break :suited;
+            }
+            const queries = q.dims[rank - 2];
+            const head = q.dims[rank - 1];
+            const keys = k.dims[rank - 1];
+            if (head != attention_head) break :suited;
+            if (k.dims[rank - 2] != head or v.dims[rank - 2] != keys or v.dims[rank - 1] != head) break :suited;
+            // The kernel stages a whole key step at a time and does not guard
+            // the tail of one.
+            if (@rem(keys, attention_key_step) != 0) break :suited;
+
+            const batches = try elementCount(q.dims[0 .. rank - 2]);
+            const dims = try arena.dupe(i64, q.dims);
+            const storage = try self.newStorage(try elementCount(dims));
+            errdefer self.releaseStorage(storage);
+            try kernel.launch(.{
+                .x = @intCast(@divFloor(queries + attention_query_tile - 1, attention_query_tile)),
+                .y = @intCast(batches),
+            }, .{ .x = 16, .y = attention_subgroups }, .{
+                (try q.gpuBuffer()).ptr,
+                (try k.gpuBuffer()).ptr,
+                (try v.gpuBuffer()).ptr,
+                storage.buffer.ptr,
+                @as(u32, @intCast(queries)),
+                @as(u32, @intCast(keys)),
+                plan.scale,
+            });
+            return self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
+        }
+
+        // Not what the kernel was written for: run the two folded products --
+        // the fusion pass has already established what they are -- along with
+        // any scale it swallowed on the way in, and then this node, handing
+        // their intermediates straight back.
+        for (plan.swallowed[0..plan.swallowed_len]) |at| {
+            try self.binary(arena, values, self.graph.nodes[at], .mul);
+        }
+        const first = self.graph.nodes[plan.product];
+        const middle = self.graph.nodes[plan.softmax];
+        try self.matmul(arena, values, first);
+        try self.softmax(arena, values, middle);
+        try self.matmul(arena, values, node);
+        for ([_][]const u8{ first.outputs[0], middle.outputs[0] }) |name| {
+            if (values.get(name)) |tensor| self.release(tensor);
+        }
+        for (plan.swallowed[0..plan.swallowed_len]) |at| {
+            if (values.get(self.graph.nodes[at].outputs[0])) |tensor| self.release(tensor);
+        }
+    }
+
     fn matmul(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
-        const a = try self.input(arena, values, node.inputs[0]);
-        const b = try self.input(arena, values, node.inputs[1]);
+        return self.matmulOf(arena, values, node.inputs[0], node.inputs[1], null, .none, node.outputs[0]);
+    }
+
+    /// The same over names given directly, so a product with an Add folded
+    /// into it can name operands the node it stands for does not.
+    fn matmulOf(
+        self: *SessionState,
+        arena: std.mem.Allocator,
+        values: *std.StringHashMapUnmanaged(*Tensor),
+        a_name: []const u8,
+        b_name: []const u8,
+        bias_name: ?[]const u8,
+        activation: Activation,
+        out_name: []const u8,
+    ) !void {
+        const a = try self.input(arena, values, a_name);
+        const b = try self.input(arena, values, b_name);
         if (a.dtype != .f32 or b.dtype != .f32 or a.dims.len < 2 or b.dims.len < 2) return Error.UnsupportedOperator;
         const m = a.dims[a.dims.len - 2];
         const k = a.dims[a.dims.len - 1];
@@ -1136,36 +2264,60 @@ const SessionState = struct {
             grid_batches = 1;
         }
 
-        try self.env.gpu.matmul.launch(.{
-            .x = @intCast(@divFloor(n + matmul_tile_n - 1, matmul_tile_n)),
-            .y = @intCast(@divFloor(rows + matmul_tile_m - 1, matmul_tile_m)),
-            .z = @intCast(grid_batches),
-        }, .{ .x = 16, .y = 16 }, .{
-            ab.ptr,
-            bb.ptr,
-            storage.buffer.ptr,
-            @as(u32, @intCast(rows)),
-            @as(u32, @intCast(n)),
-            @as(u32, @intCast(k)),
-            @as(u32, if (a_batches == 1) 0 else @intCast(m * k)),
-            @as(u32, if (b_batches == 1) 0 else @intCast(k * n)),
-            @as(u32, @intCast(m * n)),
-            @as(u32, 0),
+        const shift = if (bias_name) |name| try (try self.input(arena, values, name)).gpuBuffer() else null;
+        try self.product(.{
+            .a = ab.ptr,
+            .b = bb.ptr,
+            .c = storage.buffer.ptr,
+            .m = @intCast(rows),
+            .n = @intCast(n),
+            .k = @intCast(k),
+            .a_batch = if (a_batches == 1) 0 else @intCast(m * k),
+            .b_batch = if (b_batches == 1) 0 else @intCast(k * n),
+            .c_batch = @intCast(m * n),
+            .batches = @intCast(grid_batches),
+            .bias = if (shift) |buffer| buffer.ptr else driver.null_ptr,
+            .has_bias = shift != null,
+            .activation = activation,
         });
-        try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
+        try self.put(arena, values, out_name, .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
     }
 
     fn unary(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node, op: Unary) !void {
-        const x = try self.input(arena, values, node.inputs[0]);
+        return self.unaryOf(arena, values, try self.input(arena, values, node.inputs[0]), node.outputs[0], op);
+    }
+
+    /// The same over a tensor and an output name given directly, which is how
+    /// a fused activation reaches it: the node it stands for names neither.
+    fn unaryOf(
+        self: *SessionState,
+        arena: std.mem.Allocator,
+        values: *std.StringHashMapUnmanaged(*Tensor),
+        x: *Tensor,
+        name: []const u8,
+        op: Unary,
+    ) !void {
         if (x.dtype != .f32) return Error.UnsupportedDataType;
         const count = try x.count();
         const storage = try self.newStorage(count);
         errdefer self.releaseStorage(storage);
         const xb = try x.gpuBuffer();
         const block: u32 = 256;
+        // Sign and IsNaN are the two the vector kernel leaves out; nothing in
+        // these graphs reaches them often enough to be worth the select.
+        scalar: {
+            if (count % lane_step != 0 or op == .sign or op == .is_nan) break :scalar;
+            const kernel = self.env.gpu.unary_vec orelse break :scalar;
+            const groups = count / lane_step;
+            try kernel.launch(.{ .x = @intCast((groups + block - 1) / block) }, .{ .x = block }, .{
+                xb.ptr, storage.buffer.ptr, @as(u32, @intCast(groups)), @intFromEnum(op),
+            });
+            const dims = try arena.dupe(i64, x.dims);
+            return self.put(arena, values, name, .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
+        }
         try self.env.gpu.unary.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{ xb.ptr, storage.buffer.ptr, @as(u32, @intCast(count)), @intFromEnum(op) });
         const dims = try arena.dupe(i64, x.dims);
-        try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
+        try self.put(arena, values, name, .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
     }
 
     fn softmax(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
@@ -1178,10 +2330,10 @@ const SessionState = struct {
         const storage = try self.newStorage(count);
         errdefer self.releaseStorage(storage);
         const xb = try x.gpuBuffer();
-        // A power of two, since the tree reduction halves it, and capped well
-        // below the hardware maximum: a row is reduced twice, and each step of
-        // that costs a barrier, so a wide block spends more on the reduction
-        // than on the row. A narrow one just loops over more of the row.
+        // A power of two, since the fallback tree reduction halves it, and
+        // capped well below the hardware maximum: a row is reduced twice, and a
+        // wide block spends more on the reduction than on the row, while a
+        // narrow one just loops over more of the row.
         var block: u32 = 32;
         while (block < cols and block < 256) block *= 2;
         try self.env.gpu.softmax.launch(.{ .x = @intCast(rows) }, .{ .x = block }, .{ xb.ptr, storage.buffer.ptr, @as(u32, @intCast(cols)) });
@@ -1233,14 +2385,47 @@ const SessionState = struct {
         for (dims, 0..) |dim, i| metadata[i] = @intCast(dim);
         @memcpy(metadata[rank .. 2 * rank], astrides[0..rank]);
         @memcpy(metadata[2 * rank .. 3 * rank], bstrides[0..rank]);
-        try self.env.metadata.upload(metadata[0 .. 3 * rank]);
+        try self.env.uploadMetadata(metadata[0 .. 3 * rank]);
         // Neither side broadcast means the kernel can index straight through.
         const walk: u32 = if (std.mem.eql(i64, a.dims, dims) and std.mem.eql(i64, b.dims, dims)) 0 else @intCast(rank);
         const ab = try a.gpuBuffer();
         const bb = try b.gpuBuffer();
         const block: u32 = 256;
+        const a_period = repeatingPeriod(a.dims, dims) orelse 0;
+        const b_period = repeatingPeriod(b.dims, dims) orelse 0;
+        // The comparisons and Pow are the ones the vector kernel leaves out:
+        // they want a select or a scalar call per component, and nothing in
+        // these graphs spends enough time in them to pay for that.
+        const arithmetic = switch (op) {
+            .add, .sub, .mul, .div, .min, .max => true,
+            else => false,
+        };
+        if (arithmetic) blk: {
+            const kernel = self.env.gpu.binary_vec orelse break :blk;
+            const a_groups = groupPeriod(count, a_period) orelse break :blk;
+            const b_groups = groupPeriod(count, b_period) orelse break :blk;
+            const groups = count / lane_step;
+            try kernel.launch(.{ .x = @intCast((groups + block - 1) / block) }, .{ .x = block }, .{
+                ab.ptr,
+                bb.ptr,
+                storage.buffer.ptr,
+                @as(u32, @intCast(groups)),
+                @intFromEnum(op),
+                a_groups,
+                b_groups,
+            });
+            return self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
+        }
         try self.env.gpu.binary.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{
-            ab.ptr, bb.ptr, storage.buffer.ptr, self.env.metadata.ptr, walk, @as(u32, @intCast(count)), @intFromEnum(op),
+            ab.ptr,
+            bb.ptr,
+            storage.buffer.ptr,
+            self.env.metadata.ptr,
+            walk,
+            @as(u32, @intCast(count)),
+            @intFromEnum(op),
+            @as(u32, @intCast(a_period)),
+            @as(u32, @intCast(b_period)),
         });
         try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
     }
@@ -1259,10 +2444,10 @@ const SessionState = struct {
         const xb = try x.gpuBuffer();
         const sb = try scale.gpuBuffer();
         const bb = if (bias) |b| try b.gpuBuffer() else xb;
-        // A power of two, since the tree reduction halves it, and capped well
-        // below the hardware maximum: a row is reduced twice, and each step of
-        // that costs a barrier, so a wide block spends more on the reduction
-        // than on the row. A narrow one just loops over more of the row.
+        // A power of two, since the fallback tree reduction halves it, and
+        // capped well below the hardware maximum: a row is reduced twice, and a
+        // wide block spends more on the reduction than on the row, while a
+        // narrow one just loops over more of the row.
         var block: u32 = 32;
         while (block < cols and block < 256) block *= 2;
         try self.env.gpu.layer_norm.launch(.{ .x = @intCast(rows) }, .{ .x = block }, .{
@@ -1346,7 +2531,7 @@ const SessionState = struct {
         @memcpy(metadata[rank..][0..rank], strides[0..rank]);
         @memcpy(metadata[2 * rank ..][0..reduced], swept_dims[0..reduced]);
         @memcpy(metadata[2 * rank + reduced ..][0..reduced], swept_strides[0..reduced]);
-        try self.env.metadata.upload(metadata[0 .. 2 * rank + 2 * reduced]);
+        try self.env.uploadMetadata(metadata[0 .. 2 * rank + 2 * reduced]);
 
         const count = try elementCount(kept);
         const storage = try self.newStorage(count);
@@ -1393,14 +2578,15 @@ const SessionState = struct {
         errdefer self.releaseStorage(storage);
         const ab = try a.gpuBuffer();
         const bb = try b.gpuBuffer();
-        try self.env.gpu.matmul.launch(.{
-            .x = @intCast(@divFloor(n + matmul_tile_n - 1, matmul_tile_n)),
-            .y = @intCast(@divFloor(m + matmul_tile_m - 1, matmul_tile_m)),
-        }, .{ .x = 16, .y = 16 }, .{
-            ab.ptr,                             bb.ptr,                storage.buffer.ptr,
-            @as(u32, @intCast(m)),              @as(u32, @intCast(n)), @as(u32, @intCast(k)),
-            @as(u32, 0),                        @as(u32, 0),           @as(u32, @intCast(m * n)),
-            @as(u32, if (transposed) 1 else 0),
+        try self.product(.{
+            .a = ab.ptr,
+            .b = bb.ptr,
+            .c = storage.buffer.ptr,
+            .m = @intCast(m),
+            .n = @intCast(n),
+            .k = @intCast(k),
+            .c_batch = @intCast(m * n),
+            .b_transposed = transposed,
         });
 
         if (node.inputs.len > 2 and node.inputs[2].len != 0) {
@@ -1414,14 +2600,21 @@ const SessionState = struct {
             metadata[3] = 1;
             metadata[4] = cstrides[0];
             metadata[5] = cstrides[1];
-            try self.env.metadata.upload(metadata[0..6]);
+            try self.env.uploadMetadata(metadata[0..6]);
             // The sum lands back where the product is: each thread reads and
             // writes the one element it owns.
             const cb = try c.gpuBuffer();
             const block: u32 = 256;
             try self.env.gpu.binary.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{
-                storage.buffer.ptr, cb.ptr,                    storage.buffer.ptr,       self.env.metadata.ptr,
-                @as(u32, 2),        @as(u32, @intCast(count)), @intFromEnum(Binary.add),
+                storage.buffer.ptr,
+                cb.ptr,
+                storage.buffer.ptr,
+                self.env.metadata.ptr,
+                @as(u32, 2),
+                @as(u32, @intCast(count)),
+                @intFromEnum(Binary.add),
+                @as(u32, @intCast(count)),
+                @as(u32, @intCast(repeatingPeriod(c.dims, dims) orelse 0)),
             });
         }
         try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
@@ -1491,21 +2684,17 @@ const SessionState = struct {
         errdefer self.releaseStorage(storage);
         const ab = try a.gpuBuffer();
         const bb = try b.gpuBuffer();
-        try self.env.gpu.matmul.launch(.{
-            .x = @intCast(@divFloor(n + matmul_tile_n - 1, matmul_tile_n)),
-            .y = @intCast(@divFloor(m + matmul_tile_m - 1, matmul_tile_m)),
-            .z = @intCast(batches),
-        }, .{ .x = 16, .y = 16 }, .{
-            ab.ptr,
-            bb.ptr,
-            storage.buffer.ptr,
-            @as(u32, @intCast(m)),
-            @as(u32, @intCast(n)),
-            @as(u32, @intCast(k)),
-            @as(u32, @intCast(m * @as(usize, @intCast(k)))),
-            @as(u32, @intCast(@as(usize, @intCast(k)) * n)),
-            @as(u32, @intCast(m * n)),
-            @as(u32, 0),
+        try self.product(.{
+            .a = ab.ptr,
+            .b = bb.ptr,
+            .c = storage.buffer.ptr,
+            .m = @intCast(m),
+            .n = @intCast(n),
+            .k = @intCast(k),
+            .a_batch = @intCast(m * @as(usize, @intCast(k))),
+            .b_batch = @intCast(@as(usize, @intCast(k)) * n),
+            .c_batch = @intCast(m * n),
+            .batches = @intCast(batches),
         });
         try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
     }
@@ -1531,7 +2720,7 @@ const SessionState = struct {
         for (dims, 0..) |dim, i| metadata[i] = @intCast(dim);
         for (x.dims, 0..) |dim, i| metadata[rank + i] = @intCast(dim);
         @memcpy(metadata[2 * rank ..][0..rank], strides[0..rank]);
-        try self.env.metadata.upload(metadata[0 .. 3 * rank]);
+        try self.env.uploadMetadata(metadata[0 .. 3 * rank]);
 
         const storage = try self.newStorage(count);
         errdefer self.releaseStorage(storage);
@@ -1705,7 +2894,7 @@ const SessionState = struct {
             @intCast(kernel[0]), @intCast(kernel[1]), @intCast(sh),    @intCast(sw),
             @intCast(ph0),       @intCast(pw0),
         };
-        try self.env.metadata.upload(&meta);
+        try self.env.uploadMetadata(&meta);
         const xb = try x.gpuBuffer();
         const block: u32 = 256;
         try self.env.gpu.max_pool2d.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{
@@ -1801,7 +2990,7 @@ const SessionState = struct {
         @memcpy(metadata[rank..][0..rank], cstrides[0..rank]);
         @memcpy(metadata[2 * rank ..][0..rank], astrides[0..rank]);
         @memcpy(metadata[3 * rank ..][0..rank], bstrides[0..rank]);
-        try self.env.metadata.upload(metadata[0 .. 4 * rank]);
+        try self.env.uploadMetadata(metadata[0 .. 4 * rank]);
 
         const storage = try self.newStorage(count);
         errdefer self.releaseStorage(storage);
@@ -1813,11 +3002,13 @@ const SessionState = struct {
         try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
     }
 
-    /// Uploads a host integer or boolean tensor as the floats the elementwise
-    /// kernels work in.
+    /// Uploads a host integer or boolean tensor as whatever the elementwise
+    /// kernels work in. A half build cannot hold an integer past 2048 exactly,
+    /// which is fine for the masks and small counts these graphs cast, and is
+    /// why index arithmetic stays on the host as i64.
     fn deviceMask(self: *SessionState, arena: std.mem.Allocator, tensor: Tensor) !*Storage {
         const count = try tensor.count();
-        const host = try arena.alloc(f32, count);
+        const host = try arena.alloc(Element, count);
         for (host, 0..) |*value, i| value.* = @floatFromInt(try tensor.element(i));
         const storage = try self.newStorage(count);
         errdefer self.releaseStorage(storage);
@@ -1843,7 +3034,7 @@ const SessionState = struct {
         // down. The copy is stream-ordered, so it sees the finished tensor.
         const downloaded: ?[]f32 = if (x.onHost()) null else blk: {
             const host = try arena.alloc(f32, count);
-            try (try x.gpuBuffer()).download(host);
+            try downloadFloats(arena, try x.gpuBuffer(), host);
             break :blk host;
         };
         switch (to) {
@@ -1887,16 +3078,11 @@ const SessionState = struct {
         var metadata: [2 * max_rank]u32 = @splat(0);
         for (dims, 0..) |dim, i| metadata[i] = @intCast(dim);
         @memcpy(metadata[rank..][0..rank], strides[0..rank]);
-        try self.env.metadata.upload(metadata[0 .. 2 * rank]);
 
         const storage = try self.newStorage(count);
         errdefer self.releaseStorage(storage);
         const xb = try x.gpuBuffer();
-        const block: u32 = 256;
-        try self.env.gpu.copy.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{
-            xb.ptr,                    storage.buffer.ptr, self.env.metadata.ptr, @as(u32, @intCast(rank)),
-            @as(u32, @intCast(count)), @as(u32, 0),        @as(u32, 0),
-        });
+        try self.strided(xb.ptr, storage.buffer.ptr, metadata[0 .. 2 * rank], count, 0, 0);
         try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
     }
 
@@ -1937,7 +3123,7 @@ const SessionState = struct {
         for (dims, 0..) |dim, i| metadata[i] = @intCast(dim);
         for (x.dims, 0..) |dim, i| metadata[rank + i] = @intCast(dim);
         @memcpy(metadata[2 * rank ..][0..rank], strides[0..rank]);
-        try self.env.metadata.upload(metadata[0 .. 3 * rank]);
+        try self.env.uploadMetadata(metadata[0 .. 3 * rank]);
 
         const storage = try self.newStorage(count);
         errdefer self.releaseStorage(storage);
@@ -2118,21 +3304,17 @@ const SessionState = struct {
         var metadata: [2 * max_rank]u32 = @splat(0);
         for (dims, 0..) |dim, i| metadata[i] = @intCast(dim);
         @memcpy(metadata[rank..][0..rank], strides[0..rank]);
-        try self.env.metadata.upload(metadata[0 .. 2 * rank]);
 
         const storage = try self.newStorage(count);
         errdefer self.releaseStorage(storage);
         const db = try data.gpuBuffer();
-        const block: u32 = 256;
-        try self.env.gpu.copy.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{
-            db.ptr,                    storage.buffer.ptr, self.env.metadata.ptr, @as(u32, @intCast(rank)),
-            @as(u32, @intCast(count)), @as(u32, 0),        @as(u32, 0),
-        });
+        try self.strided(db.ptr, storage.buffer.ptr, metadata[0 .. 2 * rank], count, 0, 0);
 
         try self.ensureIndices(offsets.len);
         try self.env.indices.upload(offsets);
         const ub = try updates.gpuBuffer();
         const written = tuples * span;
+        const block: u32 = 256;
         try self.env.gpu.scatter.launch(.{ .x = @intCast((written + block - 1) / block) }, .{ .x = block }, .{
             ub.ptr, self.env.indices.ptr, storage.buffer.ptr, @as(u32, @intCast(span)), @as(u32, @intCast(written)),
         });
@@ -2224,6 +3406,97 @@ fn hostSelect(arena: std.mem.Allocator, tensor: Tensor, sources: []const usize) 
     }
 }
 
+/// Rewrites a copy's dims and strides -- laid out as `rank` of each, in one
+/// array -- into the fewest axes that describe the same walk, and returns the
+/// shorter slice. Every axis is a division and a modulo per element, and the
+/// shapes these graphs transpose carry axes that earn neither: an extent of
+/// one contributes nothing, and two adjacent axes that run contiguously
+/// through the source are one axis with the extents multiplied. A window
+/// partition's six drop to four this way.
+fn collapseAxes(given: []u32) []u32 {
+    const rank = given.len / 2;
+    var dims: [max_rank]u32 = undefined;
+    var strides: [max_rank]u32 = undefined;
+    var kept: usize = 0;
+    for (0..rank) |axis| {
+        const dim = given[axis];
+        const stride = given[rank + axis];
+        if (dim == 1) continue;
+        // Wrapping, because Slice spells a reversed axis as a negative stride
+        // and the products of two of those still line up.
+        if (kept != 0 and strides[kept - 1] == stride *% dim) {
+            dims[kept - 1] *= dim;
+            strides[kept - 1] = stride;
+            continue;
+        }
+        dims[kept] = dim;
+        strides[kept] = stride;
+        kept += 1;
+    }
+    if (kept == 0) {
+        dims[0] = 1;
+        strides[0] = 0;
+        kept = 1;
+    }
+    @memcpy(given[0..kept], dims[0..kept]);
+    @memcpy(given[kept..][0..kept], strides[0..kept]);
+    return given[0 .. 2 * kept];
+}
+
+/// Host floats on their way to the device, in whatever a tensor is stored as.
+/// A float build hands the slice straight to the driver; a half build narrows
+/// it through a scratch buffer first.
+fn uploadFloats(allocator: std.mem.Allocator, buffer: driver.Buffer(Element), source: []const f32) !void {
+    if (Element == f32) return buffer.upload(source);
+    const scratch = try allocator.alloc(Element, source.len);
+    defer allocator.free(scratch);
+    for (scratch, source) |*narrow, value| narrow.* = @floatCast(value);
+    try buffer.upload(scratch);
+}
+
+/// The same in reverse, for the graph outputs and the handful of operators
+/// that finish their work on the host.
+fn downloadFloats(allocator: std.mem.Allocator, buffer: driver.Buffer(Element), out: []f32) !void {
+    if (Element == f32) return buffer.download(out);
+    const scratch = try allocator.alloc(Element, out.len);
+    defer allocator.free(scratch);
+    try buffer.download(scratch);
+    for (out, scratch) |*value, narrow| value.* = @floatCast(narrow);
+}
+
+/// `period` counted in groups of `lane_step`, for the vector kernels. Null
+/// whenever a work item that owns one group of outputs would need values from
+/// two turns of the repeat, or from a broadcast the kernel does not index. One
+/// value repeated over everything is spelled zero, which a group cannot
+/// express.
+fn groupPeriod(count: usize, period: usize) ?u32 {
+    if (period == 0 or count % lane_step != 0) return null;
+    if (period == 1) return 0;
+    if (period % lane_step != 0) return null;
+    return @intCast(period / lane_step);
+}
+
+/// How many elements of `input` go by before it starts over, when it is
+/// broadcast to `output` by simply repeating: a bias over the last axis, a
+/// window every batch shares, a single value. Null for any other broadcast,
+/// which then has to be walked stride by stride. Almost every broadcast in
+/// these graphs is of this shape, and it is the difference between one wrap
+/// and a division per axis for every element.
+fn repeatingPeriod(input: []const i64, output: []const i64) ?usize {
+    if (input.len > output.len) return null;
+    const leading = output.len - input.len;
+    var period: usize = 1;
+    var repeating = true;
+    for (input, 0..) |dim, axis| {
+        if (dim < 0) return null;
+        if (repeating and dim == 1 and output[leading + axis] != 1) continue;
+        repeating = false;
+        if (dim != output[leading + axis]) return null;
+        period *= @intCast(dim);
+    }
+    return if (period == 0) null else period;
+}
+
 fn makeBroadcastStrides(input: []const i64, output: []const i64, result: *[8]u32) void {
     var stride: u32 = 1;
     var source = input.len;
@@ -2282,7 +3555,7 @@ pub const Value = struct {
             .f32 => {
                 const data = try allocator.alloc(f32, try tensor.count());
                 errdefer allocator.free(data);
-                try (try tensor.gpuBuffer()).download(data);
+                try downloadFloats(allocator, try tensor.gpuBuffer(), data);
                 return .{ .dtype = .f32, .bytes = std.mem.sliceAsBytes(data), .dims = dims, .owned_allocator = allocator, .owned_f32 = data };
             },
             .i64 => {

@@ -10,11 +10,14 @@ pub const panic = gpu.panic;
 
 pub const max_rank = 8;
 
+const inf: f32 = @bitCast(@as(u32, 0x7f800000));
+const neg_inf: f32 = -inf;
+
 /// Elementwise binary operations, selected by `op`.
 pub const Binary = enum(u32) { add, sub, mul, div, pow, min, max, equal, less, greater };
 
 /// Elementwise unary operations, selected by `op`.
-pub const Unary = enum(u32) { neg, erf, exp, sqrt, reciprocal, sigmoid, tanh, relu, abs, floor, sin, cos, log, sign, is_nan };
+pub const Unary = enum(u32) { neg, erf, exp, sqrt, reciprocal, sigmoid, tanh, relu, abs, floor, sin, cos, log, sign, is_nan, gelu };
 
 const Meta = [*]addrspace(.global) const u32;
 
@@ -35,11 +38,20 @@ fn offsetOf(index: u32, meta: Meta, dims_at: u32, strides_at: u32, rank: u32) u3
     return offset;
 }
 
+/// Where an operand is the tail of the output shape -- a bias over the last
+/// axis, a window shared by every batch, a single value -- the same block of
+/// `period` values repeats over everything in front of it, and one wrap is the
+/// whole index calculation. `period` is uniform across the block, so the power
+/// of two test costs nothing and the common cases avoid the division.
+fn wrap(index: u32, period: u32) u32 {
+    return if (period & (period -% 1) == 0) index & (period -% 1) else index % period;
+}
+
 /// meta: [0..rank) output dims, [rank..2*rank) a strides, [2*rank..3*rank) b strides.
 ///
-/// A rank of zero means neither operand is broadcast, so both are indexed
-/// straight through. Walking the shape costs a division and a modulo per axis
-/// per operand, and most of a graph's arithmetic is between matching shapes.
+/// A period of zero is an operand whose broadcast does not have that shape, and
+/// is walked stride by stride through `meta` instead. Walking costs a division
+/// and a modulo per axis, and almost no arithmetic in a graph needs it.
 pub fn binary(
     a: [*]addrspace(.global) const f32,
     b: [*]addrspace(.global) const f32,
@@ -48,12 +60,14 @@ pub fn binary(
     rank: u32,
     count: u32,
     op: u32,
+    a_period: u32,
+    b_period: u32,
 ) callconv(.kernel) void {
     const i = gpu.globalIndex();
     if (i >= count) return;
 
-    const x = if (rank == 0) a[i] else a[offsetOf(i, meta, 0, rank, rank)];
-    const y = if (rank == 0) b[i] else b[offsetOf(i, meta, 0, 2 * rank, rank)];
+    const x = if (a_period != 0) a[wrap(i, a_period)] else a[offsetOf(i, meta, 0, rank, rank)];
+    const y = if (b_period != 0) b[wrap(i, b_period)] else b[offsetOf(i, meta, 0, 2 * rank, rank)];
 
     out[i] = switch (@as(Binary, @enumFromInt(op))) {
         .add => x + y,
@@ -97,6 +111,8 @@ pub fn unary(
         // Comparing a value against itself is the only NaN test that survives
         // a compiler entitled to assume floats are never NaN.
         .is_nan => if (v != v) 1 else 0,
+        // 1 / sqrt(2), which is what the graph divides by before the erf.
+        .gelu => 0.5 * v * (1.0 + erf(v * 0.7071067811865476)),
     };
 }
 
@@ -398,25 +414,31 @@ pub fn softmax(
     const width = gpu.blockSize();
     const base = row * cols;
 
-    var top: f32 = -3.4e38;
+    var top: f32 = neg_inf;
     var sum: f32 = 0;
     var i = lane;
     while (i < cols) : (i += width) {
         const v = x[base + i];
         if (v > top) {
-            sum *= exp(top - v);
+            sum = if (top == neg_inf) 0 else sum * exp(top - v);
             top = v;
         }
-        sum += exp(v - top);
+        if (v != neg_inf and top != neg_inf) {
+            sum += exp(v - top);
+        }
     }
 
     // Every lane's running sum is against its own maximum, so it is brought
     // onto the row's maximum before the sums are added together.
     const peak = reduceMax(top);
-    const total = reduceSum(sum * exp(top - peak));
+    const local_sum = if (top == neg_inf or peak == neg_inf) 0 else (sum * exp(top - peak));
+    const total = reduceSum(local_sum);
 
     i = lane;
-    while (i < cols) : (i += width) out[base + i] = exp(x[base + i] - peak) / total;
+    while (i < cols) : (i += width) {
+        const v = x[base + i];
+        out[base + i] = if (v == neg_inf or peak == neg_inf or total == 0) 0 else (exp(v - peak) / total);
+    }
 }
 
 /// The one scratch array both reductions share. Its callers reduce twice in a
@@ -526,11 +548,23 @@ pub fn matmul(
     /// inside the staging loop, and a branch there costs the whole kernel
     /// about a tenth of its throughput.
     b_transposed: u32,
+    /// Added to every element on the way out, indexed by column, where a
+    /// MatMul the graph followed with an Add has been folded into this one.
+    bias: [*]addrspace(.global) const f32,
+    has_bias: u32,
+    /// Applied to every element after the bias, where the activation that
+    /// followed the product has been folded into it as well.
+    activation: u32,
+    /// How many tiles of C a work group block covers. Which tile each block
+    /// takes decides what the resident ones share; the host sizes this to what
+    /// it reckons the last level cache holds both operands of.
+    block_m: u32,
+    block_n: u32,
 ) callconv(.kernel) void {
     if (b_transposed != 0) {
-        matmulTiled(a, b, c, m, n, k, a_batch, b_batch, c_batch, true);
+        matmulTiled(a, b, c, m, n, k, a_batch, b_batch, c_batch, bias, has_bias, activation, block_m, block_n, true);
     } else {
-        matmulTiled(a, b, c, m, n, k, a_batch, b_batch, c_batch, false);
+        matmulTiled(a, b, c, m, n, k, a_batch, b_batch, c_batch, bias, has_bias, activation, block_m, block_n, false);
     }
 }
 
@@ -544,13 +578,28 @@ inline fn matmulTiled(
     a_batch: u32,
     b_batch: u32,
     c_batch: u32,
+    bias: [*]addrspace(.global) const f32,
+    has_bias: u32,
+    activation: u32,
+    block_m: u32,
+    block_n: u32,
     comptime transposed: bool,
 ) void {
     const tx = gpu.threadIndex();
     const ty = gpu.threadIndexY();
     const thread = ty * mm_threads + tx;
-    const row_base = gpu.blockIndexY() * mm_tile_m;
-    const col_base = gpu.blockIndex() * mm_tile_n;
+    const tiles_n = (n + mm_tile_n - 1) / mm_tile_n;
+    const tiles_m = (m + mm_tile_m - 1) / mm_tile_m;
+    const blocks_n = (tiles_n + block_n - 1) / block_n;
+    const taken = gpu.blockIndex();
+    const at = taken / (block_m * block_n);
+    const within = taken % (block_m * block_n);
+    const tile_m = (at / blocks_n) * block_m + within / block_n;
+    const tile_n = (at % blocks_n) * block_n + within % block_n;
+    // The grid is a whole number of blocks, so the last ones overhang.
+    if (tile_m >= tiles_m or tile_n >= tiles_n) return;
+    const row_base = tile_m * mm_tile_m;
+    const col_base = tile_n * mm_tile_n;
     const batch = gpu.blockIndexZ();
     const a_base = batch * a_batch;
     const b_base = batch * b_batch;
@@ -584,7 +633,11 @@ inline fn matmulTiled(
         if (row < m) {
             inline for (0..mm_cols) |j| {
                 const col = col_base + tx + j * mm_threads;
-                if (col < n) c[batch * c_batch + row * n + col] = acc[i][j];
+                if (col < n) {
+                    const value = acc[i][j] + if (has_bias != 0) bias[col] else 0;
+                    c[batch * c_batch + row * n + col] =
+                        if (activation != 0) 0.5 * value * (1.0 + erf(value * 0.7071067811865476)) else value;
+                }
             }
         }
     }
@@ -1030,6 +1083,87 @@ pub fn convTranspose2d(
     out[i] = sum + (if (has_bias != 0) bias[channel] else 0);
 }
 
+/// Non-overlapping transposed convolution as GEMM plus pixel shuffle.
+/// A is the input viewed as [pixel, input_channel], B is the weight viewed as
+/// [input_channel, output_channel * kernel_h * kernel_w]. Both views are
+/// gathered from their native NCHW / ONNX layouts while staging each tile.
+pub fn convTranspose2dGemm(
+    x: [*]addrspace(.global) const f32,
+    w: [*]addrspace(.global) const f32,
+    bias: [*]addrspace(.global) const f32,
+    out: [*]addrspace(.global) f32,
+    in_h: u32,
+    in_w: u32,
+    out_channels: u32,
+    out_h: u32,
+    out_w: u32,
+    kernel_h: u32,
+    kernel_w: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    has_bias: u32,
+) callconv(.kernel) void {
+    _ = in_h;
+    const tx = gpu.threadIndex();
+    const ty = gpu.threadIndexY();
+    const thread = ty * mm_threads + tx;
+    const row_base = gpu.blockIndexY() * mm_tile_m;
+    const col_base = gpu.blockIndex() * mm_tile_n;
+    const batch = gpu.blockIndexZ();
+    const taps = kernel_h * kernel_w;
+    const x_base = batch * k * m;
+    const out_base = batch * out_channels * out_h * out_w;
+
+    var acc: [mm_rows][mm_cols]f32 = @splat(@splat(0));
+
+    var step: u32 = 0;
+    while (step < k) : (step += mm_tile_k) {
+        inline for (0..mm_tile_m * mm_tile_k / mm_stage) |slab| {
+            const idx = thread + slab * mm_stage;
+            const pixel = row_base + idx / mm_tile_k;
+            const channel = step + idx % mm_tile_k;
+            a_tile[idx / mm_tile_k][idx % mm_tile_k] = if (pixel < m and channel < k)
+                x[x_base + channel * m + pixel]
+            else
+                0;
+        }
+
+        inline for (0..mm_tile_k * mm_tile_n / mm_stage) |slab| {
+            const idx = thread + slab * mm_stage;
+            const channel = step + idx / mm_tile_n;
+            const feature = col_base + idx % mm_tile_n;
+            b_tile[idx / mm_tile_n][idx % mm_tile_n] = if (channel < k and feature < n)
+                w[channel * n + feature]
+            else
+                0;
+        }
+        gpu.syncThreads();
+
+        accumulateTiles(&acc, tx, ty);
+        gpu.syncThreads();
+    }
+
+    inline for (0..mm_rows) |i| {
+        const pixel = row_base + ty + i * mm_threads;
+        if (pixel < m) {
+            const in_y = pixel / in_w;
+            const in_x = pixel % in_w;
+            inline for (0..mm_cols) |j| {
+                const feature = col_base + tx + j * mm_threads;
+                if (feature < n) {
+                    const channel = feature / taps;
+                    const tap = feature % taps;
+                    const out_y = in_y * kernel_h + tap / kernel_w;
+                    const out_x = in_x * kernel_w + tap % kernel_w;
+                    out[out_base + (channel * out_h + out_y) * out_w + out_x] =
+                        acc[i][j] + (if (has_bias != 0) bias[channel] else 0);
+                }
+            }
+        }
+    }
+}
+
 export fn anchor() usize {
     return @intFromPtr(&binary) ^ @intFromPtr(&unary) ^ @intFromPtr(&copy) ^
         @intFromPtr(&fill) ^ @intFromPtr(&select) ^ @intFromPtr(&tile) ^ @intFromPtr(&conv2dGemm) ^
@@ -1039,5 +1173,5 @@ export fn anchor() usize {
         @intFromPtr(&concatCopy) ^ @intFromPtr(&pad) ^
         @intFromPtr(&gather) ^ @intFromPtr(&layerNorm) ^
         @intFromPtr(&softmax) ^ @intFromPtr(&matmul) ^ @intFromPtr(&conv2d) ^
-        @intFromPtr(&convTranspose2d);
+        @intFromPtr(&convTranspose2d) ^ @intFromPtr(&convTranspose2dGemm);
 }

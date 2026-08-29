@@ -2,3 +2,4 @@
 zig-out/
 zig-pkg/
 cat_mask*.bmp
+vendor/

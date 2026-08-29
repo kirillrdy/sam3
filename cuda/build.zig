@@ -70,7 +70,7 @@ pub const PtxOptions = struct {
     /// Device code. It may `@import("gpu")` for the device-side runtime.
     root_source_file: std.Build.LazyPath,
     arch: []const u8 = default_arch,
-    optimize: std.builtin.OptimizeMode = .ReleaseSafe,
+    optimize: std.builtin.OptimizeMode = .Debug,
 };
 
 /// Compiles device code to PTX for a package that depends on this one.
@@ -97,11 +97,7 @@ pub fn findLibrary(b: *std.Build) ?[]const u8 {
 }
 
 fn addPtx(b: *std.Build, gpu_source: std.Build.LazyPath, options: PtxOptions) std.Build.LazyPath {
-    // ptxas rejects the `@import("builtin")` target tables that a Debug build
-    // leaves in the module -- they use bit widths like `.u2` that PTX has no
-    // syntax for -- so device code is built at ReleaseSafe or better. Safety
-    // checks survive that; they just trap the launch instead of printing.
-    const optimize = if (options.optimize == .Debug) .ReleaseSafe else options.optimize;
+    const optimize = options.optimize;
 
     // Device code is a separate compilation: a different target, no libc, no
     // std. The NVPTX backend has no object writer, so the artifact is the

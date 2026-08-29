@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
     );
     defer allocator.free(tokenizer_json);
 
-    std.debug.print("\n=== CPU vs CUDA preprocessing ===\n\n", .{});
+    std.debug.print("\n=== CPU vs GPU preprocessing ===\n\n", .{});
     std.debug.print("  image:        {s} ({d}x{d})\n", .{ image_path, img.width, img.height });
 
     var model = try sam3.Model.open(allocator, io, .{
@@ -48,11 +48,11 @@ pub fn main(init: std.process.Init) !void {
         .concept_text_encoder = concept_text_path,
         .concept_decoder = concept_decoder_path,
         .concept_tokenizer_json = tokenizer_json,
-    }, .{ .cuda = true });
+    }, .{ .cuda = true, .gpu = true });
     defer model.deinit();
 
     const preprocessor = model.preprocessor orelse {
-        std.debug.print("\n  No GPU preprocessing to compare against. Build with -Dcuda.\n\n", .{});
+        std.debug.print("\n  No GPU preprocessing to compare against. Build with -Ddevice=gpu or -Dcuda.\n\n", .{});
         std.process.exit(1);
     };
 
@@ -68,7 +68,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(cpu_pixels);
     const cpu_seconds = secondsSince(io, cpu_start);
 
-    std.debug.print("\n  preprocess:   CPU {d:.1} ms, CUDA {d:.1} ms ({d:.1}x)\n", .{
+    std.debug.print("\n  preprocess:   CPU {d:.1} ms, GPU {d:.1} ms ({d:.1}x)\n", .{
         cpu_seconds * 1000,
         gpu_seconds * 1000,
         cpu_seconds / gpu_seconds,
@@ -76,18 +76,26 @@ pub fn main(init: std.process.Init) !void {
     report("  pixel tensor", cpu_pixels, gpu_pixels);
 
     // The masks that come out the far end of both graphs.
+    const cpu_segment_start = Io.Timestamp.now(io, .awake);
     var cpu_masks = try segment(&model, img);
+    const cpu_segment_seconds = secondsSince(io, cpu_segment_start);
     defer cpu_masks.deinit();
 
     model.preprocessor = preprocessor;
+    const gpu_segment_start = Io.Timestamp.now(io, .awake);
     var gpu_masks = try segment(&model, img);
+    const gpu_segment_seconds = secondsSince(io, gpu_segment_start);
     defer gpu_masks.deinit();
 
-    std.debug.print("\n  masks:        CPU {d}, CUDA {d}, both {d}x{d}\n", .{
+    std.debug.print("\n  masks:        CPU {d}, GPU {d}, both {d}x{d}\n", .{
         cpu_masks.count,
         gpu_masks.count,
         cpu_masks.width,
         cpu_masks.height,
+    });
+    std.debug.print("  segment:      CPU prep {d:.2} s, GPU prep {d:.2} s\n", .{
+        cpu_segment_seconds,
+        gpu_segment_seconds,
     });
     if (cpu_masks.count != gpu_masks.count or cpu_masks.logits.len != gpu_masks.logits.len) {
         std.debug.print("  ! the two runs disagree on how many masks there are\n\n", .{});
@@ -109,7 +117,7 @@ pub fn main(init: std.process.Init) !void {
         cpu_masks.logits.len,
         percent,
     });
-    std.debug.print("  best mask:    CPU {d}, CUDA {d}\n\n", .{ cpu_masks.best(), gpu_masks.best() });
+    std.debug.print("  best mask:    CPU {d}, GPU {d}\n\n", .{ cpu_masks.best(), gpu_masks.best() });
 }
 
 fn segment(model: *sam3.Model, img: sam3.ImageRGB) !sam3.Masks {
