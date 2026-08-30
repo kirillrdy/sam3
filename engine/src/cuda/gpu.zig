@@ -43,19 +43,9 @@ pub fn blockSize() u32 {
     return special("ntid.x");
 }
 
-/// Blocks in the grid, `gridDim.x`.
-pub fn gridSize() u32 {
-    return special("nctaid.x");
-}
-
 /// Index of this thread across the whole grid.
 pub fn globalIndex() u32 {
     return blockIndex() * blockSize() + threadIndex();
-}
-
-/// Total number of threads launched, the stride for a grid-stride loop.
-pub fn globalSize() u32 {
-    return gridSize() * blockSize();
 }
 
 /// Barrier across the block: no thread passes until all of them arrive, and

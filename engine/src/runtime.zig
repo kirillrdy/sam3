@@ -5,9 +5,10 @@
 const std = @import("std");
 const onnx = @import("onnx.zig");
 const device_mod = @import("device.zig");
-const driver = device_mod.driver;
+pub const Device = device_mod.Device;
+pub const driver = device_mod.driver;
 /// What a float tensor is stored as on the device; see `device.Element`.
-const Element = device_mod.Element;
+pub const Element = device_mod.Element;
 
 pub const Error = error{
     NativeRuntime,
@@ -21,14 +22,15 @@ pub const Error = error{
 };
 
 /// The two elementwise kernels select their operation by number. `kernels.zig`
-/// is compiled for the GPU and cannot be imported here, so these mirror the
-/// enums it declares and must be kept in step with them.
-const Binary = enum(u32) { add, sub, mul, div, pow, min, max, equal, less, greater };
-const Unary = enum(u32) { neg, erf, exp, sqrt, reciprocal, sigmoid, tanh, relu, abs, floor, sin, cos, log, sign, is_nan, gelu };
+/// is compiled for the GPU and cannot be imported here, so these values mirror
+/// its enums and must be kept in step with them. ONNX spellings are used where
+/// possible so `execute` can decode them directly.
+const Binary = enum(u32) { Add, Sub, Mul, Div, Pow, Min, Max };
+const Unary = enum(u32) { Neg, Erf, Exp, Sqrt, reciprocal, Sigmoid, Tanh, Relu, Abs, Floor, Sin, Cos, Log, Sign, IsNaN, gelu };
 
 /// Comparisons run on the host, over the i64 tensors a graph does its shape
 /// arithmetic with, so they are their own list rather than `Binary` entries.
-const Compare = enum { equal, greater, greater_equal, less, less_equal };
+const Compare = enum { Equal, Greater, GreaterOrEqual, Less, LessOrEqual };
 
 /// Matches `kernels.max_rank`: the stride arrays a launch carries are fixed.
 const max_rank = 8;
@@ -60,6 +62,11 @@ const matmul_tensor_subgroups = 8;
 const conv_tensor_tile_m = 128;
 const conv_tensor_tile_n = 64;
 const conv_tensor_subgroups = 16;
+
+/// The same for `kernels.matmulNBitsTensor`.
+const matmul_nbits_tensor_tile_m = 128;
+const matmul_nbits_tensor_tile_n = 64;
+const matmul_nbits_tensor_subgroups = 16;
 
 /// The same for `kernels.matmulSimd`, whose work group is eight SIMD groups of
 /// 32 lanes. Kept in step with SG_TILE_M and SG_TILE_N there.
@@ -116,11 +123,6 @@ pub fn version() []const u8 {
     else
         "native CUDA";
 }
-
-pub const DeviceKind = enum {
-    gpu,
-    cpu,
-};
 
 /// Device memory a graph is done with, kept for the next node that wants the
 /// same size rather than handed back to the driver. `cuMemFree` synchronizes
@@ -281,7 +283,7 @@ const State = struct {
 pub const Env = struct {
     state: *State,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, _: [:0]const u8) !Env {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) !Env {
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
         var gpu = try device_mod.Device.init(0);
@@ -309,24 +311,14 @@ pub const Env = struct {
         self.state.gpu.deinit();
         allocator.destroy(self.state);
     }
-
-    pub fn registerProvider(_: Env, _: [:0]const u8, _: [:0]const u8) !void {}
-
-    pub fn find(_: Env, kind: DeviceKind) !?Device {
-        return if (kind == .gpu) .{ .kind = .gpu, .id = 0 } else null;
-    }
 };
 
 pub const Session = struct {
     state: *SessionState,
-    device: DeviceKind = .gpu,
 
     pub fn open(
         env: Env,
-        model_path: [:0]const u8,
-        _: ?Accelerator,
-        _: []const Option,
-        _: ?*const fn ([]const u8) void,
+        model_path: []const u8,
     ) !Session {
         const state = try env.state.allocator.create(SessionState);
         errdefer env.state.allocator.destroy(state);
@@ -393,12 +385,7 @@ const Tensor = struct {
     },
 
     fn count(self: Tensor) !usize {
-        var result: usize = 1;
-        for (self.dims) |dim| {
-            if (dim < 0) return Error.InvalidShape;
-            result = try std.math.mul(usize, result, @intCast(dim));
-        }
-        return result;
+        return elementCount(self.dims);
     }
 
     fn i64s(self: Tensor) ![]const i64 {
@@ -442,10 +429,6 @@ const Tensor = struct {
     }
 };
 
-/// A scaled dot product attention, recognized once when the graph is opened.
-/// The node it is recorded against is the second matrix product, the one whose
-/// output the rest of the graph reads; the other two are on `folded`, and the
-/// score matrix they passed between them is never allocated.
 /// Several operators the graph spells out that one kernel does whole,
 /// recognized once when the graph is opened. It is recorded against the last
 /// node of the group -- the one whose output the rest of the graph reads --
@@ -1063,27 +1046,10 @@ const SessionState = struct {
         if (std.mem.eql(u8, node.op_type, "Slice")) return self.slice(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "Pad")) return self.pad(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "MatMul")) return self.matmul(arena, values, node);
-        if (std.mem.eql(u8, node.op_type, "Add")) return self.binary(arena, values, node, .add);
-        if (std.mem.eql(u8, node.op_type, "Sub")) return self.binary(arena, values, node, .sub);
-        if (std.mem.eql(u8, node.op_type, "Mul")) return self.binary(arena, values, node, .mul);
-        if (std.mem.eql(u8, node.op_type, "Div")) return self.binary(arena, values, node, .div);
-        if (std.mem.eql(u8, node.op_type, "Mod")) return self.binary(arena, values, node, .div);
-        if (std.mem.eql(u8, node.op_type, "Neg")) return self.unary(arena, values, node, .neg);
-        if (std.mem.eql(u8, node.op_type, "Erf")) return self.unary(arena, values, node, .erf);
-        if (std.mem.eql(u8, node.op_type, "Relu")) return self.unary(arena, values, node, .relu);
-        if (std.mem.eql(u8, node.op_type, "Sigmoid")) return self.unary(arena, values, node, .sigmoid);
-        if (std.mem.eql(u8, node.op_type, "Sqrt")) return self.unary(arena, values, node, .sqrt);
-        if (std.mem.eql(u8, node.op_type, "Exp")) return self.unary(arena, values, node, .exp);
-        if (std.mem.eql(u8, node.op_type, "Tanh")) return self.unary(arena, values, node, .tanh);
-        if (std.mem.eql(u8, node.op_type, "Abs")) return self.unary(arena, values, node, .abs);
-        if (std.mem.eql(u8, node.op_type, "Floor")) return self.unary(arena, values, node, .floor);
-        if (std.mem.eql(u8, node.op_type, "Sin")) return self.unary(arena, values, node, .sin);
-        if (std.mem.eql(u8, node.op_type, "Cos")) return self.unary(arena, values, node, .cos);
-        if (std.mem.eql(u8, node.op_type, "Equal")) return self.compare(arena, values, node, .equal);
-        if (std.mem.eql(u8, node.op_type, "Greater")) return self.compare(arena, values, node, .greater);
-        if (std.mem.eql(u8, node.op_type, "GreaterOrEqual")) return self.compare(arena, values, node, .greater_equal);
-        if (std.mem.eql(u8, node.op_type, "Less")) return self.compare(arena, values, node, .less);
-        if (std.mem.eql(u8, node.op_type, "LessOrEqual")) return self.compare(arena, values, node, .less_equal);
+        if (std.meta.stringToEnum(Binary, node.op_type)) |op| return self.binary(arena, values, node, op);
+        if (std.mem.eql(u8, node.op_type, "Mod")) return self.binary(arena, values, node, .Div);
+        if (std.meta.stringToEnum(Unary, node.op_type)) |op| return self.unary(arena, values, node, op);
+        if (std.meta.stringToEnum(Compare, node.op_type)) |op| return self.compare(arena, values, node, op);
         if (std.mem.eql(u8, node.op_type, "Not")) return self.not(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "Where")) return self.where(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "Cast")) return self.cast(arena, values, node);
@@ -1094,12 +1060,6 @@ const SessionState = struct {
         if (std.mem.eql(u8, node.op_type, "Clip")) return self.clip(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "OneHot")) return self.oneHot(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "ScatterND")) return self.scatterNd(arena, values, node);
-        if (std.mem.eql(u8, node.op_type, "Log")) return self.unary(arena, values, node, .log);
-        if (std.mem.eql(u8, node.op_type, "Sign")) return self.unary(arena, values, node, .sign);
-        if (std.mem.eql(u8, node.op_type, "IsNaN")) return self.unary(arena, values, node, .is_nan);
-        if (std.mem.eql(u8, node.op_type, "Max")) return self.binary(arena, values, node, .max);
-        if (std.mem.eql(u8, node.op_type, "Min")) return self.binary(arena, values, node, .min);
-        if (std.mem.eql(u8, node.op_type, "Pow")) return self.binary(arena, values, node, .pow);
         if (std.mem.eql(u8, node.op_type, "And")) return self.logical(arena, values, node, true);
         if (std.mem.eql(u8, node.op_type, "Or")) return self.logical(arena, values, node, false);
         if (std.mem.eql(u8, node.op_type, "MatMulNBits")) return self.matmulNBits(arena, values, node);
@@ -1683,7 +1643,7 @@ const SessionState = struct {
         var source: usize = 0;
         for (dims, 0..) |*dim, i| {
             var inserted = false;
-            for (axes) |axis| if (normalizeAxisInsert(axis, rank) == i) {
+            for (axes) |axis| if (normalizeAxis(axis, rank) == i) {
                 inserted = true;
                 break;
             };
@@ -1974,7 +1934,7 @@ const SessionState = struct {
         // to put a transposed right operand. Where all of that holds the
         // blocked kernel runs about twice as fast; where it does not, the
         // staged one takes the product unchanged.
-        const blocked = suited: {
+        const blocked: ?driver.Function = suited: {
             if (Element != f16 or args.b_transposed) break :suited null;
             const kernel = self.env.gpu.matmul_xmx_block orelse break :suited null;
             if (args.k % 8 != 0 or args.n % 8 != 0) break :suited null;
@@ -2116,9 +2076,9 @@ const SessionState = struct {
         for (plan.swallowed[0..plan.swallowed_len]) |at| {
             const step = self.graph.nodes[at];
             if (std.mem.eql(u8, step.op_type, "Mul")) {
-                try self.binary(arena, values, step, .mul);
+                try self.binary(arena, values, step, .Mul);
             } else if (std.mem.eql(u8, step.op_type, "Neg")) {
-                try self.unary(arena, values, step, .neg);
+                try self.unary(arena, values, step, .Neg);
             } else if (std.mem.eql(u8, step.op_type, "Reshape")) {
                 try self.reshape(arena, values, step);
             } else if (std.mem.eql(u8, step.op_type, "Split")) {
@@ -2131,7 +2091,7 @@ const SessionState = struct {
                 try self.concat(arena, values, step);
             } else return Error.UnsupportedOperator;
         }
-        try self.binary(arena, values, node, .add);
+        try self.binary(arena, values, node, .Add);
         for (plan.swallowed[0..plan.swallowed_len]) |at| {
             for (self.graph.nodes[at].outputs) |name| {
                 if (name.len == 0) continue;
@@ -2198,7 +2158,7 @@ const SessionState = struct {
         // any scale it swallowed on the way in, and then this node, handing
         // their intermediates straight back.
         for (plan.swallowed[0..plan.swallowed_len]) |at| {
-            try self.binary(arena, values, self.graph.nodes[at], .mul);
+            try self.binary(arena, values, self.graph.nodes[at], .Mul);
         }
         const first = self.graph.nodes[plan.product];
         const middle = self.graph.nodes[plan.softmax];
@@ -2306,7 +2266,7 @@ const SessionState = struct {
         // Sign and IsNaN are the two the vector kernel leaves out; nothing in
         // these graphs reaches them often enough to be worth the select.
         scalar: {
-            if (count % lane_step != 0 or op == .sign or op == .is_nan) break :scalar;
+            if (count % lane_step != 0 or op == .Sign or op == .IsNaN) break :scalar;
             const kernel = self.env.gpu.unary_vec orelse break :scalar;
             const groups = count / lane_step;
             try kernel.launch(.{ .x = @intCast((groups + block - 1) / block) }, .{ .x = block }, .{
@@ -2359,12 +2319,12 @@ const SessionState = struct {
                 const x = av[hostOffset(i, dims, &astrides)];
                 const y = bv[hostOffset(i, dims, &bstrides)];
                 value.* = switch (op) {
-                    .add => x + y,
-                    .sub => x - y,
-                    .mul => x * y,
-                    .div => if (modulo) @mod(x, y) else @divFloor(x, y),
-                    .min => @min(x, y),
-                    .max => @max(x, y),
+                    .Add => x + y,
+                    .Sub => x - y,
+                    .Mul => x * y,
+                    .Div => if (modulo) @mod(x, y) else @divFloor(x, y),
+                    .Min => @min(x, y),
+                    .Max => @max(x, y),
                     else => return Error.UnsupportedOperator,
                 };
             }
@@ -2393,13 +2353,10 @@ const SessionState = struct {
         const block: u32 = 256;
         const a_period = repeatingPeriod(a.dims, dims) orelse 0;
         const b_period = repeatingPeriod(b.dims, dims) orelse 0;
-        // The comparisons and Pow are the ones the vector kernel leaves out:
-        // they want a select or a scalar call per component, and nothing in
-        // these graphs spends enough time in them to pay for that.
-        const arithmetic = switch (op) {
-            .add, .sub, .mul, .div, .min, .max => true,
-            else => false,
-        };
+        // Pow is the one arithmetic operator the vector kernel leaves out: it
+        // wants a scalar call per component, and these graphs spend too little
+        // time in it for that to pay.
+        const arithmetic = op != .Pow;
         if (arithmetic) blk: {
             const kernel = self.env.gpu.binary_vec orelse break :blk;
             const a_groups = groupPeriod(count, a_period) orelse break :blk;
@@ -2612,7 +2569,7 @@ const SessionState = struct {
                 self.env.metadata.ptr,
                 @as(u32, 2),
                 @as(u32, @intCast(count)),
-                @intFromEnum(Binary.add),
+                @intFromEnum(Binary.Add),
                 @as(u32, @intCast(count)),
                 @as(u32, @intCast(repeatingPeriod(c.dims, dims) orelse 0)),
             });
@@ -2829,10 +2786,15 @@ const SessionState = struct {
         const weights = try self.constantBytes(node.inputs[1]);
         const scales = try (try self.input(arena, values, node.inputs[2])).gpuBuffer();
 
-        try self.env.gpu.matmul_nbits.launch(.{
-            .x = @intCast(@divFloor(width + matmul_tile_n - 1, matmul_tile_n)),
-            .y = @intCast(@divFloor(@as(i64, @intCast(rows)) + matmul_tile_m - 1, matmul_tile_m)),
-        }, .{ .x = 16, .y = 16 }, .{
+        const tensor_kernel = self.env.gpu.matmul_nbits_tensor;
+        const tile_m: i64 = if (tensor_kernel != null) matmul_nbits_tensor_tile_m else matmul_tile_m;
+        const tile_n: i64 = if (tensor_kernel != null) matmul_nbits_tensor_tile_n else matmul_tile_n;
+        const subgroups: u32 = if (tensor_kernel != null) matmul_nbits_tensor_subgroups else 16;
+        const kernel = tensor_kernel orelse self.env.gpu.matmul_nbits;
+        try kernel.launch(.{
+            .x = @intCast(@divFloor(width + tile_n - 1, tile_n)),
+            .y = @intCast(@divFloor(@as(i64, @intCast(rows)) + tile_m - 1, tile_m)),
+        }, .{ .x = 16, .y = subgroups }, .{
             ab.ptr,
             weights,
             scales.ptr,
@@ -2926,11 +2888,11 @@ const SessionState = struct {
             const x = try a.element(hostOffset(i, dims, &astrides));
             const y = try b.element(hostOffset(i, dims, &bstrides));
             value.* = @intFromBool(switch (op) {
-                .equal => x == y,
-                .greater => x > y,
-                .greater_equal => x >= y,
-                .less => x < y,
-                .less_equal => x <= y,
+                .Equal => x == y,
+                .Greater => x > y,
+                .GreaterOrEqual => x >= y,
+                .Less => x < y,
+                .LessOrEqual => x <= y,
             });
         }
         try self.put(arena, values, node.outputs[0], .{ .dtype = .bool, .dims = dims, .data = .{ .host = out } });
@@ -3341,10 +3303,6 @@ fn elementCount(dims: []const i64) !usize {
 fn normalizeAxis(axis: i64, rank: usize) usize {
     return @intCast(if (axis < 0) @as(i64, @intCast(rank)) + axis else axis);
 }
-fn normalizeAxisInsert(axis: i64, rank: usize) usize {
-    return normalizeAxis(axis, rank);
-}
-
 fn broadcastShape(arena: std.mem.Allocator, a: []const i64, b: []const i64) ![]i64 {
     const rank = @max(a.len, b.len);
     const out = try arena.alloc(i64, rank);
@@ -3567,3 +3525,7 @@ pub const Value = struct {
         }
     }
 };
+
+test {
+    std.testing.refAllDecls(@This());
+}

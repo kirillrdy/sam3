@@ -3,6 +3,7 @@
 //! Kernels arrive as OpenCL C source and are JIT-compiled by the driver on load.
 
 const std = @import("std");
+const opencl = @This();
 
 pub const is_opencl = true;
 
@@ -206,11 +207,11 @@ pub fn init() Error!void {
     global_dispatch = dispatch_ptr;
 }
 
-pub fn getDispatch() *const Dispatch {
+fn getDispatch() *const Dispatch {
     return global_dispatch.?;
 }
 
-pub fn getPlatform() cl_platform_id {
+fn getPlatform() cl_platform_id {
     return global_platform;
 }
 
@@ -223,7 +224,7 @@ pub const Context = struct {
     dispatch: *const Dispatch,
 
     pub fn init(ordinal: u32) Error!Context {
-        try @import("opencl.zig").init();
+        try opencl.init();
         const dispatch = getDispatch();
         const plat = getPlatform();
 

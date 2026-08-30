@@ -8,16 +8,16 @@ const gpu = @import("gpu");
 
 pub const panic = gpu.panic;
 
-pub const max_rank = 8;
+const max_rank = 8;
 
 const inf: f32 = @bitCast(@as(u32, 0x7f800000));
 const neg_inf: f32 = -inf;
 
 /// Elementwise binary operations, selected by `op`.
-pub const Binary = enum(u32) { add, sub, mul, div, pow, min, max, equal, less, greater };
+const Binary = enum(u32) { add, sub, mul, div, pow, min, max, equal, less, greater };
 
 /// Elementwise unary operations, selected by `op`.
-pub const Unary = enum(u32) { neg, erf, exp, sqrt, reciprocal, sigmoid, tanh, relu, abs, floor, sin, cos, log, sign, is_nan, gelu };
+const Unary = enum(u32) { neg, erf, exp, sqrt, reciprocal, sigmoid, tanh, relu, abs, floor, sin, cos, log, sign, is_nan, gelu };
 
 const Meta = [*]addrspace(.global) const u32;
 
@@ -52,7 +52,7 @@ fn wrap(index: u32, period: u32) u32 {
 /// A period of zero is an operand whose broadcast does not have that shape, and
 /// is walked stride by stride through `meta` instead. Walking costs a division
 /// and a modulo per axis, and almost no arithmetic in a graph needs it.
-pub fn binary(
+fn binary(
     a: [*]addrspace(.global) const f32,
     b: [*]addrspace(.global) const f32,
     out: [*]addrspace(.global) f32,
@@ -83,7 +83,7 @@ pub fn binary(
     };
 }
 
-pub fn unary(
+fn unary(
     x: [*]addrspace(.global) const f32,
     out: [*]addrspace(.global) f32,
     count: u32,
@@ -185,7 +185,7 @@ fn cos(x: f32) f32 {
 /// Copies a strided window of `src` into a dense `dst`. Slice, Concat, Split,
 /// Pad and plain copies all reduce to this.
 /// meta: [0..rank) dst dims, [rank..2*rank) src strides.
-pub fn copy(
+fn copy(
     src: [*]addrspace(.global) const f32,
     dst: [*]addrspace(.global) f32,
     meta: Meta,
@@ -199,7 +199,7 @@ pub fn copy(
     dst[dst_offset + i] = src[src_offset +% offsetOf(i, meta, 0, rank, rank)];
 }
 
-pub fn fill(
+fn fill(
     dst: [*]addrspace(.global) f32,
     value: f32,
     count: u32,
@@ -211,7 +211,7 @@ pub fn fill(
 
 /// Picks elementwise between `a` and `b`, all three broadcast to the output.
 /// meta: [0..rank) output dims, then condition, a and b strides.
-pub fn select(
+fn select(
     condition: [*]addrspace(.global) const f32,
     a: [*]addrspace(.global) const f32,
     b: [*]addrspace(.global) const f32,
@@ -232,7 +232,7 @@ pub fn select(
 /// this wraps the coordinate rather than pinning it, so it cannot be spelled
 /// as a stride of zero.
 /// meta: [0..rank) output dims, [rank..2*rank) source dims, then source strides.
-pub fn tile(
+fn tile(
     src: [*]addrspace(.global) const f32,
     dst: [*]addrspace(.global) f32,
     meta: Meta,
@@ -256,7 +256,7 @@ pub fn tile(
 
 /// ONNX spells Clip's bounds as scalar tensors, so they arrive as device
 /// pointers rather than as values; either may be absent.
-pub fn clip(
+fn clip(
     x: [*]addrspace(.global) const f32,
     low: [*]addrspace(.global) const f32,
     high: [*]addrspace(.global) const f32,
@@ -275,7 +275,7 @@ pub fn clip(
 
 /// Writes each `slice`-element run of `updates` at its own offset in `dst`.
 /// ScatterND reduces to this once the host has flattened its index tuples.
-pub fn scatter(
+fn scatter(
     updates: [*]addrspace(.global) const f32,
     offsets: [*]addrspace(.global) const u32,
     dst: [*]addrspace(.global) f32,
@@ -289,7 +289,7 @@ pub fn scatter(
 
 /// Copies one dense tensor into an axis window of another dense tensor. Used
 /// by Concat and Split without constructing temporary tensors.
-pub fn concatCopy(
+fn concatCopy(
     src: [*]addrspace(.global) const f32,
     dst: [*]addrspace(.global) f32,
     src_axis: u32,
@@ -308,7 +308,7 @@ pub fn concatCopy(
 
 /// Constant padding. `meta` contains output dims, input dims, input strides,
 /// then leading pads, each `rank` elements long.
-pub fn pad(
+fn pad(
     src: [*]addrspace(.global) const f32,
     dst: [*]addrspace(.global) f32,
     meta: Meta,
@@ -341,7 +341,7 @@ pub fn pad(
 }
 
 /// out[outer, index, inner] = src[outer, indices[index], inner]
-pub fn gather(
+fn gather(
     src: [*]addrspace(.global) const f32,
     indices: [*]addrspace(.global) const u32,
     dst: [*]addrspace(.global) f32,
@@ -364,7 +364,7 @@ pub fn gather(
 }
 
 /// One block per row: mean and variance over `cols`, then scale and shift.
-pub fn layerNorm(
+fn layerNorm(
     x: [*]addrspace(.global) const f32,
     scale: [*]addrspace(.global) const f32,
     bias: [*]addrspace(.global) const f32,
@@ -404,7 +404,7 @@ pub fn layerNorm(
 /// rescaled whenever a larger element turns up. The obvious three-pass form
 /// touches the row five times -- read, read and write, read and write -- and
 /// attention rows here run to 5184 columns, so those passes are the cost.
-pub fn softmax(
+fn softmax(
     x: [*]addrspace(.global) const f32,
     out: [*]addrspace(.global) f32,
     cols: u32,
@@ -533,7 +533,7 @@ inline fn accumulateTiles(acc: *[mm_rows][mm_cols]f32, tx: u32, ty: u32) void {
 
 /// C[b] = A[b] x B[b], blockIdx.z selecting the batch. A batch stride of zero
 /// broadcasts that operand across the batch.
-pub fn matmul(
+fn matmul(
     a: [*]addrspace(.global) const f32,
     b: [*]addrspace(.global) const f32,
     c: [*]addrspace(.global) f32,
@@ -647,7 +647,7 @@ inline fn matmulTiled(
 /// ones are a second shape that each output element sweeps.
 /// meta: [0..rank) output dims with a 1 where an axis was reduced,
 ///       [rank..2*rank) input strides, then the reduced dims and their strides.
-pub fn sumAxes(
+fn sumAxes(
     src: [*]addrspace(.global) const f32,
     dst: [*]addrspace(.global) f32,
     meta: Meta,
@@ -671,7 +671,7 @@ pub fn sumAxes(
 /// Nearest-neighbour resize, ONNX's `asymmetric` mapping with `floor`: an
 /// output coordinate reads back from `coordinate * in_dim / out_dim`.
 /// meta: [0..rank) output dims, [rank..2*rank) input dims, then input strides.
-pub fn resizeNearest(
+fn resizeNearest(
     src: [*]addrspace(.global) const f32,
     dst: [*]addrspace(.global) f32,
     meta: Meta,
@@ -697,7 +697,7 @@ pub fn resizeNearest(
 /// One block per plane: normalizes each plane over its own extent, then scales
 /// and shifts by its channel's parameters. Unlike `layerNorm`, whose scale
 /// runs along the row, this one has a single pair per row.
-pub fn instanceNorm(
+fn instanceNorm(
     x: [*]addrspace(.global) const f32,
     scale: [*]addrspace(.global) const f32,
     bias: [*]addrspace(.global) const f32,
@@ -739,7 +739,7 @@ pub fn instanceNorm(
 /// way the text-prompt models fit in VRAM at all.
 ///
 /// Same block tiling as `matmul`, and it needs the same grid.
-pub fn matmulNBits(
+fn matmulNBits(
     a: [*]addrspace(.global) const f32,
     quantized: [*]addrspace(.global) const u8,
     scales: [*]addrspace(.global) const f32,
@@ -810,7 +810,7 @@ pub fn matmulNBits(
 
 /// Running sum along one axis, one thread per line. The lines are short where
 /// this is used, so walking them in order beats a parallel scan.
-pub fn cumulativeSum(
+fn cumulativeSum(
     src: [*]addrspace(.global) const f32,
     dst: [*]addrspace(.global) f32,
     along: u32,
@@ -831,7 +831,7 @@ pub fn cumulativeSum(
 
 /// meta: in_h, in_w, out_h, out_w, kernel_h, kernel_w, stride_h, stride_w,
 ///       pad_h, pad_w
-pub fn maxPool2d(
+fn maxPool2d(
     src: [*]addrspace(.global) const f32,
     dst: [*]addrspace(.global) f32,
     meta: Meta,
@@ -877,7 +877,7 @@ pub fn maxPool2d(
 /// Same block tiling as `matmul`, and it needs the same grid.
 /// meta: in_channels, in_h, in_w, out_h, out_w, kernel_h, kernel_w,
 ///       stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w
-pub fn conv2dGemm(
+fn conv2dGemm(
     x: [*]addrspace(.global) const f32,
     w: [*]addrspace(.global) const f32,
     bias: [*]addrspace(.global) const f32,
@@ -956,7 +956,7 @@ pub fn conv2dGemm(
 /// Direct convolution over NCHW input with OIHW weights. Still what a grouped
 /// convolution runs on: the implicit GEMM above assumes one group, since a
 /// block tile of output channels would otherwise straddle two of them.
-pub fn conv2d(
+fn conv2d(
     x: [*]addrspace(.global) const f32,
     w: [*]addrspace(.global) const f32,
     bias: [*]addrspace(.global) const f32,
@@ -1021,7 +1021,7 @@ pub fn conv2d(
 
 /// Transposed convolution, gathering rather than scattering: each output
 /// pixel walks the input positions that would have written to it.
-pub fn convTranspose2d(
+fn convTranspose2d(
     x: [*]addrspace(.global) const f32,
     w: [*]addrspace(.global) const f32,
     bias: [*]addrspace(.global) const f32,
@@ -1087,7 +1087,7 @@ pub fn convTranspose2d(
 /// A is the input viewed as [pixel, input_channel], B is the weight viewed as
 /// [input_channel, output_channel * kernel_h * kernel_w]. Both views are
 /// gathered from their native NCHW / ONNX layouts while staging each tile.
-pub fn convTranspose2dGemm(
+fn convTranspose2dGemm(
     x: [*]addrspace(.global) const f32,
     w: [*]addrspace(.global) const f32,
     bias: [*]addrspace(.global) const f32,

@@ -65,14 +65,19 @@ fn checkMatmulNBits(device: *engine.Device) !void {
     try upload(a, &a_host);
     try q.upload(&weights);
     try upload(scales, &scales_host);
-    try device.matmul_nbits.launch(.{ .x = 1, .y = 1 }, .{ .x = 16, .y = 16 }, .{
-        a.ptr, q.ptr, scales.ptr, out.ptr,
-        @as(u32, m), @as(u32, n), @as(u32, k), @as(u32, 4), @as(u32, blocks),
-    });
-    try device.synchronize();
-    var actual: [expected.len]f32 = undefined;
-    try download(out, &actual);
-    try expectApprox(&actual, &expected);
+    // Keep the portable fallback covered even where the tensor kernel exists.
+    const kernels = [_]?engine.driver.Function{ device.matmul_nbits, device.matmul_nbits_tensor };
+    for (kernels) |maybe_kernel| if (maybe_kernel) |kernel| {
+        try kernel.launch(.{ .x = 1, .y = 1 }, .{ .x = 16, .y = 16 }, .{
+            a.ptr,            q.ptr,       scales.ptr,  out.ptr,
+            @as(u32, m),      @as(u32, n), @as(u32, k), @as(u32, 4),
+            @as(u32, blocks),
+        });
+        try device.synchronize();
+        var actual: [expected.len]f32 = undefined;
+        try download(out, &actual);
+        try expectApprox(&actual, &expected);
+    };
 }
 
 fn checkBinary(device: *engine.Device) !void {
@@ -193,11 +198,11 @@ fn checkMatmulSimd(device: *engine.Device) !void {
     const tiles_m = (m + 63) / 64;
     const tiles_n = (n + 63) / 64;
     try kernel.launch(.{ .x = tiles_m * tiles_n, .z = 1 }, .{ .x = 16, .y = 16 }, .{
-        a.ptr,       b.ptr,        out.ptr,
-        @as(u32, m), @as(u32, n),  @as(u32, k),
-        @as(u32, 0), @as(u32, 0),  @as(u32, 0),
-        @as(u32, 0), bias.ptr,     @as(u32, 1),
-        @as(u32, 0), @as(u32, 1),  @as(u32, 1),
+        a.ptr,       b.ptr,       out.ptr,
+        @as(u32, m), @as(u32, n), @as(u32, k),
+        @as(u32, 0), @as(u32, 0), @as(u32, 0),
+        @as(u32, 0), bias.ptr,    @as(u32, 1),
+        @as(u32, 0), @as(u32, 1), @as(u32, 1),
     });
     try device.synchronize();
 

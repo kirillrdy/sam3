@@ -1,7 +1,0 @@
-.{
-    .name = .metal,
-    .version = "0.0.0",
-    .fingerprint = 0xc062f4c91e47881c,
-    .minimum_zig_version = "0.16.0",
-    .paths = .{ "build.zig", "build.zig.zon", "src" },
-}

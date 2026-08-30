@@ -22,7 +22,6 @@ const CUstream = *opaque {};
 extern fn cuInit(flags: c_uint) Result;
 extern fn cuGetErrorString(err: Result, str: *[*:0]const u8) Result;
 extern fn cuDeviceGet(device: *Device, ordinal: c_int) Result;
-extern fn cuDeviceGetCount(count: *c_int) Result;
 extern fn cuDeviceGetName(name: [*]u8, len: c_int, dev: Device) Result;
 extern fn cuDeviceGetAttribute(value: *c_int, attribute: c_uint, dev: Device) Result;
 extern fn cuDevicePrimaryCtxRetain(ctx: *CUcontext, dev: Device) Result;
@@ -87,12 +86,6 @@ fn check(result: Result) Error!void {
 
 pub fn init() Error!void {
     try check(cuInit(0));
-}
-
-pub fn deviceCount() Error!u32 {
-    var count: c_int = 0;
-    try check(cuDeviceGetCount(&count));
-    return @intCast(count);
 }
 
 /// Grid and block extents, in blocks and in threads respectively.

@@ -1,29 +1,33 @@
 const std = @import("std");
 const builtin = @import("builtin");
-/// Selected by build.zig. The current implementation is ONNX Runtime; the
-/// native CUDA engine implements this same session/value boundary.
 pub const onnx = @import("runtime");
-const resample = @import("resample.zig");
-const tokenizer = @import("tokenizer.zig");
-const ImageRGB = @import("io/image.zig").ImageRGB;
-const gpu = @import("gpu");
+pub const resample = @import("resample.zig");
+pub const tokenizer = @import("tokenizer.zig");
+pub const zigimg = @import("zigimg");
+pub const Image = zigimg.Image;
+
+pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Image {
+    var decoded = try Image.fromMemory(allocator, bytes);
+    errdefer decoded.deinit(allocator);
+    try decoded.convert(allocator, .rgb24);
+    return decoded;
+}
 
 pub const image_size: usize = 1008;
 
-pub const Point = @import("point.zig").Point;
+pub const Point = struct {
+    x: f32,
+    y: f32,
+    label: i64 = 1,
+};
 
 pub const Paths = struct {
-    vision_encoder: [:0]const u8,
-    decoder: [:0]const u8,
-    concept_vision_encoder: [:0]const u8,
-    concept_text_encoder: [:0]const u8,
-    concept_decoder: [:0]const u8,
+    vision_encoder: []const u8,
+    decoder: []const u8,
+    concept_vision_encoder: []const u8,
+    concept_text_encoder: []const u8,
+    concept_decoder: []const u8,
     concept_tokenizer_json: []const u8,
-
-    openvino_provider: ?[:0]const u8 = null,
-    webgpu_provider: ?[:0]const u8 = null,
-
-    cache_dir: ?[:0]const u8 = null,
 };
 
 const vision_input = "pixel_values";
@@ -67,40 +71,6 @@ const concept_decoder_outputs = [_][*:0]const u8{
     "pred_logits",
 };
 
-const Npu = struct { id: u32, name: []const u8 };
-
-const known_npus = [_]Npu{
-    .{ .id = 0x643e, .name = "Lunar Lake" },
-    .{ .id = 0xb03e, .name = "Panther Lake" },
-    .{ .id = 0xfd3e, .name = "Wildcat Lake" },
-};
-
-fn npuName(id: u32) ?[]const u8 {
-    for (known_npus) |npu| if (npu.id == id) return npu.name;
-    return null;
-}
-
-pub const Target = struct {
-    device: onnx.DeviceKind = .cpu,
-
-    untested_npu: bool = false,
-
-    /// Preprocess images on a GPU rather than the CPU.
-    cuda: bool = false,
-    gpu: bool = false,
-};
-
-fn registerProvider(env: onnx.Env, name: [:0]const u8, path: ?[:0]const u8) void {
-    const provider = path orelse return;
-    env.registerProvider(name, provider) catch {
-        std.debug.print("  ! {s} provider at '{s}' would not load: {s}\n", .{
-            name,
-            provider,
-            onnx.lastError(),
-        });
-    };
-}
-
 pub const Model = struct {
     allocator: std.mem.Allocator,
     env: onnx.Env,
@@ -111,147 +81,27 @@ pub const Model = struct {
     concept_decoder: onnx.Session,
     concept_tokenizer: tokenizer.Tokenizer,
 
-    /// Null when preprocessing runs on the CPU.
-    preprocessor: ?gpu.Preprocessor,
-
-    pub fn open(allocator: std.mem.Allocator, io: std.Io, paths: Paths, target: Target) !Model {
+    pub fn open(allocator: std.mem.Allocator, io: std.Io, paths: Paths) !Model {
         try onnx.init(allocator, io);
 
-        const env = try onnx.Env.init(allocator, io, "sam3");
+        const env = try onnx.Env.init(allocator, io);
         errdefer env.deinit();
 
-        registerProvider(env, "OpenVINO", paths.openvino_provider);
-        registerProvider(env, "webgpu", paths.webgpu_provider);
-
-        var accelerator: ?onnx.Accelerator = if (target.device == .cpu)
-            null
-        else if (builtin.os.tag.isDarwin() and target.device != .webgpu)
-            .{ .coreml = target.device }
-        else if (try env.find(target.device)) |device|
-            .{ .device = device }
-        else if ((target.device == .gpu or target.device == .npu) and paths.openvino_provider != null)
-            .{ .openvino = target.device }
-        else
-            null;
-
-        var declined = false;
-
-        if (accelerator) |selected| {
-            if (selected == .device and selected.device.kind == .npu) {
-                if (npuName(selected.device.id)) |name| {
-                    std.debug.print("  NPU:          Intel {s} (0x{x:0>4})\n", .{ name, selected.device.id });
-                } else if (target.untested_npu) {
-                    std.debug.print("  NPU:          unrecognised generation 0x{x:0>4}, trying it anyway\n", .{selected.device.id});
-                } else {
-                    std.debug.print(
-                        \\  ! the NPU here (0x{x:0>4}) is a generation this has not been run on,
-                        \\    so this runs on the CPU. Only Lunar Lake and newer are in the list;
-                        \\    Meteor Lake and Arrow Lake carry a third of the throughput and have
-                        \\    never been tried. Build with -Duntested-npu to use it regardless.
-                        \\
-                        \\
-                    , .{selected.device.id});
-                    accelerator = null;
-                    declined = true;
-                }
-            }
-        }
-
-        if (target.device != .cpu and accelerator == null and !declined) {
-            std.debug.print(
-                \\  ! no {t} among the devices the runtime enumerated, so this runs on the CPU.
-                \\    The provider has to be registered (a -Dopenvino build), and whatever the
-                \\    OpenVINO plugin dlopens to reach the device has to be on the library path:
-                \\{s}
-                \\
-                \\
-            , .{
-                target.device,
-                switch (target.device) {
-                    .npu =>
-                    \\    an NPU needs libze_loader.so.1 and libze_intel_npu.so.1, which on NixOS
-                    \\    are in two different directories:
-                    \\    LD_LIBRARY_PATH=/run/current-system/sw/lib:/run/opengl-driver/lib
-                    ,
-                    .gpu =>
-                    \\    a GPU needs libOpenCL.so.1 -- the ICD loader, which the build compiles
-                    \\    and installs beside the provider, so it is zig-out/lib that has to be on
-                    \\    the path. The loader then needs a driver to open, which it takes from the
-                    \\    ICD registry: NixOS has no /etc/OpenCL/vendors, so name the driver
-                    \\    hardware.graphics installed instead --
-                    \\    OCL_ICD_FILENAMES=/run/opengl-driver/lib/intel-opencl/libigdrcl.so
-                    ,
-                    .webgpu =>
-                    \\    WebGPU needs a working Vulkan driver. On Linux, Dawn selects a Vulkan
-                    \\    adapter, so verify the GPU with `vulkaninfo --summary`.
-                    ,
-                    .cpu => "",
-                },
-            });
-        }
-
-        var config_buf: [512]u8 = undefined;
-        var option_buf: [8]onnx.Option = undefined;
-        var options: []const onnx.Option = &.{};
-        if (accelerator) |selected| switch (selected) {
-            .device => if (target.device != .webgpu) {
-                if (paths.cache_dir) |dir| {
-                    const config = try std.fmt.bufPrintZ(
-                        &config_buf,
-                        "{{\"{s}\":{{\"CACHE_DIR\":\"{s}\"}}}}",
-                        .{ target.device.openvinoName(), dir },
-                    );
-                    option_buf[0] = .{ .key = "load_config", .value = config.ptr };
-                    options = option_buf[0..1];
-                }
-            },
-            .openvino => if (paths.cache_dir) |dir| {
-                const config = try std.fmt.bufPrintZ(
-                    &config_buf,
-                    "{{\"{s}\":{{\"CACHE_DIR\":\"{s}\"}}}}",
-                    .{ target.device.openvinoName(), dir },
-                );
-                option_buf[0] = .{ .key = "load_config", .value = config.ptr };
-                options = option_buf[0..1];
-            },
-            .coreml => |device| {
-                option_buf[0] = .{
-                    .key = "MLComputeUnits",
-                    .value = switch (device) {
-                        .npu => "CPUAndNeuralEngine",
-                        .gpu => "CPUAndGPU",
-                        .webgpu => unreachable,
-                        .cpu => unreachable,
-                    },
-                };
-                option_buf[1] = .{ .key = "ModelFormat", .value = "MLProgram" };
-                option_buf[2] = .{ .key = "RequireStaticInputShapes", .value = "1" };
-                option_buf[3] = .{ .key = "AllowLowPrecisionAccumulationOnGPU", .value = "1" };
-                var count: usize = 4;
-                if (paths.cache_dir) |dir| {
-                    const cache_dir = try std.fmt.bufPrintZ(&config_buf, "{s}", .{dir});
-                    option_buf[count] = .{ .key = "ModelCacheDirectory", .value = cache_dir.ptr };
-                    count += 1;
-                }
-                options = option_buf[0..count];
-            },
-        };
-
-        const vision = try onnx.Session.open(env, paths.vision_encoder, accelerator, options, reportFallback);
+        const vision = try onnx.Session.open(env, paths.vision_encoder);
         errdefer vision.deinit();
 
-        const decoder = try onnx.Session.open(env, paths.decoder, null, &.{}, reportFallback);
+        const decoder = try onnx.Session.open(env, paths.decoder);
         errdefer decoder.deinit();
 
-        const concept_vision = try onnx.Session.open(env, paths.concept_vision_encoder, accelerator, options, reportFallback);
+        const concept_vision = try onnx.Session.open(env, paths.concept_vision_encoder);
         errdefer concept_vision.deinit();
-        // The text graph has a large weight set for a tiny input, so moving it
-        // to the GPU costs more VRAM than it saves time. The smaller decoder
-        // benefits from the selected accelerator.
-        const concept_text = try onnx.Session.open(env, paths.concept_text_encoder, null, &.{}, reportFallback);
+
+        const concept_text = try onnx.Session.open(env, paths.concept_text_encoder);
         errdefer concept_text.deinit();
-        const concept_decoder = try onnx.Session.open(env, paths.concept_decoder, accelerator, options, reportFallback);
+
+        const concept_decoder = try onnx.Session.open(env, paths.concept_decoder);
         errdefer concept_decoder.deinit();
+
         const concept_tokenizer = try tokenizer.Tokenizer.init(allocator, paths.concept_tokenizer_json);
 
         return .{
@@ -263,32 +113,10 @@ pub const Model = struct {
             .concept_text = concept_text,
             .concept_decoder = concept_decoder,
             .concept_tokenizer = concept_tokenizer,
-            .preprocessor = if (target.cuda or target.gpu) openPreprocessor() else null,
         };
-    }
-
-    /// The GPU only handles preprocessing, so failing to reach it costs a few
-    /// milliseconds rather than the run: say so and stay on the CPU.
-    fn openPreprocessor() ?gpu.Preprocessor {
-        if (!gpu.available) {
-            std.debug.print("  ! this build has no GPU preprocessing support, so images are preprocessed on the CPU.\n", .{});
-            return null;
-        }
-        var preprocessor = gpu.Preprocessor.init(image_size) catch {
-            std.debug.print("  ! no GPU device for preprocessing, so it runs on the CPU: {s}\n", .{gpu.lastError()});
-            return null;
-        };
-        var name_buf: [128]u8 = undefined;
-        std.debug.print("  GPU:          {s}\n", .{preprocessor.deviceName(&name_buf) catch "GPU"});
-        return preprocessor;
-    }
-
-    fn reportFallback(message: []const u8) void {
-        std.debug.print("  ! falling back to the CPU: {s}\n", .{message});
     }
 
     pub fn deinit(self: *Model) void {
-        if (self.preprocessor) |*preprocessor| preprocessor.deinit();
         self.concept_tokenizer.deinit();
         self.concept_decoder.deinit();
         self.concept_text.deinit();
@@ -298,13 +126,7 @@ pub const Model = struct {
         self.env.deinit();
     }
 
-    pub fn segment(self: *Model, img: ImageRGB, points: []const Point) !Masks {
-        var embedding = try self.encode(img);
-        defer embedding.deinit();
-        return self.decode(embedding, points);
-    }
-
-    pub fn encode(self: *Model, img: ImageRGB) !Embedding {
+    pub fn encode(self: *Model, img: Image) !Embedding {
         const pixels = try self.preprocess(img);
         defer self.allocator.free(pixels);
 
@@ -365,7 +187,7 @@ pub const Model = struct {
         return Masks.take(self.allocator, results[0], results[1], results[2]);
     }
 
-    pub fn encodeConcept(self: *Model, img: ImageRGB) !ConceptEmbedding {
+    pub fn encodeConcept(self: *Model, img: Image) !ConceptEmbedding {
         const pixels = try self.preprocessConcept(img);
         defer self.allocator.free(pixels);
 
@@ -419,13 +241,11 @@ pub const Model = struct {
         return Masks.takeConcept(self.allocator, results[0], results[2], threshold);
     }
 
-    /// Public so `zig build compare` can run the two preprocessing paths
-    /// against each other; the pipeline calls it on its own.
-    pub fn preprocess(self: *Model, img: ImageRGB) ![]f32 {
+    fn preprocess(self: *Model, img: Image) ![]f32 {
         return self.preprocessNormalized(img, @splat(0.5), @splat(0.5));
     }
 
-    fn preprocessConcept(self: *Model, img: ImageRGB) ![]f32 {
+    fn preprocessConcept(self: *Model, img: Image) ![]f32 {
         return self.preprocessNormalized(
             img,
             .{ 0.485, 0.456, 0.406 },
@@ -433,24 +253,7 @@ pub const Model = struct {
         );
     }
 
-    /// Resizes and normalizes an image into the tensor the encoder takes, on
-    /// the GPU when one was opened for it. A GPU that fails part way through a
-    /// session hands the work back to the CPU for the rest of it.
-    fn preprocessNormalized(self: *Model, img: ImageRGB, mean: [3]f32, deviation: [3]f32) ![]f32 {
-        if (self.preprocessor) |*preprocessor| {
-            const out = try self.allocator.alloc(f32, 3 * image_size * image_size);
-            if (preprocessor.run(img.data, img.width, img.height, mean, deviation, out)) {
-                return out;
-            } else |err| {
-                self.allocator.free(out);
-                std.debug.print("  ! CUDA preprocessing failed ({t}), moving it to the CPU: {s}\n", .{
-                    err,
-                    gpu.lastError(),
-                });
-                preprocessor.deinit();
-                self.preprocessor = null;
-            }
-        }
+    fn preprocessNormalized(self: *Model, img: Image, mean: [3]f32, deviation: [3]f32) ![]f32 {
         return preprocessCpu(self.allocator, img, mean, deviation);
     }
 };
@@ -558,11 +361,6 @@ pub const Masks = struct {
         self.allocator.free(self.scores);
     }
 
-    pub fn plane(self: Masks, index: usize) []const f32 {
-        const stride = self.width * self.height;
-        return self.logits[index * stride ..][0..stride];
-    }
-
     pub fn best(self: Masks) usize {
         if (self.count == 0) return 0;
         var winner: usize = 0;
@@ -584,7 +382,8 @@ fn max(values: []const f32) f32 {
 }
 
 /// The CPU path, and the reference the CUDA kernel is checked against.
-fn preprocessCpu(allocator: std.mem.Allocator, img: ImageRGB, mean: [3]f32, deviation: [3]f32) ![]f32 {
+fn preprocessCpu(allocator: std.mem.Allocator, img: Image, mean: [3]f32, deviation: [3]f32) ![]f32 {
+    const pixels = img.pixels.rgb24;
     const plane_size = image_size * image_size;
     const out = try allocator.alloc(f32, 3 * plane_size);
     errdefer allocator.free(out);
@@ -593,8 +392,14 @@ fn preprocessCpu(allocator: std.mem.Allocator, img: ImageRGB, mean: [3]f32, devi
     defer allocator.free(source);
 
     for (0..3) |channel| {
-        for (source, 0..) |*v, i| {
-            v.* = @as(f32, @floatFromInt(img.data[i * 3 + channel])) / 255.0;
+        for (source, pixels) |*v, px| {
+            const byte: u8 = switch (channel) {
+                0 => px.r,
+                1 => px.g,
+                2 => px.b,
+                else => unreachable,
+            };
+            v.* = @as(f32, @floatFromInt(byte)) / 255.0;
         }
 
         const resized = try resample.bilinear(
@@ -611,4 +416,8 @@ fn preprocessCpu(allocator: std.mem.Allocator, img: ImageRGB, mean: [3]f32, devi
         for (target, resized) |*v, r| v.* = (r - mean[channel]) / deviation[channel];
     }
     return out;
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }

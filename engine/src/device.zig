@@ -80,6 +80,9 @@ pub const Device = struct {
     /// gathers for them out of threadgroup memory.
     conv2d_gemm_tensor: ?driver.Function,
     matmul_nbits: driver.Function,
+    /// Dequantizes one weight tile into threadgroup memory and takes its
+    /// product on the Apple neural accelerators.
+    matmul_nbits_tensor: ?driver.Function,
     cumulative_sum: driver.Function,
     max_pool2d: driver.Function,
     sum_axes: driver.Function,
@@ -136,6 +139,7 @@ pub const Device = struct {
             .conv2d_gemm_xmx = module.function("conv2dGemmXmx") catch null,
             .conv2d_gemm_tensor = module.function("conv2dGemmTensor") catch null,
             .matmul_nbits = try module.function("matmulNBits"),
+            .matmul_nbits_tensor = module.function("matmulNBitsTensor") catch null,
             .cumulative_sum = try module.function("cumulativeSum"),
             .max_pool2d = try module.function("maxPool2d"),
             .sum_axes = try module.function("sumAxes"),

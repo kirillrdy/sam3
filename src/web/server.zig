@@ -1,6 +1,5 @@
 const std = @import("std");
-const sam3 = @import("../sam3.zig");
-const image_io = @import("../io/image.zig");
+const sam3 = @import("sam3");
 const protocol = @import("protocol.zig");
 const Io = std.Io;
 
@@ -39,8 +38,8 @@ pub fn run(
         .assets = assets,
         .options = options,
     };
-    defer server.dropCache();
-    defer server.dropConceptCache();
+    defer dropCache(&server.cache);
+    defer dropCache(&server.concept_cache);
 
     const address = try Io.net.IpAddress.parseIp4(options.host, options.port);
     var listener = try address.listen(io, .{ .reuse_address = true });
@@ -72,17 +71,8 @@ const Server = struct {
 
     mutex: Io.Mutex = .init,
 
-    cache: ?Cache = null,
-    concept_cache: ?ConceptCache = null,
-
-    const Cache = struct {
-        hash: u64,
-        embedding: sam3.Embedding,
-    };
-    const ConceptCache = struct {
-        hash: u64,
-        embedding: sam3.ConceptEmbedding,
-    };
+    cache: ?Cache(sam3.Embedding) = null,
+    concept_cache: ?Cache(sam3.ConceptEmbedding) = null,
 
     fn converse(self: *Server, stream: Io.net.Stream) void {
         defer stream.close(self.io);
@@ -123,20 +113,10 @@ const Server = struct {
         }
 
         if (std.mem.eql(u8, path, "/")) {
-            return request.respond(self.assets.index_html, .{
-                .extra_headers = &.{
-                    .{ .name = "content-type", .value = "text/html; charset=utf-8" },
-                    .{ .name = "cache-control", .value = "no-store" },
-                },
-            });
+            return serveAsset(request, self.assets.index_html, "text/html; charset=utf-8");
         }
         if (std.mem.eql(u8, path, "/client.wasm")) {
-            return request.respond(self.assets.client_wasm, .{
-                .extra_headers = &.{
-                    .{ .name = "content-type", .value = "application/wasm" },
-                    .{ .name = "cache-control", .value = "no-store" },
-                },
-            });
+            return serveAsset(request, self.assets.client_wasm, "application/wasm");
         }
         if (std.mem.eql(u8, path, "/example.png")) return self.serveExample(request);
 
@@ -198,15 +178,7 @@ const Server = struct {
             secondsSince(self.io, started),
         });
 
-        const payload = try serialize(self.gpa, masks);
-        defer self.gpa.free(payload);
-
-        return request.respond(payload, .{
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "application/octet-stream" },
-                .{ .name = "cache-control", .value = "no-store" },
-            },
-        });
+        return self.respondMasks(request, masks);
     }
 
     fn encode(self: *Server, body: []const u8) !sam3.Embedding {
@@ -217,10 +189,10 @@ const Server = struct {
         // Both encoder embeddings are large GPU allocations. Retain only the
         // prompting mode currently in use so switching modes cannot exhaust
         // device memory.
-        self.dropConceptCache();
+        dropCache(&self.concept_cache);
 
-        var img = try image_io.decode(self.gpa, body);
-        defer img.deinit();
+        var img = try sam3.decode(self.gpa, body);
+        defer img.deinit(self.gpa);
 
         const started = Io.Timestamp.now(self.io, .awake);
         const embedding = try self.model.encode(img);
@@ -230,7 +202,7 @@ const Server = struct {
             secondsSince(self.io, started),
         });
 
-        self.dropCache();
+        dropCache(&self.cache);
         self.cache = .{ .hash = hash, .embedding = embedding };
         return embedding;
     }
@@ -276,6 +248,10 @@ const Server = struct {
             secondsSince(self.io, started),
         });
 
+        return self.respondMasks(request, masks);
+    }
+
+    fn respondMasks(self: *Server, request: *std.http.Server.Request, masks: sam3.Masks) !void {
         const payload = try serialize(self.gpa, masks);
         defer self.gpa.free(payload);
         return request.respond(payload, .{
@@ -291,10 +267,10 @@ const Server = struct {
         if (self.concept_cache) |cached| {
             if (cached.hash == hash) return cached.embedding;
         }
-        self.dropCache();
+        dropCache(&self.cache);
 
-        var img = try image_io.decode(self.gpa, body);
-        defer img.deinit();
+        var img = try sam3.decode(self.gpa, body);
+        defer img.deinit(self.gpa);
 
         const started = Io.Timestamp.now(self.io, .awake);
         const embedding = try self.model.encodeConcept(img);
@@ -304,21 +280,29 @@ const Server = struct {
             secondsSince(self.io, started),
         });
 
-        self.dropConceptCache();
+        dropCache(&self.concept_cache);
         self.concept_cache = .{ .hash = hash, .embedding = embedding };
         return embedding;
     }
-
-    fn dropCache(self: *Server) void {
-        if (self.cache) |*cached| cached.embedding.deinit();
-        self.cache = null;
-    }
-
-    fn dropConceptCache(self: *Server) void {
-        if (self.concept_cache) |*cached| cached.embedding.deinit();
-        self.concept_cache = null;
-    }
 };
+
+fn Cache(comptime Embedding: type) type {
+    return struct { hash: u64, embedding: Embedding };
+}
+
+fn dropCache(cache: anytype) void {
+    if (cache.*) |*cached| cached.embedding.deinit();
+    cache.* = null;
+}
+
+fn serveAsset(request: *std.http.Server.Request, contents: []const u8, content_type: []const u8) !void {
+    return request.respond(contents, .{
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = content_type },
+            .{ .name = "cache-control", .value = "no-store" },
+        },
+    });
+}
 
 fn parseText(query: []const u8, out: []u8) ![]const u8 {
     var fields = std.mem.splitScalar(u8, query, '&');

@@ -224,6 +224,18 @@ const Parser = struct {
     directory: []const u8,
     weights: []align(std.heap.page_size_min) u8 = &.{},
 
+    fn appendF32(self: *Parser, values: *std.ArrayList(f32), r: *Reader, wire: u3) !void {
+        if (wire != 2) return values.append(self.arena, @bitCast(try r.fixed32()));
+        var field = try r.sub();
+        while (!field.eof()) try values.append(self.arena, @bitCast(try field.fixed32()));
+    }
+
+    fn appendI64(self: *Parser, values: *std.ArrayList(i64), r: *Reader, wire: u3) !void {
+        if (wire != 2) return values.append(self.arena, @bitCast(try r.varint()));
+        var field = try r.sub();
+        while (!field.eof()) try values.append(self.arena, @bitCast(try field.varint()));
+    }
+
     fn parseModel(self: *Parser, bytes: []const u8) !Graph {
         var model: Reader = .{ .bytes = bytes };
         while (!model.eof()) {
@@ -306,18 +318,8 @@ const Parser = struct {
                 3 => attribute.i = @bitCast(try r.varint()),
                 4 => attribute.s = try r.slice(),
                 5 => attribute.tensor = try self.parseTensor(try r.sub()),
-                7 => if (f.wire == 2) {
-                    var packed_floats = try r.sub();
-                    while (!packed_floats.eof()) {
-                        try floats.append(self.arena, @bitCast(try packed_floats.fixed32()));
-                    }
-                } else try floats.append(self.arena, @bitCast(try r.fixed32())),
-                8 => if (f.wire == 2) {
-                    var packed_ints = try r.sub();
-                    while (!packed_ints.eof()) {
-                        try ints.append(self.arena, @bitCast(try packed_ints.varint()));
-                    }
-                } else try ints.append(self.arena, @bitCast(try r.varint())),
+                7 => try self.appendF32(&floats, &r, f.wire),
+                8 => try self.appendI64(&ints, &r, f.wire),
                 else => try r.skip(f.wire),
             }
         }
@@ -344,19 +346,10 @@ const Parser = struct {
         while (!r.eof()) {
             const f = try r.field();
             switch (f.number) {
-                1 => if (f.wire == 2) {
-                    var packed_dims = try r.sub();
-                    while (!packed_dims.eof()) try dims.append(self.arena, @bitCast(try packed_dims.varint()));
-                } else try dims.append(self.arena, @bitCast(try r.varint())),
+                1 => try self.appendI64(&dims, &r, f.wire),
                 2 => tensor.dtype = @enumFromInt(try r.varint()),
-                4 => if (f.wire == 2) {
-                    var packed_floats = try r.sub();
-                    while (!packed_floats.eof()) try typed_f32.append(self.arena, @bitCast(try packed_floats.fixed32()));
-                } else try typed_f32.append(self.arena, @bitCast(try r.fixed32())),
-                7 => if (f.wire == 2) {
-                    var packed_ints = try r.sub();
-                    while (!packed_ints.eof()) try typed_i64.append(self.arena, @bitCast(try packed_ints.varint()));
-                } else try typed_i64.append(self.arena, @bitCast(try r.varint())),
+                4 => try self.appendF32(&typed_f32, &r, f.wire),
+                7 => try self.appendI64(&typed_i64, &r, f.wire),
                 8 => tensor.name = try r.slice(),
                 9 => tensor.data = try r.slice(),
                 13 => {

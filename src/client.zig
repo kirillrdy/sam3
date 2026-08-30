@@ -1,21 +1,25 @@
 const std = @import("std");
-const image_io = @import("io/image.zig");
+const zigimg = @import("zigimg");
 const resample = @import("resample.zig");
-const visualization = @import("io/visualization.zig");
 const protocol = @import("web/protocol.zig");
-const Point = @import("point.zig").Point;
-const ImageRGB = image_io.ImageRGB;
-const RGB = image_io.RGB;
+
+const Point = struct {
+    x: f32,
+    y: f32,
+    label: i64 = 1,
+};
+
+const Rgb24 = zigimg.color.Rgb24;
 
 const gpa = std.heap.page_allocator;
 
-const mask_color: RGB = .{ .r = 0, .g = 220, .b = 100 };
+const mask_color: Rgb24 = .{ .r = 0, .g = 220, .b = 100 };
 const mask_alpha = 0.5;
 const marker_radius = 7;
 
 const max_points = 32;
 
-var image: ?ImageRGB = null;
+var image: ?zigimg.Image = null;
 
 var frame: []u8 = &.{};
 
@@ -59,9 +63,11 @@ export fn dealloc(ptr: [*]u8, len: u32) void {
 }
 
 export fn loadImage(ptr: [*]const u8, len: u32) i32 {
-    const decoded = image_io.decode(gpa, ptr[0..len]) catch return -1;
+    var decoded = zigimg.Image.fromMemory(gpa, ptr[0..len]) catch return -1;
+    errdefer decoded.deinit(gpa);
+    decoded.convert(gpa, .rgb24) catch return -1;
 
-    if (image) |*old| old.deinit();
+    if (image) |*old| old.deinit(gpa);
     gpa.free(frame);
     masks.clear();
     points_len = 0;
@@ -69,7 +75,7 @@ export fn loadImage(ptr: [*]const u8, len: u32) i32 {
 
     image = decoded;
     frame = gpa.alloc(u8, decoded.width * decoded.height * 4) catch {
-        image.?.deinit();
+        image.?.deinit(gpa);
         image = null;
         frame = &.{};
         return -1;
@@ -212,14 +218,9 @@ export fn bestMask() u32 {
 export fn render(index: i32) void {
     const img = image orelse return;
 
-    var canvas: ImageRGB = .{
-        .width = img.width,
-        .height = img.height,
-        .data = gpa.alloc(u8, img.data.len) catch return,
-        .allocator = gpa,
-    };
-    defer canvas.deinit();
-    @memcpy(canvas.data, img.data);
+    var canvas = zigimg.Image.create(gpa, img.width, img.height, .rgb24) catch return;
+    defer canvas.deinit(gpa);
+    @memcpy(canvas.pixels.rgb24, img.pixels.rgb24);
 
     if (index >= 0 and @as(usize, @intCast(index)) < masks.count) {
         if (resample.bilinear(
@@ -231,35 +232,83 @@ export fn render(index: i32) void {
             img.height,
         )) |mask| {
             defer gpa.free(mask);
-            visualization.overlayMask(&canvas, mask, mask_color, mask_alpha);
+            overlayMask(&canvas, mask, mask_color, mask_alpha);
         } else |_| {}
     }
 
-    for (points[0..points_len]) |p| visualization.drawPointMarker(&canvas, p, marker_radius);
+    for (points[0..points_len]) |p| drawPointMarker(&canvas, p, marker_radius);
 
-    for (0..img.width * img.height) |i| {
-        frame[i * 4 + 0] = canvas.data[i * 3 + 0];
-        frame[i * 4 + 1] = canvas.data[i * 3 + 1];
-        frame[i * 4 + 2] = canvas.data[i * 3 + 2];
+    for (canvas.pixels.rgb24, 0..) |px, i| {
+        frame[i * 4 + 0] = px.r;
+        frame[i * 4 + 1] = px.g;
+        frame[i * 4 + 2] = px.b;
         frame[i * 4 + 3] = 255;
     }
 }
 
-fn testPng(allocator: std.mem.Allocator, buffer: []u8, width: usize, height: usize, color: RGB) ![]u8 {
-    const zigimg = @import("zigimg");
+fn overlayMask(img: *zigimg.Image, mask: []const f32, color: Rgb24, alpha: f32) void {
+    const pixels = img.pixels.rgb24;
+    std.debug.assert(mask.len == pixels.len);
 
-    var source = try zigimg.Image.create(allocator, width, height, .rgb24);
-    defer source.deinit(allocator);
-    for (source.pixels.rgb24) |*pixel| pixel.* = .{ .r = color.r, .g = color.g, .b = color.b };
+    const tint = [3]f32{
+        @floatFromInt(color.r),
+        @floatFromInt(color.g),
+        @floatFromInt(color.b),
+    };
+    const keep = 1.0 - alpha;
 
-    return source.writeToMemory(allocator, buffer, .{ .png = .{} });
+    for (mask, pixels) |logit, *px| {
+        if (logit <= 0.0) continue;
+        const r: f32 = @floatFromInt(px.r);
+        const g: f32 = @floatFromInt(px.g);
+        const b: f32 = @floatFromInt(px.b);
+        px.r = @intFromFloat(r * keep + tint[0] * alpha);
+        px.g = @intFromFloat(g * keep + tint[1] * alpha);
+        px.b = @intFromFloat(b * keep + tint[2] * alpha);
+    }
 }
 
-fn testOpen(png: []const u8) !void {
-    const ptr = alloc(@intCast(png.len)) orelse return error.OutOfMemory;
-    defer dealloc(ptr, @intCast(png.len));
-    @memcpy(ptr[0..png.len], png);
-    try std.testing.expectEqual(@as(i32, 0), loadImage(ptr, @intCast(png.len)));
+fn drawPointMarker(img: *zigimg.Image, point: Point, radius: usize) void {
+    const cx: isize = @intFromFloat(point.x * @as(f32, @floatFromInt(img.width)));
+    const cy: isize = @intFromFloat(point.y * @as(f32, @floatFromInt(img.height)));
+    const color: Rgb24 = if (point.label == 1)
+        .{ .r = 0, .g = 255, .b = 0 }
+    else
+        .{ .r = 255, .g = 0, .b = 0 };
+
+    const r: isize = @intCast(radius);
+    var dy = -r;
+    while (dy <= r) : (dy += 1) {
+        var dx = -r;
+        while (dx <= r) : (dx += 1) {
+            if (dx * dx + dy * dy > r * r) continue;
+            const px = cx + dx;
+            const py = cy + dy;
+            if (px < 0 or py < 0) continue;
+            if (px >= @as(isize, @intCast(img.width)) or py >= @as(isize, @intCast(img.height))) continue;
+            const idx: usize = @intCast(py * @as(isize, @intCast(img.width)) + px);
+            img.pixels.rgb24[idx] = color;
+        }
+    }
+}
+
+fn testPpm(buffer: []u8, width: usize, height: usize, color: Rgb24) []const u8 {
+    var writer = std.Io.Writer.fixed(buffer);
+    writer.print("P6\n{d} {d}\n255\n", .{ width, height }) catch unreachable;
+    const header_len = writer.end;
+    for (0..width * height) |i| {
+        buffer[header_len + i * 3 + 0] = color.r;
+        buffer[header_len + i * 3 + 1] = color.g;
+        buffer[header_len + i * 3 + 2] = color.b;
+    }
+    return buffer[0 .. header_len + width * height * 3];
+}
+
+fn testOpen(image_bytes: []const u8) !void {
+    const ptr = alloc(@intCast(image_bytes.len)) orelse return error.OutOfMemory;
+    defer dealloc(ptr, @intCast(image_bytes.len));
+    @memcpy(ptr[0..image_bytes.len], image_bytes);
+    try std.testing.expectEqual(@as(i32, 0), loadImage(ptr, @intCast(image_bytes.len)));
 }
 
 test "a click is normalised against the canvas it landed on, not the image" {
@@ -283,10 +332,10 @@ test "a click is normalised against the canvas it landed on, not the image" {
 
 test "an image the page opens reaches the canvas as RGBA" {
     var buffer: [8192]u8 = undefined;
-    const png = try testPng(std.testing.allocator, &buffer, 3, 2, .{ .r = 10, .g = 20, .b = 30 });
+    const ppm = testPpm(&buffer, 3, 2, .{ .r = 10, .g = 20, .b = 30 });
 
     clearPoints();
-    try testOpen(png);
+    try testOpen(ppm);
 
     try std.testing.expectEqual(@as(u32, 3), imageWidth());
     try std.testing.expectEqual(@as(u32, 2), imageHeight());
@@ -299,8 +348,8 @@ test "an image the page opens reaches the canvas as RGBA" {
 
 test "a file that is not an image leaves the canvas alone" {
     var buffer: [8192]u8 = undefined;
-    const png = try testPng(std.testing.allocator, &buffer, 3, 2, .{ .r = 10, .g = 20, .b = 30 });
-    try testOpen(png);
+    const ppm = testPpm(&buffer, 3, 2, .{ .r = 10, .g = 20, .b = 30 });
+    try testOpen(ppm);
 
     const junk = "not an image at all";
     const ptr = alloc(junk.len).?;
@@ -314,10 +363,10 @@ test "a file that is not an image leaves the canvas alone" {
 
 test "a response becomes hypotheses, and the chosen one is tinted over the frame" {
     var buffer: [8192]u8 = undefined;
-    const png = try testPng(std.testing.allocator, &buffer, 1, 1, .{ .r = 200, .g = 10, .b = 10 });
+    const ppm = testPpm(&buffer, 1, 1, .{ .r = 200, .g = 10, .b = 10 });
 
     clearPoints();
-    try testOpen(png);
+    try testOpen(ppm);
 
     const header: protocol.Header = .{ .count = 2, .width = 1, .height = 1, .object_score = 2.5 };
     var response: [protocol.Header.size + 2 * 4 + 2 * 4]u8 = undefined;

@@ -1633,6 +1633,85 @@ kernel void matmulTensor(
     }
 }
 
+// A quantized product on the same tensor units. The operation cannot read
+// packed nibbles, so each work group expands only the 64x64 weight tile it is
+// about to consume. Keeping that tile in threadgroup memory avoids both a
+// graph-sized dequantized copy and repeating the unpack for every output row.
+#define QN_TILE_M 128
+#define QN_TILE_N 64
+#define QN_TILE_K 64
+#define QN_GROUPS 8
+#define QN_THREADS (QN_GROUPS * 32)
+
+kernel void matmulNBitsTensor(
+    device const real* a [[buffer(0)]],
+    device const uchar* quantized [[buffer(1)]],
+    device const real* scales [[buffer(2)]],
+    device real* out [[buffer(3)]],
+    constant uint& m [[buffer(4)]],
+    constant uint& n [[buffer(5)]],
+    constant uint& k [[buffer(6)]],
+    constant uint& block_shift [[buffer(7)]],
+    constant uint& blocks_per_row [[buffer(8)]],
+    uint3 group_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]
+) {
+    threadgroup real weights[QN_TILE_K * QN_TILE_N];
+
+    uint row_base = group_id.y * QN_TILE_M;
+    uint col_base = group_id.x * QN_TILE_N;
+    uint block_mask = (1u << block_shift) - 1u;
+    uint blob = 1u << (block_shift - 1u);
+    uint row_stride = blocks_per_row * blob;
+
+    constexpr auto descriptor = matmul2d_descriptor(
+        QN_TILE_M, QN_TILE_N, QN_TILE_K, false, false, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descriptor, execution_simdgroups<QN_GROUPS>> op;
+
+    auto left = tensor(const_cast<device real*>(a), dextents<int32_t, 2>(k, m));
+    auto staged = tensor((threadgroup real*)weights, dextents<int32_t, 2>(QN_TILE_N, QN_TILE_K));
+    auto result = tensor(out, dextents<int32_t, 2>(n, m));
+    auto first = left.slice(0, row_base);
+    auto target = result.slice(col_base, row_base);
+
+    auto acc = op.get_destination_cooperative_tensor<decltype(first), decltype(staged), float>();
+    #pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < acc.get_capacity(); i++) {
+        if (acc.is_valid_element(i)) acc[i] = 0.0f;
+    }
+
+    for (uint step = 0; step < k; step += QN_TILE_K) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = thread_index; idx < QN_TILE_K * QN_TILE_N; idx += QN_THREADS) {
+            uint depth = idx / QN_TILE_N;
+            uint column = idx % QN_TILE_N;
+            uint weight_row = col_base + column;
+            uint along = step + depth;
+            real value = 0;
+            if (weight_row < n && along < k) {
+                uint block = along >> block_shift;
+                uint within = along & block_mask;
+                uchar packed = quantized[weight_row * row_stride + block * blob + (within >> 1)];
+                uchar nibble = (within & 1) ? (packed >> 4) : (packed & 0x0f);
+                value = (real)(((float)nibble - 8.0f) * (float)scales[weight_row * blocks_per_row + block]);
+            }
+            weights[idx] = value;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto tile = left.slice(step, row_base);
+        op.run(tile, staged, acc);
+    }
+
+    auto narrowed = op.get_destination_cooperative_tensor<decltype(first), decltype(staged), real>();
+    #pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < acc.get_capacity(); i++) {
+        if (acc.is_valid_element(i)) narrowed[i] = (real)acc[i];
+    }
+    narrowed.store(target);
+}
+
 // A convolution is the same product over a window that is gathered rather than
 // stored, so the operand the graph does not hold has to be built somewhere the
 // operation can read it: `matmul2d` takes threadgroup tensors as well as device

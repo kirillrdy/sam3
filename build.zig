@@ -1,20 +1,18 @@
 const std = @import("std");
-const onnxruntime = @import("onnxruntime");
-const cuda_build = @import("cuda");
+const engine_build = @import("engine");
 
-/// Where the model runs. `cuda`, `opencl`, and `metal` select the in-tree graph runtime;
-/// the other values are ONNX Runtime execution providers.
-const Device = enum { cpu, npu, gpu, opencl, metal, webgpu, cuda };
-
-const webgpu_version = "0.2.1";
-const webgpu_url = "https://files.pythonhosted.org/packages/f4/c4/f7de789c43f8a25468c0e5d4a69c28cfb3c29c84c2556c1e6e7dd4c4cee4/onnxruntime_ep_webgpu-0.2.1-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl";
-const webgpu_sha256 = "3ba8e49e09bac60501e71e66a5d8376f5e5fa71b94d71fe90330c4487eb0bd82";
+/// Where the model runs on the native graph runtime.
+const Device = enum { cuda, opencl, metal };
 
 const ModelAsset = struct {
     name: []const u8,
     sha256: []const u8,
     label: []const u8,
 };
+
+fn modelAsset(name: []const u8, sha256: []const u8, label: []const u8) ModelAsset {
+    return .{ .name = name, .sha256 = sha256, .label = label };
+}
 
 const ModelFetch = struct {
     path: []const u8,
@@ -57,36 +55,37 @@ fn addHfFetch(
     return .{ .path = path, .run = run };
 }
 
+fn dependOnFetches(step: *std.Build.Step, fetches: []const ModelFetch) void {
+    for (fetches) |fetch| step.dependOn(&fetch.run.step);
+}
+
+fn installFetch(b: *std.Build, step: *std.Build.Step, fetch: ModelFetch, destination: []const u8) void {
+    const install = b.addInstallFile(.{ .cwd_relative = fetch.path }, destination);
+    install.step.dependOn(&fetch.run.step);
+    step.dependOn(&install.step);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const default_device: Device = if (target.result.os.tag.isDarwin()) .metal else .opencl;
     const device = b.option(
         Device,
         "device",
-        "Which device to run the model on: cpu, Intel npu/gpu, native Intel opencl, Apple metal, cross-vendor webgpu, or nvidia cuda (default: cpu)",
-    ) orelse .cpu;
+        "Which device to run the model on: native Intel opencl, Apple metal, or nvidia cuda",
+    ) orelse default_device;
 
-    const is_cuda = device == .cuda;
-    const is_opencl = device == .opencl;
-    const is_metal = device == .metal;
-    const native_runtime = is_cuda or is_opencl or is_metal;
-    if (is_metal and !target.result.os.tag.isDarwin()) {
+    if (device == .metal and !target.result.os.tag.isDarwin()) {
         std.log.err("the Metal backend requires an Apple target", .{});
         std.process.exit(1);
     }
 
-    const with_cuda = b.option(
-        bool,
-        "cuda",
-        "Preprocess images on an NVIDIA GPU through the CUDA driver API, on a build that is otherwise ONNX Runtime's (default: false; implied by -Ddevice=cuda)",
-    ) orelse false;
-
     const cuda_arch = b.option(
         []const u8,
         "sm",
-        "Compute capability the CUDA kernels are built for (default: " ++ cuda_build.default_arch ++ ")",
-    ) orelse cuda_build.default_arch;
+        "Compute capability the CUDA kernels are built for (default: " ++ engine_build.default_cuda_arch ++ ")",
+    ) orelse engine_build.default_cuda_arch;
 
     // What the in-tree runtime stores a float tensor as. Half is the default
     // on OpenCL and Metal, where nearly every operator is bound by how many
@@ -95,25 +94,7 @@ pub fn build(b: *std.Build) void {
         bool,
         "half",
         "Store float tensors on the device as halves (default: true with -Ddevice=opencl or metal)",
-    ) orelse (is_opencl or is_metal);
-
-    const untested_npu = b.option(
-        bool,
-        "untested-npu",
-        "Use the NPU even on a generation this has not been run on (default: false)",
-    ) orelse false;
-
-    const device_library_path = b.option(
-        []const []const u8,
-        "device-library-path",
-        "Directory holding the device's own libraries -- the Level Zero loader, the NPU driver, the GPU's OpenCL driver -- for when `run` does not find them itself",
-    ) orelse &.{};
-
-    const opencl_driver_path = b.option(
-        []const u8,
-        "opencl-driver",
-        "Path to the Intel GPU's OpenCL driver (libigdrcl.so), for when there is no ICD registry naming it and `run` does not find it itself",
-    );
+    ) orelse (device != .cuda);
 
     const host = b.option(
         []const u8,
@@ -127,31 +108,13 @@ pub fn build(b: *std.Build) void {
         "Port the web UI listens on (default: 3000)",
     ) orelse 3000;
 
-    const with_openvino = (device == .npu or device == .gpu) and target.result.os.tag == .linux;
-    const with_coreml = !native_runtime and device != .cpu and target.result.os.tag.isDarwin();
-    const with_webgpu = device == .webgpu;
-    if (with_webgpu and (target.result.os.tag != .linux or target.result.cpu.arch != .x86_64)) {
-        std.log.err("the pinned WebGPU provider currently supports x86_64-linux only", .{});
-        std.process.exit(1);
-    }
-    const ort = if (native_runtime) null else b.dependency("onnxruntime", .{
-        .target = target,
-        .optimize = optimize,
-        .openvino = with_openvino,
-    });
-
-    var runtime_paths: std.ArrayList([]const u8) = .empty;
-    if (with_openvino) {
-        runtime_paths.appendSlice(b.allocator, onnxruntime.openvinoRuntimeLibraryPaths(b)) catch @panic("OOM");
-    }
-
     const zigimg = b.dependency("zigimg", .{
         .target = target,
         .optimize = optimize,
     });
 
     const mod = b.addModule("sam3", .{
-        .root_source_file = b.path("src/root.zig"),
+        .root_source_file = b.path("src/sam3.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -159,167 +122,15 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Keep the model layer independent of the executor: it imports `runtime`
-    // and never learns which one it got. ONNX Runtime is used for CPU/NPU;
-    // the native engine runs directly on the GPU (NVIDIA CUDA, Intel OpenCL,
-    // or Apple Metal).
-    if (native_runtime) {
-        const BackendEnum = enum { cuda, opencl, metal };
-        const engine = b.dependency("engine", .{
-            .target = target,
-            .optimize = optimize,
-            .backend = if (is_cuda) BackendEnum.cuda else if (is_opencl) BackendEnum.opencl else BackendEnum.metal,
-            .sm = cuda_arch,
-            .half = half,
-        });
-        mod.addImport("runtime", engine.module("engine"));
-    } else {
-        const ort_runtime = b.createModule(.{
-            .root_source_file = b.path("src/onnx.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        ort_runtime.linkLibrary(ort.?.artifact("onnxruntime"));
-        mod.addImport("runtime", ort_runtime);
-    }
-
-    const text_trace = b.addExecutable(.{
-        .name = "text-trace",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/text-trace.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "sam3", .module = mod }},
-        }),
+    const engine = b.dependency("engine", .{
+        .target = target,
+        .optimize = optimize,
+        .backend = device,
+        .sm = cuda_arch,
+        .half = half,
     });
-    const run_text_trace = b.addRunArtifact(text_trace);
-    if (b.args) |args| run_text_trace.addArgs(args);
-    b.step("trace-text", "Write the text encoder output for diagnosis").dependOn(&run_text_trace.step);
+    mod.addImport("runtime", engine.module("engine"));
 
-    const tensor_probe = b.addExecutable(.{
-        .name = "tensor-probe",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/tensor-probe.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "sam3", .module = mod }},
-        }),
-    });
-    const run_tensor_probe = b.addRunArtifact(tensor_probe);
-    if (b.args) |args| run_tensor_probe.addArgs(args);
-    b.step("probe", "TEMP: dump named intermediate tensors").dependOn(&run_tensor_probe.step);
-
-    const concept_trace = b.addExecutable(.{
-        .name = "concept-vision-trace",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/concept-vision-trace.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "sam3", .module = mod }},
-        }),
-    });
-    const run_concept_trace = b.addRunArtifact(concept_trace);
-    if (b.args) |args| run_concept_trace.addArgs(args);
-    b.step("trace-concept", "Write the concept vision encoder outputs for diagnosis").dependOn(&run_concept_trace.step);
-
-    const decoder_trace = b.addExecutable(.{
-        .name = "concept-decoder-trace",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/concept-decoder-trace.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "sam3", .module = mod }},
-        }),
-    });
-    const run_decoder_trace = b.addRunArtifact(decoder_trace);
-    if (b.args) |args| run_decoder_trace.addArgs(args);
-    b.step("trace-decoder", "Run the concept decoder from captured inputs").dependOn(&run_decoder_trace.step);
-
-    const test_lookup = b.addExecutable(.{
-        .name = "test-lookup",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/test-lookup.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "sam3", .module = mod }},
-        }),
-    });
-    const run_test_lookup = b.addRunArtifact(test_lookup);
-    if (b.args) |args| run_test_lookup.addArgs(args);
-    b.step("test-lookup", "Run test lookup on cat.png").dependOn(&run_test_lookup.step);
-
-    // The GPU preprocessing path is a swappable module, so nothing else in
-    // sam3 needs to know whether this build can talk to a GPU at all.
-    if (with_cuda or is_cuda) {
-        const cuda_dep = b.dependency("cuda", .{ .target = target, .optimize = optimize });
-        const kernels = cuda_build.addPtxFor(b, cuda_dep, .{
-            .root_source_file = b.path("src/gpu/kernels.zig"),
-            .arch = cuda_arch,
-            .optimize = optimize,
-        });
-        const backend = b.createModule(.{
-            .root_source_file = b.path("src/gpu/cuda.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "cuda", .module = cuda_dep.module("cuda") }},
-        });
-        backend.addAnonymousImport("kernels.ptx", .{ .root_source_file = kernels });
-        mod.addImport("gpu", backend);
-    } else if (is_opencl) {
-        const opencl_dep = b.dependency("opencl", .{ .target = target, .optimize = optimize });
-        const backend = b.createModule(.{
-            .root_source_file = b.path("src/gpu/opencl.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "opencl", .module = opencl_dep.module("opencl") }},
-        });
-        mod.addImport("gpu", backend);
-    } else {
-        mod.addImport("gpu", b.createModule(.{
-            .root_source_file = b.path("src/gpu/disabled.zig"),
-            .target = target,
-            .optimize = optimize,
-        }));
-    }
-
-    var openvino_provider_path: []const u8 = "";
-    var provider_cache_path: []const u8 = "";
-    if (with_openvino) {
-        provider_cache_path = b.cache_root.join(b.allocator, &.{ "sam3", "openvino-cache" }) catch @panic("OOM");
-
-        onnxruntime.linkStdCxx(b, mod);
-
-        b.getInstallStep().dependOn(&b.addInstallArtifact(
-            ort.?.artifact("onnxruntime_providers_shared"),
-            .{ .dest_dir = .{ .override = .bin } },
-        ).step);
-
-        const provider = b.addInstallArtifact(ort.?.artifact("onnxruntime_providers_openvino"), .{});
-        b.getInstallStep().dependOn(&provider.step);
-        b.getInstallStep().dependOn(&b.addInstallArtifact(
-            ort.?.artifact("onnxruntime_providers_openvino"),
-            .{ .dest_dir = .{ .override = .bin } },
-        ).step);
-        openvino_provider_path = b.getInstallPath(.lib, "libonnxruntime_providers_openvino.so");
-    }
-    if (with_coreml) {
-        provider_cache_path = b.cache_root.join(b.allocator, &.{ "sam3", "coreml-cache" }) catch @panic("OOM");
-    }
-
-    if (device == .gpu and with_openvino) {
-        b.installArtifact(ort.?.artifact("OpenCL"));
-        runtime_paths.append(b.allocator, b.getInstallPath(.lib, "")) catch @panic("OOM");
-    }
-    if (with_webgpu) {
-        for ([_][]const u8{
-            "/run/current-system/sw/lib",
-            "/run/current-system/sw/share/google/chrome",
-            "/run/opengl-driver/lib",
-        }) |dir| {
-            std.Io.Dir.accessAbsolute(b.graph.io, dir, .{}) catch continue;
-            runtime_paths.append(b.allocator, dir) catch @panic("OOM");
-        }
-    }
 
     const fetch_exe = b.addExecutable(.{
         .name = "fetch",
@@ -331,43 +142,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    var webgpu_provider_path: []const u8 = "";
-    if (with_webgpu) {
-        const unzip_exe = b.addExecutable(.{
-            .name = "unzip",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("tools/unzip.zig"),
-                .target = b.graph.host,
-                .optimize = optimize,
-                .strip = if (optimize == .ReleaseFast) true else null,
-            }),
-        });
-
-        const wheel = b.cache_root.join(b.allocator, &.{
-            "sam3",
-            "webgpu",
-            "onnxruntime_ep_webgpu-" ++ webgpu_version ++ ".whl",
-        }) catch @panic("OOM");
-        const fetch_webgpu = b.addRunArtifact(fetch_exe);
-        fetch_webgpu.has_side_effects = true;
-        fetch_webgpu.addArgs(&.{
-            "--url",    webgpu_url,
-            "--out",    wheel,
-            "--sha256", webgpu_sha256,
-            "--label",  "ONNX Runtime WebGPU provider (4.2 MiB)",
-        });
-
-        const unzip_webgpu = b.addRunArtifact(unzip_exe);
-        unzip_webgpu.addFileArg(.{ .cwd_relative = wheel });
-        const unpacked = unzip_webgpu.addOutputDirectoryArg("onnxruntime-webgpu-" ++ webgpu_version);
-        unzip_webgpu.step.dependOn(&fetch_webgpu.step);
-        const provider = unpacked.path(b, "onnxruntime_ep_webgpu/libonnxruntime_providers_webgpu.so");
-
-        const install_provider = b.addInstallFile(provider, "lib/libonnxruntime_providers_webgpu.so");
-        b.getInstallStep().dependOn(&install_provider.step);
-        webgpu_provider_path = b.getInstallPath(.lib, "libonnxruntime_providers_webgpu.so");
-    }
-
     const hf_repo = b.option(
         []const u8,
         "hf-repo",
@@ -376,74 +150,26 @@ pub fn build(b: *std.Build) void {
 
     const weights_step = b.step("fetch-weights", "Download the SAM 3 tracker ONNX export");
 
-    const fp16_model = addModelFetch(b, fetch_exe, hf_repo, .{
-        .name = "vision_encoder_fp16.onnx",
-        .sha256 = "f8c52be6de99124bb17f25792054406abc482ce3502166f948d5c5849cd14d02",
-        .label = "vision_encoder_fp16.onnx",
-    });
-    const fp16_data = addModelFetch(b, fetch_exe, hf_repo, .{
-        .name = "vision_encoder_fp16.onnx_data",
-        .sha256 = "4b021a4d3068c9e9153f2f2fcc9e6d280156228671c00ab6c2ddfa737da7f151",
-        .label = "vision_encoder_fp16.onnx_data (892 MiB)",
-    });
+    const tracker_assets = [_]ModelAsset{
+        modelAsset("vision_encoder_fp16.onnx", "f8c52be6de99124bb17f25792054406abc482ce3502166f948d5c5849cd14d02", "vision_encoder_fp16.onnx"),
+        modelAsset("vision_encoder_fp16.onnx_data", "4b021a4d3068c9e9153f2f2fcc9e6d280156228671c00ab6c2ddfa737da7f151", "vision_encoder_fp16.onnx_data (892 MiB)"),
+        modelAsset("vision_encoder.onnx", "9f284aab8c3d8e81e9c79f7b566f9cea43b7bc9afdd920eee2390fb65b3db897", "vision_encoder.onnx"),
+        modelAsset("vision_encoder.onnx_data", "838e1f0b2d0394ed3bd3b3499775dd6676524e1dfc5a7371948a76dcb69e4dd3", "vision_encoder.onnx_data (1.7 GiB)"),
+        modelAsset("prompt_encoder_mask_decoder.onnx", "4f9ac85291d634ae36a21ce940e3c09671cc05b6511966e5d3d96988b12b95f8", "prompt_encoder_mask_decoder.onnx"),
+        modelAsset("prompt_encoder_mask_decoder.onnx_data", "2d870726d484cb496760fd139c21f115cf1b945c6b69583489faa2ac79f1d2ae", "prompt_encoder_mask_decoder.onnx_data (21 MiB)"),
+    };
+    var tracker_fetches: [tracker_assets.len]ModelFetch = undefined;
+    for (tracker_assets, &tracker_fetches) |model_asset, *fetch| fetch.* = addModelFetch(b, fetch_exe, hf_repo, model_asset);
+    const fp16_model = tracker_fetches[0];
+    const fp16_data = tracker_fetches[1];
+    const fp32_model = tracker_fetches[2];
+    const decoder_model = tracker_fetches[4];
 
     const fp16_step = b.step("fp16-model", "Build the checksum-verified FP16 vision encoder in zig-out/models");
-    const install_fp16_model = b.addInstallFile(
-        .{ .cwd_relative = fp16_model.path },
-        "models/vision_encoder_fp16.onnx",
-    );
-    install_fp16_model.step.dependOn(&fp16_model.run.step);
-    fp16_step.dependOn(&install_fp16_model.step);
-    const install_fp16_data = b.addInstallFile(
-        .{ .cwd_relative = fp16_data.path },
-        "models/vision_encoder_fp16.onnx_data",
-    );
-    install_fp16_data.step.dependOn(&fp16_data.run.step);
-    fp16_step.dependOn(&install_fp16_data.step);
+    installFetch(b, fp16_step, fp16_model, "models/vision_encoder_fp16.onnx");
+    installFetch(b, fp16_step, fp16_data, "models/vision_encoder_fp16.onnx_data");
 
-    const fp32_model = addModelFetch(b, fetch_exe, hf_repo, .{
-        .name = "vision_encoder.onnx",
-        .sha256 = "9f284aab8c3d8e81e9c79f7b566f9cea43b7bc9afdd920eee2390fb65b3db897",
-        .label = "vision_encoder.onnx",
-    });
-    const fp32_data = addModelFetch(b, fetch_exe, hf_repo, .{
-        .name = "vision_encoder.onnx_data",
-        .sha256 = "838e1f0b2d0394ed3bd3b3499775dd6676524e1dfc5a7371948a76dcb69e4dd3",
-        .label = "vision_encoder.onnx_data (1.7 GiB)",
-    });
-    const q4_model = addModelFetch(b, fetch_exe, hf_repo, .{
-        .name = "vision_encoder_q4.onnx",
-        .sha256 = "b80cb1cb6ab80efe646ad49ffa11d398af76e8912eb966971932ef2d8e7fe11b",
-        .label = "vision_encoder_q4.onnx",
-    });
-    const q4_data = addModelFetch(b, fetch_exe, hf_repo, .{
-        .name = "vision_encoder_q4.onnx_data",
-        .sha256 = "be632cacb4a82ef8be28285e49821b9dd7f96e3231cb90df631890f367110555",
-        .label = "vision_encoder_q4.onnx_data (352 MiB)",
-    });
-    const decoder_model = addModelFetch(b, fetch_exe, hf_repo, .{
-        .name = "prompt_encoder_mask_decoder.onnx",
-        .sha256 = "4f9ac85291d634ae36a21ce940e3c09671cc05b6511966e5d3d96988b12b95f8",
-        .label = "prompt_encoder_mask_decoder.onnx",
-    });
-    const decoder_data = addModelFetch(b, fetch_exe, hf_repo, .{
-        .name = "prompt_encoder_mask_decoder.onnx_data",
-        .sha256 = "2d870726d484cb496760fd139c21f115cf1b945c6b69583489faa2ac79f1d2ae",
-        .label = "prompt_encoder_mask_decoder.onnx_data (21 MiB)",
-    });
-
-    if (with_coreml) {
-        weights_step.dependOn(&fp16_model.run.step);
-        weights_step.dependOn(&fp16_data.run.step);
-    } else if (with_webgpu) {
-        weights_step.dependOn(&q4_model.run.step);
-        weights_step.dependOn(&q4_data.run.step);
-    } else {
-        weights_step.dependOn(&fp32_model.run.step);
-        weights_step.dependOn(&fp32_data.run.step);
-    }
-    weights_step.dependOn(&decoder_model.run.step);
-    weights_step.dependOn(&decoder_data.run.step);
+    dependOnFetches(weights_step, tracker_fetches[2..]);
 
     const concept_repo = b.option(
         []const u8,
@@ -451,51 +177,25 @@ pub fn build(b: *std.Build) void {
         "Hugging Face repo containing the SAM 3 text-prompt ONNX export",
     ) orelse "danilobukvic/sam3-text-onnx";
     const concept_step = b.step("fetch-concept-weights", "Download the quantized SAM 3 text-prompt export");
-    const concept_vision = addHfFetch(b, fetch_exe, concept_repo, "concept", "vision_encoder_int4.onnx", .{
-        .name = "vision_encoder_int4.onnx",
-        .sha256 = "88edb4602b7e7b2aa282543dea0b25a253bb13d5d7d5debbd19c2fb5e7941ae7",
-        .label = "concept vision encoder (5.6 MiB)",
-    });
-    const concept_vision_data = addHfFetch(b, fetch_exe, concept_repo, "concept", "vision_encoder_int4.onnx.data", .{
-        .name = "vision_encoder_int4.onnx.data",
-        .sha256 = "b89c9156064e926761f29be3f87b160fd34f4c93f1de46593295d155621829a2",
-        .label = "concept vision weights (279 MiB)",
-    });
-    const concept_text = addHfFetch(b, fetch_exe, concept_repo, "concept", "text_encoder_int4.onnx", .{
-        .name = "text_encoder_int4.onnx",
-        .sha256 = "92f824a1841b787dc8dafa8cb8e8dce0c874f8d2d629f6b1c8de88399ede3806",
-        .label = "concept text encoder (2.7 MiB)",
-    });
-    const concept_text_data = addHfFetch(b, fetch_exe, concept_repo, "concept", "text_encoder_int4.onnx.data", .{
-        .name = "text_encoder_int4.onnx.data",
-        .sha256 = "fcf5adcd6ad7b5155409367efde4ee981a5482fd5700191499a666ba4b637db5",
-        .label = "concept text weights (347 MiB)",
-    });
-    const concept_decoder = addHfFetch(b, fetch_exe, concept_repo, "concept", "decoder_int4.onnx", .{
-        .name = "decoder_int4.onnx",
-        .sha256 = "2354b510382d025ab897fa158abe7da94d065c8f880d60aed35b01820361b06d",
-        .label = "concept decoder (19 MiB)",
-    });
-    const concept_tokenizer = addHfFetch(b, fetch_exe, concept_repo, "concept", "tokenizer.json", .{
-        .name = "tokenizer.json",
-        .sha256 = "6d9109cc838977f3ca94a379eec36aecc7c807e1785cd729660ca2fc0171fb35",
-        .label = "concept tokenizer (3.5 MiB)",
-    });
-    for ([_]*std.Build.Step.Run{
-        concept_vision.run,
-        concept_vision_data.run,
-        concept_text.run,
-        concept_text_data.run,
-        concept_decoder.run,
-        concept_tokenizer.run,
-    }) |fetch| concept_step.dependOn(&fetch.step);
+    const concept_assets = [_]ModelAsset{
+        modelAsset("vision_encoder_int4.onnx", "88edb4602b7e7b2aa282543dea0b25a253bb13d5d7d5debbd19c2fb5e7941ae7", "concept vision encoder (5.6 MiB)"),
+        modelAsset("vision_encoder_int4.onnx.data", "b89c9156064e926761f29be3f87b160fd34f4c93f1de46593295d155621829a2", "concept vision weights (279 MiB)"),
+        modelAsset("text_encoder_int4.onnx", "92f824a1841b787dc8dafa8cb8e8dce0c874f8d2d629f6b1c8de88399ede3806", "concept text encoder (2.7 MiB)"),
+        modelAsset("text_encoder_int4.onnx.data", "fcf5adcd6ad7b5155409367efde4ee981a5482fd5700191499a666ba4b637db5", "concept text weights (347 MiB)"),
+        modelAsset("decoder_int4.onnx", "2354b510382d025ab897fa158abe7da94d065c8f880d60aed35b01820361b06d", "concept decoder (19 MiB)"),
+        modelAsset("tokenizer.json", "6d9109cc838977f3ca94a379eec36aecc7c807e1785cd729660ca2fc0171fb35", "concept tokenizer (3.5 MiB)"),
+    };
+    var concept_fetches: [concept_assets.len]ModelFetch = undefined;
+    for (concept_assets, &concept_fetches) |model_asset, *fetch| {
+        fetch.* = addHfFetch(b, fetch_exe, concept_repo, "concept", model_asset.name, model_asset);
+    }
+    dependOnFetches(concept_step, &concept_fetches);
+    const concept_vision = concept_fetches[0];
+    const concept_text = concept_fetches[2];
+    const concept_decoder = concept_fetches[4];
+    const concept_tokenizer = concept_fetches[5];
 
-    const default_vision_path = if (with_coreml)
-        fp16_model.path
-    else if (with_webgpu)
-        q4_model.path
-    else
-        fp32_model.path;
+    const default_vision_path = fp32_model.path;
     const vision_path = b.option(
         []const u8,
         "vision-encoder-path",
@@ -525,15 +225,7 @@ pub fn build(b: *std.Build) void {
     server_options.addOption([]const u8, "concept_text_path", concept_text.path);
     server_options.addOption([]const u8, "concept_decoder_path", concept_decoder.path);
     server_options.addOption([]const u8, "concept_tokenizer_path", concept_tokenizer.path);
-    server_options.addOption([]const u8, "openvino_provider_path", openvino_provider_path);
-    server_options.addOption([]const u8, "webgpu_provider_path", webgpu_provider_path);
-    server_options.addOption([]const u8, "provider_cache_path", provider_cache_path);
     server_options.addOption([]const u8, "example_path", example_path);
-    // The application names devices the way an execution provider does, and
-    // the in-tree runtime enumerates exactly one GPU.
-    server_options.addOption([]const u8, "device", if (native_runtime) "gpu" else @tagName(device));
-    server_options.addOption(bool, "untested_npu", untested_npu);
-    server_options.addOption(bool, "cuda", with_cuda or is_cuda or is_opencl);
     server_options.addOption([]const u8, "host", host);
     server_options.addOption(u16, "port", port);
 
@@ -564,7 +256,7 @@ pub fn build(b: *std.Build) void {
     const web_exe = b.addExecutable(.{
         .name = "sam3-web",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/web/main.zig"),
+            .root_source_file = b.path("main.zig"),
             .target = target,
             .optimize = optimize,
             .strip = if (optimize == .ReleaseFast) true else null,
@@ -578,31 +270,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = client.getEmittedBin(),
     });
     web_exe.root_module.addOptions("build_options", server_options);
-    if (with_openvino or with_webgpu) onnxruntime.linkStdCxx(b, web_exe.root_module);
     b.installArtifact(web_exe);
-
-    const compare_exe = b.addExecutable(.{
-        .name = "sam3-compare",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/compare/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "sam3", .module = mod }},
-        }),
-    });
-    compare_exe.root_module.addOptions("build_options", server_options);
-    if (with_openvino or with_webgpu) onnxruntime.linkStdCxx(b, compare_exe.root_module);
-
-    const compare_step = b.step(
-        "compare",
-        "Segment one image twice, preprocessing on the CPU and on the GPU, and diff the results",
-    );
-    const compare_cmd = b.addRunArtifact(compare_exe);
-    compare_cmd.step.dependOn(weights_step);
-    compare_cmd.step.dependOn(examples_step);
-    compare_cmd.setCwd(b.path("."));
-    if (b.args) |args| compare_cmd.addArgs(args);
-    compare_step.dependOn(&compare_cmd.step);
 
     const run_step = b.step("run", b.fmt("Run the web UI on http://{s}:{d}/", .{ host, port }));
     const run_cmd = b.addRunArtifact(web_exe);
@@ -613,24 +281,20 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(concept_step);
     run_cmd.step.dependOn(examples_step);
     run_cmd.setCwd(b.path("."));
-    if (with_openvino or with_webgpu) {
-        onnxruntime.addOpenVinoRuntimeEnvironment(
-            b,
-            run_cmd,
-            if (with_openvino)
-                std.meta.stringToEnum(onnxruntime.OpenVinoDevice, @tagName(device)).?
-            else
-                .cpu,
-            device_library_path,
-            runtime_paths.items,
-            if (with_openvino) opencl_driver_path else null,
-        );
-    }
 
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
-    const web_tests = b.addTest(.{ .root_module = web_exe.root_module });
+    const web_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/web/server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "sam3", .module = mod },
+            },
+        }),
+    });
     const run_web_tests = b.addRunArtifact(web_tests);
 
     const client_tests = b.addTest(.{

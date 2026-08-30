@@ -8,9 +8,6 @@
     .minimum_zig_version = "0.16.0",
 
     .dependencies = .{
-        .cuda = .{ .path = "cuda" },
-        .opencl = .{ .path = "opencl" },
-        .metal = .{ .path = "metal" },
         .engine = .{ .path = "engine" },
         .zigimg = .{
             .url = "git+https://github.com/nothke/zigimg#581795265e1caee099baae32883c0f9d4f28f81a",
@@ -19,9 +16,6 @@
     },
     .paths = .{
         "build.zig",
-        "cuda",
-        "opencl",
-        "metal",
         "engine",
         "build.zig.zon",
         "src",

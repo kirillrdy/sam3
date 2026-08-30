@@ -7,11 +7,7 @@
 
     .minimum_zig_version = "0.16.0",
 
-    .dependencies = .{
-        .cuda = .{ .path = "../cuda" },
-        .opencl = .{ .path = "../opencl" },
-        .metal = .{ .path = "../metal" },
-    },
+    .dependencies = .{},
 
     .paths = .{
         "build.zig",
