@@ -37,16 +37,6 @@ pub const Context = struct {
         if (current_context != null and current_context.?.ptr == self.ptr) current_context = null;
     }
 
-    pub fn name(self: Context, buf: []u8) Error![]const u8 {
-        const device_name = std.mem.span(c.sam_metal_context_name(self.ptr));
-        if (device_name.len > buf.len) return Error.Metal;
-        @memcpy(buf[0..device_name.len], device_name);
-        return buf[0..device_name.len];
-    }
-
-    pub fn computeCapability(_: Context) Error![2]u32 {
-        return .{ 3, 0 };
-    }
     pub fn makeCurrent(self: Context) Error!void {
         current_context = self;
     }

@@ -28,7 +28,6 @@ typedef struct {
 
 SamMetalContext *sam_metal_context_create(uint32_t ordinal);
 void sam_metal_context_destroy(SamMetalContext *context);
-const char *sam_metal_context_name(SamMetalContext *context);
 int sam_metal_context_synchronize(SamMetalContext *context);
 
 SamMetalModule *sam_metal_module_create(SamMetalContext *context, const char *source);

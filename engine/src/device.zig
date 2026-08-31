@@ -57,6 +57,7 @@ pub const Device = struct {
     /// staging them through local memory, where the driver has them.
     attention_block: ?driver.Function,
     matmul: driver.Function,
+    matmul_post: ?driver.Function,
     /// The same product on the neural accelerators the Apple GPUs carry from
     /// the M5 on, which Metal 4 reaches through its tensor operations.
     matmul_tensor: ?driver.Function,
@@ -94,7 +95,8 @@ pub const Device = struct {
     /// image, so that the product itself can be the one on the matrix engines.
     pixel_shuffle: ?driver.Function,
 
-    pub fn init(ordinal: u32) !Device {
+    pub fn init(io: std.Io, ordinal: u32) !Device {
+        _ = io;
         try driver.init();
         const context = try driver.Context.init(ordinal);
         errdefer context.deinit();
@@ -128,6 +130,7 @@ pub const Device = struct {
             .attention = if (@hasDecl(driver, "is_metal")) null else module.function("attention") catch null,
             .attention_block = if (@hasDecl(driver, "is_metal")) null else module.function("attentionBlock") catch null,
             .matmul = try module.function("matmul"),
+            .matmul_post = module.function("matmulPost") catch null,
             // A build that compiled the kernel out leaves no symbol behind, so
             // failing to find it is the answer rather than an error.
             .matmul_tensor = module.function("matmulTensor") catch null,
@@ -155,14 +158,6 @@ pub const Device = struct {
         self.module.unload();
         self.context.deinit();
         self.* = undefined;
-    }
-
-    pub fn name(self: Device, buffer: []u8) ![]const u8 {
-        return self.context.name(buffer);
-    }
-
-    pub fn capability(self: Device) ![2]u32 {
-        return self.context.computeCapability();
     }
 
     pub fn synchronize(self: Device) !void {

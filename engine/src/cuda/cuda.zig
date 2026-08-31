@@ -22,8 +22,6 @@ const CUstream = *opaque {};
 extern fn cuInit(flags: c_uint) Result;
 extern fn cuGetErrorString(err: Result, str: *[*:0]const u8) Result;
 extern fn cuDeviceGet(device: *Device, ordinal: c_int) Result;
-extern fn cuDeviceGetName(name: [*]u8, len: c_int, dev: Device) Result;
-extern fn cuDeviceGetAttribute(value: *c_int, attribute: c_uint, dev: Device) Result;
 extern fn cuDevicePrimaryCtxRetain(ctx: *CUcontext, dev: Device) Result;
 extern fn cuDevicePrimaryCtxRelease_v2(dev: Device) Result;
 extern fn cuCtxSetCurrent(ctx: CUcontext) Result;
@@ -58,12 +56,6 @@ extern fn cuLaunchKernel(
 const JitOption = enum(c_uint) {
     error_log_buffer = 5,
     error_log_buffer_size_bytes = 6,
-};
-
-const Attribute = enum(c_uint) {
-    max_threads_per_block = 1,
-    compute_capability_major = 75,
-    compute_capability_minor = 76,
 };
 
 var error_buf: [512]u8 = undefined;
@@ -108,26 +100,6 @@ pub const Context = struct {
 
     pub fn deinit(self: Context) void {
         _ = cuDevicePrimaryCtxRelease_v2(self.device);
-    }
-
-    pub fn name(self: Context, buf: []u8) Error![]const u8 {
-        try check(cuDeviceGetName(buf.ptr, @intCast(buf.len), self.device));
-        return std.mem.sliceTo(buf, 0);
-    }
-
-    /// Compute capability as {major, minor} -- `sm_89` for an Ada RTX 4070.
-    pub fn computeCapability(self: Context) Error![2]u32 {
-        var major: c_int = 0;
-        var minor: c_int = 0;
-        try check(cuDeviceGetAttribute(&major, @intFromEnum(Attribute.compute_capability_major), self.device));
-        try check(cuDeviceGetAttribute(&minor, @intFromEnum(Attribute.compute_capability_minor), self.device));
-        return .{ @intCast(major), @intCast(minor) };
-    }
-
-    pub fn maxThreadsPerBlock(self: Context) Error!u32 {
-        var value: c_int = 0;
-        try check(cuDeviceGetAttribute(&value, @intFromEnum(Attribute.max_threads_per_block), self.device));
-        return @intCast(value);
     }
 
     /// CUDA's current context is thread-local. A retained primary context may

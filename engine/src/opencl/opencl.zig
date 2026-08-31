@@ -15,7 +15,6 @@ pub const Error = error{
 
 pub const cl_int = i32;
 pub const cl_uint = u32;
-pub const cl_ulong = u64;
 pub const cl_bitfield = u64;
 pub const cl_device_type = cl_bitfield;
 pub const cl_mem_flags = cl_bitfield;
@@ -24,16 +23,8 @@ pub const cl_context_properties = isize;
 
 pub const CL_SUCCESS: cl_int = 0;
 pub const CL_DEVICE_TYPE_GPU: cl_device_type = 1 << 2;
-pub const CL_DEVICE_NAME: cl_uint = 0x102B;
-pub const CL_DEVICE_VENDOR: cl_uint = 0x102C;
-pub const CL_DEVICE_VERSION: cl_uint = 0x102F;
 pub const CL_PROGRAM_BUILD_LOG: cl_uint = 0x1183;
 pub const CL_MEM_READ_WRITE: cl_mem_flags = 1 << 0;
-pub const CL_MEM_WRITE_ONLY: cl_mem_flags = 1 << 1;
-pub const CL_MEM_READ_ONLY: cl_mem_flags = 1 << 2;
-pub const CL_MEM_USE_HOST_PTR: cl_mem_flags = 1 << 3;
-pub const CL_MEM_ALLOC_HOST_PTR: cl_mem_flags = 1 << 4;
-pub const CL_MEM_COPY_HOST_PTR: cl_mem_flags = 1 << 5;
 
 pub const DevicePtr = ?*anyopaque;
 pub const null_ptr: DevicePtr = null;
@@ -265,16 +256,6 @@ pub const Context = struct {
         if (global_context != null and global_context.?.context == self.context) {
             global_context = null;
         }
-    }
-
-    pub fn name(self: Context, buf: []u8) Error![]const u8 {
-        var size: usize = 0;
-        try check(self.dispatch.clGetDeviceInfo.?(self.device, CL_DEVICE_NAME, buf.len, buf.ptr, &size));
-        return std.mem.sliceTo(buf[0..size], 0);
-    }
-
-    pub fn computeCapability(_: Context) Error![2]u32 {
-        return .{ 2, 0 };
     }
 
     pub fn makeCurrent(self: Context) Error!void {

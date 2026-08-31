@@ -18,7 +18,7 @@
         "build.zig",
         "engine",
         "build.zig.zon",
+        "main.zig",
         "src",
-        "tools",
     },
 }

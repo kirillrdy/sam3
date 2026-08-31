@@ -1,7 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 pub const onnx = @import("runtime");
-pub const resample = @import("resample.zig");
 pub const tokenizer = @import("tokenizer.zig");
 pub const zigimg = @import("zigimg");
 pub const Image = zigimg.Image;
@@ -388,34 +387,71 @@ fn preprocessCpu(allocator: std.mem.Allocator, img: Image, mean: [3]f32, deviati
     const out = try allocator.alloc(f32, 3 * plane_size);
     errdefer allocator.free(out);
 
-    const source = try allocator.alloc(f32, img.width * img.height);
-    defer allocator.free(source);
+    const ratio_y = @as(f32, @floatFromInt(img.height)) / @as(f32, @floatFromInt(image_size));
+    const ratio_x = @as(f32, @floatFromInt(img.width)) / @as(f32, @floatFromInt(image_size));
+    const byte_scale: f32 = 1.0 / 255.0;
 
-    for (0..3) |channel| {
-        for (source, pixels) |*v, px| {
-            const byte: u8 = switch (channel) {
-                0 => px.r,
-                1 => px.g,
-                2 => px.b,
-                else => unreachable,
-            };
-            v.* = @as(f32, @floatFromInt(byte)) / 255.0;
+    // Resize all three interleaved byte channels together and write directly
+    // into the model's planar normalized tensor. The old path converted the
+    // entire source image to float and resized it independently three times.
+    for (0..image_size) |y| {
+        const in_y = ratio_y * (@as(f32, @floatFromInt(y)) + 0.5) - 0.5;
+        const y0 = clampPixelIndex(in_y, img.height);
+        const y1 = @min(y0 + 1, img.height - 1);
+        const wy = @max(0.0, in_y - @as(f32, @floatFromInt(y0)));
+        const row0 = pixels[y0 * img.width ..][0..img.width];
+        const row1 = pixels[y1 * img.width ..][0..img.width];
+
+        for (0..image_size) |x| {
+            const in_x = ratio_x * (@as(f32, @floatFromInt(x)) + 0.5) - 0.5;
+            const x0 = clampPixelIndex(in_x, img.width);
+            const x1 = @min(x0 + 1, img.width - 1);
+            const wx = @max(0.0, in_x - @as(f32, @floatFromInt(x0)));
+            const p00 = row0[x0];
+            const p01 = row0[x1];
+            const p10 = row1[x0];
+            const p11 = row1[x1];
+            const index = y * image_size + x;
+
+            inline for (0..3) |channel| {
+                const a: f32 = @floatFromInt(switch (channel) {
+                    0 => p00.r,
+                    1 => p00.g,
+                    2 => p00.b,
+                    else => unreachable,
+                });
+                const b: f32 = @floatFromInt(switch (channel) {
+                    0 => p01.r,
+                    1 => p01.g,
+                    2 => p01.b,
+                    else => unreachable,
+                });
+                const c: f32 = @floatFromInt(switch (channel) {
+                    0 => p10.r,
+                    1 => p10.g,
+                    2 => p10.b,
+                    else => unreachable,
+                });
+                const d: f32 = @floatFromInt(switch (channel) {
+                    0 => p11.r,
+                    1 => p11.g,
+                    2 => p11.b,
+                    else => unreachable,
+                });
+                const top = a + (b - a) * wx;
+                const bottom = c + (d - c) * wx;
+                const resized = (top + (bottom - top) * wy) * byte_scale;
+                out[channel * plane_size + index] = (resized - mean[channel]) / deviation[channel];
+            }
         }
-
-        const resized = try resample.bilinear(
-            allocator,
-            source,
-            img.width,
-            img.height,
-            image_size,
-            image_size,
-        );
-        defer allocator.free(resized);
-
-        const target = out[channel * plane_size ..][0..plane_size];
-        for (target, resized) |*v, r| v.* = (r - mean[channel]) / deviation[channel];
     }
     return out;
+}
+
+fn clampPixelIndex(coordinate: f32, limit: usize) usize {
+    if (coordinate <= 0.0) return 0;
+    const floored: usize = @intFromFloat(@floor(coordinate));
+    return @min(floored, limit - 1);
 }
 
 test {

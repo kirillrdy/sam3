@@ -43,7 +43,7 @@ const metadata_slots = 4096;
 /// The block tile `kernels.matmul` is written around, mirrored here so the
 /// host can size the grid. A block of 16x16 threads covers this much of C.
 const matmul_tile_m = 128;
-const matmul_tile_n = 64;
+const matmul_tile_n = 128;
 
 /// The same for `kernels.matmulXmx`, whose work group is 16 sub-groups of 16
 /// lanes. Kept in step with DP_TILE_M and DP_TILE_N there.
@@ -91,7 +91,7 @@ const matmul_cache_budget = 2 << 20;
 const attention_head = 64;
 const attention_key_step = 16;
 const attention_subgroups = 16;
-const attention_query_tile = 8 * attention_subgroups;
+const attention_query_tile = if (@hasDecl(driver, "is_opencl")) (8 * attention_subgroups) else 128;
 
 /// How many elements one work item of a vector kernel carries, mirroring
 /// LANE_STEP in `kernels.cl`.
@@ -286,7 +286,7 @@ pub const Env = struct {
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !Env {
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
-        var gpu = try device_mod.Device.init(0);
+        var gpu = try device_mod.Device.init(io, 0);
         errdefer gpu.deinit();
         const metadata = try driver.Buffer(u32).alloc(metadata_words);
         errdefer metadata.free();

@@ -47,7 +47,6 @@ SamMetalContext *sam_metal_context_create(uint32_t ordinal) {
 }
 
 void sam_metal_context_destroy(SamMetalContext *context) { free(context); }
-const char *sam_metal_context_name(SamMetalContext *context) { return context->device.name.UTF8String; }
 
 int sam_metal_context_synchronize(SamMetalContext *context) {
     id<MTLCommandBuffer> command = context->last;

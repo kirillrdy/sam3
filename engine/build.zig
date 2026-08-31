@@ -36,6 +36,13 @@ pub const PtxOptions = struct {
     optimize: std.builtin.OptimizeMode = .Debug,
 };
 
+fn cudaArchAtLeast(arch: []const u8, minimum: u16) bool {
+    if (!std.mem.startsWith(u8, arch, "sm_")) return false;
+    const end = std.mem.indexOfScalar(u8, arch, '+') orelse arch.len;
+    const capability = std.fmt.parseUnsigned(u16, arch[3..end], 10) catch return false;
+    return capability >= minimum;
+}
+
 pub fn addPtx(b: *std.Build, gpu_source: std.Build.LazyPath, options: PtxOptions) std.Build.LazyPath {
     const optimize = options.optimize;
 
@@ -47,6 +54,9 @@ pub fn addPtx(b: *std.Build, gpu_source: std.Build.LazyPath, options: PtxOptions
     else
         options.arch;
 
+    const ptx_options = b.addOptions();
+    ptx_options.addOption(bool, "ampere_or_newer", cudaArchAtLeast(options.arch, 80));
+
     const cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build-obj" });
     cmd.addArgs(&.{
         "-target",          "nvptx64-cuda",
@@ -54,9 +64,12 @@ pub fn addPtx(b: *std.Build, gpu_source: std.Build.LazyPath, options: PtxOptions
         "-O",               @tagName(optimize),
         "-fno-emit-bin",    "-fstrip",
         "--dep",            "gpu",
+        "--dep",            "ptx_options",
     });
     cmd.addPrefixedFileArg("-Mroot=", options.root_source_file);
+    cmd.addArgs(&.{ "--dep", "ptx_options" });
     cmd.addPrefixedFileArg("-Mgpu=", gpu_source);
+    cmd.addPrefixedFileArg("-Mptx_options=", ptx_options.getOutput());
     if (b.cache_root.path) |path| cmd.addArgs(&.{ "--cache-dir", path });
     if (b.graph.global_cache_root.path) |path| cmd.addArgs(&.{ "--global-cache-dir", path });
     return cmd.addPrefixedOutputFileArg("-femit-asm=", "kernels.ptx");
@@ -152,35 +165,6 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption(bool, "half", half and backend != .cuda);
     mod.addOptions("build_options", options);
-
-    const dump = b.addExecutable(.{
-        .name = "onnx-dump",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    b.installArtifact(dump);
-
-    const smoke = b.addExecutable(.{
-        .name = "engine-smoke",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/smoke.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "engine", .module = mod }},
-        }),
-    });
-    b.installArtifact(smoke);
-
-    const run_smoke = b.addRunArtifact(smoke);
-    run_smoke.step.dependOn(b.getInstallStep());
-    b.step("smoke", "Run native tensor kernels on the GPU").dependOn(&run_smoke.step);
-
-    const run = b.addRunArtifact(dump);
-    if (b.args) |args| run.addArgs(args);
-    b.step("dump", "Print what an ONNX file contains").dependOn(&run.step);
 
     const tests = b.addTest(.{ .root_module = mod });
     b.step("test", "Run tests").dependOn(&b.addRunArtifact(tests).step);

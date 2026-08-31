@@ -190,7 +190,7 @@ ui.file.onchange = async () => {
 
 ui.sample.onclick = async () => {
   const response = await fetch('/example.png');
-  if (!response.ok) return say('This build has no sample image; run `zig build fetch-examples`.');
+  if (!response.ok) return say('The sample image is unavailable.');
   await openImage(new Uint8Array(await response.arrayBuffer()));
 };
 

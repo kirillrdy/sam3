@@ -5,6 +5,7 @@
 //! parameters, so one kernel covers a tensor of any rank.
 
 const gpu = @import("gpu");
+const ptx_options = @import("ptx_options");
 
 pub const panic = gpu.panic;
 
@@ -488,7 +489,7 @@ fn reduceMax(value: f32) f32 {
 // take 16 consecutive floats and no two of them land in the same bank.
 const mm_threads = 16;
 const mm_rows = 8;
-const mm_cols = 4;
+const mm_cols = 8;
 const mm_tile_m = mm_threads * mm_rows;
 const mm_tile_n = mm_threads * mm_cols;
 const mm_tile_k = 16;
@@ -497,8 +498,7 @@ const mm_stage = mm_threads * mm_threads;
 var a_tile: [mm_tile_m][mm_tile_k]f32 addrspace(.shared) = undefined;
 var b_tile: [mm_tile_k][mm_tile_n]f32 addrspace(.shared) = undefined;
 
-/// Stages the block's slab of the left operand, which is a plain `m` x `k`
-/// matrix for both of the kernels below -- weights, in the convolution's case.
+/// Stages the block's slab of the left operand for conv2dGemm.
 inline fn stageLeft(left: [*]addrspace(.global) const f32, base: u32, row_base: u32, m: u32, k: u32, step: u32, thread: u32) void {
     inline for (0..mm_tile_m * mm_tile_k / mm_stage) |slab| {
         const index = thread + slab * mm_stage;
@@ -511,12 +511,8 @@ inline fn stageLeft(left: [*]addrspace(.global) const f32, base: u32, row_base: 
     }
 }
 
-/// Folds one staged k-step into the thread's register patch. `@mulAdd` rather
-/// than `acc += a * b`: Zig will not contract a multiply and an add on its
-/// own, and uncontracted it issues two instructions where the hardware has one.
+/// Folds one staged k-step into the thread's register patch for conv2dGemm.
 inline fn accumulateTiles(acc: *[mm_rows][mm_cols]f32, tx: u32, ty: u32) void {
-    // Fully unrolled, and instantiated once per caller: 16 depths of 8x4
-    // multiply-adds is more comptime steps than the default budget allows.
     @setEvalBranchQuota(20000);
     inline for (0..mm_tile_k) |depth| {
         var a_reg: [mm_rows]f32 = undefined;
@@ -527,6 +523,138 @@ inline fn accumulateTiles(acc: *[mm_rows][mm_cols]f32, tx: u32, ty: u32) void {
         }
         inline for (0..mm_rows) |i| {
             inline for (0..mm_cols) |j| acc[i][j] = @mulAdd(f32, a_reg[i], b_reg[j], acc[i][j]);
+        }
+    }
+}
+
+const mm_bk = 16;
+var mm_sa: [2][mm_tile_m][mm_bk]f32 align(16) addrspace(.shared) = undefined;
+var mm_sb: [2][mm_bk][mm_tile_n]f32 align(16) addrspace(.shared) = undefined;
+
+/// Ampere can move a vector directly from global to shared memory. Older
+/// architectures perform the same staging synchronously.
+inline fn stageGlobalFloat4(shared: *addrspace(.shared) f32, global: [*]addrspace(.global) const f32) void {
+    if (ptx_options.ampere_or_newer) {
+        gpu.cpAsync16(shared, global);
+    } else {
+        const shared_many: [*]addrspace(.shared) f32 = @ptrCast(shared);
+        inline for (0..4) |i| shared_many[i] = global[i];
+    }
+}
+
+inline fn stageCommit() void {
+    if (ptx_options.ampere_or_newer) gpu.cpAsyncCommit();
+}
+
+inline fn stageWait() void {
+    if (ptx_options.ampere_or_newer) gpu.cpAsyncWait();
+}
+
+inline fn stageA(stage: u32, a: [*]addrspace(.global) const f32, a_base: u32, row_base: u32, m: u32, k: u32, step: u32, thread: u32) void {
+    const r0 = thread / 4;
+    const c0 = (thread % 4) * 4;
+    const r1 = 64 + (thread / 4);
+    const c1 = (thread % 4) * 4;
+
+    if (row_base + r0 < m) {
+        const offset0 = a_base + (row_base + r0) * k + step + c0;
+        if (offset0 % 4 == 0 and step + c0 + 4 <= k) {
+            stageGlobalFloat4(&mm_sa[stage][r0][c0], a + offset0);
+        } else {
+            inline for (0..4) |idx| {
+                mm_sa[stage][r0][c0 + idx] = if (step + c0 + idx < k)
+                    a[a_base + (row_base + r0) * k + step + c0 + idx]
+                else
+                    0;
+            }
+        }
+    } else {
+        inline for (0..4) |idx| {
+            mm_sa[stage][r0][c0 + idx] = 0;
+        }
+    }
+
+    if (row_base + r1 < m) {
+        const offset1 = a_base + (row_base + r1) * k + step + c1;
+        if (offset1 % 4 == 0 and step + c1 + 4 <= k) {
+            stageGlobalFloat4(&mm_sa[stage][r1][c1], a + offset1);
+        } else {
+            inline for (0..4) |idx| {
+                mm_sa[stage][r1][c1 + idx] = if (step + c1 + idx < k)
+                    a[a_base + (row_base + r1) * k + step + c1 + idx]
+                else
+                    0;
+            }
+        }
+    } else {
+        inline for (0..4) |idx| {
+            mm_sa[stage][r1][c1 + idx] = 0;
+        }
+    }
+}
+
+inline fn stageB(
+    stage: u32,
+    b: [*]addrspace(.global) const f32,
+    b_base: u32,
+    col_base: u32,
+    n: u32,
+    k: u32,
+    step: u32,
+    thread: u32,
+    comptime transposed: bool,
+) void {
+    const r0 = thread / 32;
+    const c0 = (thread % 32) * 4;
+    const r1 = 8 + (thread / 32);
+    const c1 = (thread % 32) * 4;
+
+    if (transposed) {
+        inline for (0..4) |idx| {
+            mm_sb[stage][r0][c0 + idx] = if (col_base + c0 + idx < n and step + r0 < k)
+                b[b_base + (col_base + c0 + idx) * k + step + r0]
+            else
+                0;
+            mm_sb[stage][r1][c1 + idx] = if (col_base + c1 + idx < n and step + r1 < k)
+                b[b_base + (col_base + c1 + idx) * k + step + r1]
+            else
+                0;
+        }
+    } else {
+        if (step + r0 < k) {
+            const offset0 = b_base + (step + r0) * n + col_base + c0;
+            if (offset0 % 4 == 0 and col_base + c0 + 4 <= n) {
+                stageGlobalFloat4(&mm_sb[stage][r0][c0], b + offset0);
+            } else {
+                inline for (0..4) |idx| {
+                    mm_sb[stage][r0][c0 + idx] = if (col_base + c0 + idx < n)
+                        b[b_base + (step + r0) * n + col_base + c0 + idx]
+                    else
+                        0;
+                }
+            }
+        } else {
+            inline for (0..4) |idx| {
+                mm_sb[stage][r0][c0 + idx] = 0;
+            }
+        }
+
+        if (step + r1 < k) {
+            const offset1 = b_base + (step + r1) * n + col_base + c1;
+            if (offset1 % 4 == 0 and col_base + c1 + 4 <= n) {
+                stageGlobalFloat4(&mm_sb[stage][r1][c1], b + offset1);
+            } else {
+                inline for (0..4) |idx| {
+                    mm_sb[stage][r1][c1 + idx] = if (col_base + c1 + idx < n)
+                        b[b_base + (step + r1) * n + col_base + c1 + idx]
+                    else
+                        0;
+                }
+            }
+        } else {
+            inline for (0..4) |idx| {
+                mm_sb[stage][r1][c1 + idx] = 0;
+            }
         }
     }
 }
@@ -543,21 +671,10 @@ fn matmul(
     a_batch: u32,
     b_batch: u32,
     c_batch: u32,
-    /// B held as `n` rows of `k`, the way Gemm's `transB` spells it. Decided
-    /// once here rather than tested per element: the two layouts differ only
-    /// inside the staging loop, and a branch there costs the whole kernel
-    /// about a tenth of its throughput.
     b_transposed: u32,
-    /// Added to every element on the way out, indexed by column, where a
-    /// MatMul the graph followed with an Add has been folded into this one.
     bias: [*]addrspace(.global) const f32,
     has_bias: u32,
-    /// Applied to every element after the bias, where the activation that
-    /// followed the product has been folded into it as well.
     activation: u32,
-    /// How many tiles of C a work group block covers. Which tile each block
-    /// takes decides what the resident ones share; the host sizes this to what
-    /// it reckons the last level cache holds both operands of.
     block_m: u32,
     block_n: u32,
 ) callconv(.kernel) void {
@@ -566,6 +683,23 @@ fn matmul(
     } else {
         matmulTiled(a, b, c, m, n, k, a_batch, b_batch, c_batch, bias, has_bias, activation, block_m, block_n, false);
     }
+}
+
+fn matmulPost(
+    values: [*]addrspace(.global) f32,
+    bias: [*]addrspace(.global) const f32,
+    count: u32,
+    columns: u32,
+    has_bias: u32,
+    activation: u32,
+) callconv(.kernel) void {
+    const i = gpu.globalIndex();
+    if (i >= count) return;
+    const value = values[i] + if (has_bias != 0) bias[i % columns] else 0;
+    values[i] = if (activation != 0)
+        0.5 * value * (1.0 + erf(value * 0.7071067811865476))
+    else
+        value;
 }
 
 inline fn matmulTiled(
@@ -585,6 +719,7 @@ inline fn matmulTiled(
     block_n: u32,
     comptime transposed: bool,
 ) void {
+    @setEvalBranchQuota(50000);
     const tx = gpu.threadIndex();
     const ty = gpu.threadIndexY();
     const thread = ty * mm_threads + tx;
@@ -596,47 +731,402 @@ inline fn matmulTiled(
     const within = taken % (block_m * block_n);
     const tile_m = (at / blocks_n) * block_m + within / block_n;
     const tile_n = (at % blocks_n) * block_n + within % block_n;
-    // The grid is a whole number of blocks, so the last ones overhang.
     if (tile_m >= tiles_m or tile_n >= tiles_n) return;
     const row_base = tile_m * mm_tile_m;
     const col_base = tile_n * mm_tile_n;
     const batch = gpu.blockIndexZ();
     const a_base = batch * a_batch;
     const b_base = batch * b_batch;
+    const c_base = batch * c_batch;
+
+    const warp_id = thread / 32;
+    const lane_id = thread % 32;
+    const wid_m = warp_id / 2;
+    const wid_n = warp_id % 2;
+    const tid_m = lane_id / 8;
+    const tid_n = lane_id % 8;
+
+    const thread_row_base = wid_m * 32 + tid_m * 8;
+    const thread_col_base = wid_n * 64 + tid_n * 8;
+
+    // Stage 0: Prologue
+    stageA(0, a, a_base, row_base, m, k, 0, thread);
+    stageB(0, b, b_base, col_base, n, k, 0, thread, transposed);
+    stageCommit();
+    stageWait();
+    gpu.syncThreads();
 
     var acc: [mm_rows][mm_cols]f32 = @splat(@splat(0));
+    var write_stage: u32 = 1;
+    var step: u32 = mm_bk;
 
-    var step: u32 = 0;
-    while (step < k) : (step += mm_tile_k) {
-        // The 256 threads stage the block's slab of A and of B between them.
-        stageLeft(a, a_base, row_base, m, k, step, thread);
-        inline for (0..mm_tile_k * mm_tile_n / mm_stage) |slab| {
-            const index = thread + slab * mm_stage;
-            const r = index / mm_tile_n;
-            const column = index % mm_tile_n;
-            b_tile[r][column] = if (step + r < k and col_base + column < n)
-                (if (transposed)
-                    b[b_base + (col_base + column) * k + step + r]
-                else
-                    b[b_base + (step + r) * n + col_base + column])
-            else
-                0;
+    while (step < k) : (step += mm_bk) {
+        stageA(write_stage, a, a_base, row_base, m, k, step, thread);
+        stageB(write_stage, b, b_base, col_base, n, k, step, thread, transposed);
+        stageCommit();
+
+        const read_stage = write_stage ^ 1;
+        inline for (0..mm_bk) |depth| {
+            var a_reg: [mm_rows]f32 = undefined;
+            inline for (0..mm_rows) |i| {
+                a_reg[i] = mm_sa[read_stage][thread_row_base + i][depth];
+            }
+            const b_vec0 = gpu.loadSharedFloat4(&mm_sb[read_stage][depth][thread_col_base + 0]);
+            const b_vec1 = gpu.loadSharedFloat4(&mm_sb[read_stage][depth][thread_col_base + 4]);
+            inline for (0..mm_rows) |i| {
+                inline for (0..4) |j| {
+                    acc[i][j] = @mulAdd(f32, a_reg[i], b_vec0[j], acc[i][j]);
+                }
+                inline for (0..4) |j| {
+                    acc[i][4 + j] = @mulAdd(f32, a_reg[i], b_vec1[j], acc[i][4 + j]);
+                }
+            }
         }
-        gpu.syncThreads();
 
-        accumulateTiles(&acc, tx, ty);
+        stageWait();
         gpu.syncThreads();
+        write_stage ^= 1;
+    }
+
+    const final_read_stage = write_stage ^ 1;
+    inline for (0..mm_bk) |depth| {
+        var a_reg: [mm_rows]f32 = undefined;
+        inline for (0..mm_rows) |i| {
+            a_reg[i] = mm_sa[final_read_stage][thread_row_base + i][depth];
+        }
+        const b_vec0 = gpu.loadSharedFloat4(&mm_sb[final_read_stage][depth][thread_col_base + 0]);
+        const b_vec1 = gpu.loadSharedFloat4(&mm_sb[final_read_stage][depth][thread_col_base + 4]);
+        inline for (0..mm_rows) |i| {
+            inline for (0..4) |j| {
+                acc[i][j] = @mulAdd(f32, a_reg[i], b_vec0[j], acc[i][j]);
+            }
+            inline for (0..4) |j| {
+                acc[i][4 + j] = @mulAdd(f32, a_reg[i], b_vec1[j], acc[i][4 + j]);
+            }
+        }
     }
 
     inline for (0..mm_rows) |i| {
-        const row = row_base + ty + i * mm_threads;
+        const row = row_base + thread_row_base + i;
+        const col = col_base + thread_col_base;
         if (row < m) {
-            inline for (0..mm_cols) |j| {
-                const col = col_base + tx + j * mm_threads;
+            const output_offset = c_base + row * n + col;
+            if (col + 8 <= n and output_offset % 4 == 0) {
+                const bias0 = if (has_bias != 0) gpu.loadGlobalFloat4(bias + col) else [4]f32{ 0, 0, 0, 0 };
+                const bias1 = if (has_bias != 0) gpu.loadGlobalFloat4(bias + col + 4) else [4]f32{ 0, 0, 0, 0 };
+                var val0: [4]f32 = undefined;
+                var val1: [4]f32 = undefined;
+                inline for (0..4) |j| {
+                    var v0 = acc[i][j] + bias0[j];
+                    if (activation != 0) v0 = 0.5 * v0 * (1.0 + erf(v0 * 0.7071067811865476));
+                    val0[j] = v0;
+
+                    var v1 = acc[i][4 + j] + bias1[j];
+                    if (activation != 0) v1 = 0.5 * v1 * (1.0 + erf(v1 * 0.7071067811865476));
+                    val1[j] = v1;
+                }
+                gpu.storeGlobalFloat4(c + output_offset, val0);
+                gpu.storeGlobalFloat4(c + output_offset + 4, val1);
+            } else {
+                inline for (0..mm_cols) |j| {
+                    if (col + j < n) {
+                        var val = acc[i][j];
+                        if (has_bias != 0) {
+                            val += bias[col + j];
+                        }
+                        if (activation != 0) {
+                            val = 0.5 * val * (1.0 + erf(val * 0.7071067811865476));
+                        }
+                        c[c_base + row * n + col + j] = val;
+                    }
+                }
+            }
+        }
+    }
+}
+
+const tc_tile_m = 128;
+const tc_tile_n = 64;
+const tc_bk = 8;
+
+var tc_sa: [2][tc_tile_m][tc_bk]f32 addrspace(.shared) = undefined;
+var tc_sb: [2][tc_bk][tc_tile_n]f32 addrspace(.shared) = undefined;
+
+inline fn stageTensorA(
+    stage: u32,
+    a: [*]addrspace(.global) const f32,
+    a_base: u32,
+    row_base: u32,
+    m: u32,
+    k: u32,
+    step: u32,
+    thread: u32,
+) void {
+    const r0 = thread / 2;
+    const c0 = (thread % 2) * 4;
+    const r1 = 64 + (thread / 2);
+    const c1 = (thread % 2) * 4;
+
+    if (row_base + r0 < m) {
+        const offset0 = a_base + (row_base + r0) * k + step + c0;
+        if (offset0 % 4 == 0 and step + c0 + 4 <= k) {
+            stageGlobalFloat4(&tc_sa[stage][r0][c0], a + offset0);
+        } else {
+            inline for (0..4) |idx| {
+                tc_sa[stage][r0][c0 + idx] = if (step + c0 + idx < k)
+                    a[a_base + (row_base + r0) * k + step + c0 + idx]
+                else
+                    0;
+            }
+        }
+    } else {
+        inline for (0..4) |idx| {
+            tc_sa[stage][r0][c0 + idx] = 0;
+        }
+    }
+
+    if (row_base + r1 < m) {
+        const offset1 = a_base + (row_base + r1) * k + step + c1;
+        if (offset1 % 4 == 0 and step + c1 + 4 <= k) {
+            stageGlobalFloat4(&tc_sa[stage][r1][c1], a + offset1);
+        } else {
+            inline for (0..4) |idx| {
+                tc_sa[stage][r1][c1 + idx] = if (step + c1 + idx < k)
+                    a[a_base + (row_base + r1) * k + step + c1 + idx]
+                else
+                    0;
+            }
+        }
+    } else {
+        inline for (0..4) |idx| {
+            tc_sa[stage][r1][c1 + idx] = 0;
+        }
+    }
+}
+
+inline fn stageTensorB(
+    stage: u32,
+    b: [*]addrspace(.global) const f32,
+    b_base: u32,
+    col_base: u32,
+    n: u32,
+    k: u32,
+    step: u32,
+    thread: u32,
+    comptime transposed: bool,
+) void {
+    const r = thread / 16;
+    const c = (thread % 16) * 4;
+
+    if (transposed) {
+        inline for (0..4) |idx| {
+            tc_sb[stage][r][c + idx] = if (col_base + c + idx < n and step + r < k)
+                b[b_base + (col_base + c + idx) * k + step + r]
+            else
+                0;
+        }
+    } else {
+        if (step + r < k) {
+            const offset = b_base + (step + r) * n + col_base + c;
+            if (offset % 4 == 0 and col_base + c + 4 <= n) {
+                stageGlobalFloat4(&tc_sb[stage][r][c], b + offset);
+            } else {
+                inline for (0..4) |idx| {
+                    tc_sb[stage][r][c + idx] = if (col_base + c + idx < n)
+                        b[b_base + (step + r) * n + col_base + c + idx]
+                    else
+                        0;
+                }
+            }
+        } else {
+            inline for (0..4) |idx| {
+                tc_sb[stage][r][c + idx] = 0;
+            }
+        }
+    }
+}
+
+fn matmulTensor(
+    a: [*]addrspace(.global) const f32,
+    b: [*]addrspace(.global) const f32,
+    c: [*]addrspace(.global) f32,
+    m: u32,
+    n: u32,
+    k: u32,
+    a_batch: u32,
+    b_batch: u32,
+    c_batch: u32,
+    b_transposed: u32,
+    bias: [*]addrspace(.global) const f32,
+    has_bias: u32,
+    activation: u32,
+    block_m: u32,
+    block_n: u32,
+) callconv(.kernel) void {
+    if (b_transposed != 0) {
+        matmulTensorTiled(a, b, c, m, n, k, a_batch, b_batch, c_batch, bias, has_bias, activation, block_m, block_n, true);
+    } else {
+        matmulTensorTiled(a, b, c, m, n, k, a_batch, b_batch, c_batch, bias, has_bias, activation, block_m, block_n, false);
+    }
+}
+
+inline fn matmulTensorTiled(
+    a: [*]addrspace(.global) const f32,
+    b: [*]addrspace(.global) const f32,
+    c: [*]addrspace(.global) f32,
+    m: u32,
+    n: u32,
+    k: u32,
+    a_batch: u32,
+    b_batch: u32,
+    c_batch: u32,
+    bias: [*]addrspace(.global) const f32,
+    has_bias: u32,
+    activation: u32,
+    block_m: u32,
+    block_n: u32,
+    comptime transposed: bool,
+) void {
+    @setEvalBranchQuota(50000);
+    const tx = gpu.threadIndex();
+    const ty = gpu.threadIndexY();
+    const thread = ty * 16 + tx;
+    const tiles_n = (n + tc_tile_n - 1) / tc_tile_n;
+    const tiles_m = (m + tc_tile_m - 1) / tc_tile_m;
+    const blocks_n = (tiles_n + block_n - 1) / block_n;
+    const taken = gpu.blockIndex();
+    const at = taken / (block_m * block_n);
+    const within = taken % (block_m * block_n);
+    const tile_m = (at / blocks_n) * block_m + within / block_n;
+    const tile_n = (at % blocks_n) * block_n + within % block_n;
+    if (tile_m >= tiles_m or tile_n >= tiles_n) return;
+    const row_base = tile_m * tc_tile_m;
+    const col_base = tile_n * tc_tile_n;
+    const batch = gpu.blockIndexZ();
+    const a_base = batch * a_batch;
+    const b_base = batch * b_batch;
+    const c_base = batch * c_batch;
+
+    const warp_id = thread / 32;
+    const lane_id = thread % 32;
+    const wid_m = warp_id / 2;
+    const wid_n = warp_id % 2;
+
+    const group = lane_id / 4;
+    const thread_in_group = lane_id % 4;
+
+    // Stage 0: Prologue
+    stageTensorA(0, a, a_base, row_base, m, k, 0, thread);
+    stageTensorB(0, b, b_base, col_base, n, k, 0, thread, transposed);
+    stageCommit();
+    stageWait();
+    gpu.syncThreads();
+
+    var acc: [4][4][4]f32 = @splat(@splat(@splat(0.0)));
+    var write_stage: u32 = 1;
+    var step: u32 = tc_bk;
+
+    while (step < k) : (step += tc_bk) {
+        stageTensorA(write_stage, a, a_base, row_base, m, k, step, thread);
+        stageTensorB(write_stage, b, b_base, col_base, n, k, step, thread, transposed);
+        stageCommit();
+
+        const read_stage = write_stage ^ 1;
+
+        var a_reg: [4][4]f32 = undefined;
+        inline for (0..4) |m_blk| {
+            const r0 = wid_m * 64 + m_blk * 16 + group;
+            const r1 = wid_m * 64 + m_blk * 16 + group + 8;
+            const c0 = thread_in_group * 2;
+            a_reg[m_blk][0] = tc_sa[read_stage][r0][c0 + 0];
+            a_reg[m_blk][1] = tc_sa[read_stage][r1][c0 + 0];
+            a_reg[m_blk][2] = tc_sa[read_stage][r0][c0 + 1];
+            a_reg[m_blk][3] = tc_sa[read_stage][r1][c0 + 1];
+        }
+
+        var b_reg: [4][2]f32 = undefined;
+        inline for (0..4) |n_blk| {
+            const r = thread_in_group * 2;
+            const col = wid_n * 32 + n_blk * 8 + group;
+            b_reg[n_blk][0] = tc_sb[read_stage][r + 0][col];
+            b_reg[n_blk][1] = tc_sb[read_stage][r + 1][col];
+        }
+
+        inline for (0..4) |m_blk| {
+            inline for (0..4) |n_blk| {
+                acc[m_blk][n_blk] = gpu.mmaSyncM16N8K8(
+                    a_reg[m_blk],
+                    b_reg[n_blk],
+                    acc[m_blk][n_blk],
+                );
+            }
+        }
+
+        stageWait();
+        gpu.syncThreads();
+        write_stage ^= 1;
+    }
+
+    const final_read_stage = write_stage ^ 1;
+    var a_reg: [4][4]f32 = undefined;
+    inline for (0..4) |m_blk| {
+        const r0 = wid_m * 64 + m_blk * 16 + group;
+        const r1 = wid_m * 64 + m_blk * 16 + group + 8;
+        const c0 = thread_in_group * 2;
+        a_reg[m_blk][0] = tc_sa[final_read_stage][r0][c0 + 0];
+        a_reg[m_blk][1] = tc_sa[final_read_stage][r1][c0 + 0];
+        a_reg[m_blk][2] = tc_sa[final_read_stage][r0][c0 + 1];
+        a_reg[m_blk][3] = tc_sa[final_read_stage][r1][c0 + 1];
+    }
+
+    var b_reg: [4][2]f32 = undefined;
+    inline for (0..4) |n_blk| {
+        const r = thread_in_group * 2;
+        const col = wid_n * 32 + n_blk * 8 + group;
+        b_reg[n_blk][0] = tc_sb[final_read_stage][r + 0][col];
+        b_reg[n_blk][1] = tc_sb[final_read_stage][r + 1][col];
+    }
+
+    inline for (0..4) |m_blk| {
+        inline for (0..4) |n_blk| {
+            acc[m_blk][n_blk] = gpu.mmaSyncM16N8K8(
+                a_reg[m_blk],
+                b_reg[n_blk],
+                acc[m_blk][n_blk],
+            );
+        }
+    }
+
+    // Epilogue
+    inline for (0..4) |m_blk| {
+        inline for (0..4) |n_blk| {
+            const r0 = row_base + wid_m * 64 + m_blk * 16 + group;
+            const r1 = row_base + wid_m * 64 + m_blk * 16 + group + 8;
+            const col = col_base + wid_n * 32 + n_blk * 8 + thread_in_group * 2;
+
+            if (r0 < m) {
                 if (col < n) {
-                    const value = acc[i][j] + if (has_bias != 0) bias[col] else 0;
-                    c[batch * c_batch + row * n + col] =
-                        if (activation != 0) 0.5 * value * (1.0 + erf(value * 0.7071067811865476)) else value;
+                    var v0 = acc[m_blk][n_blk][0] + (if (has_bias != 0) bias[col] else 0.0);
+                    if (activation != 0) v0 = 0.5 * v0 * (1.0 + erf(v0 * 0.7071067811865476));
+                    c[c_base + r0 * n + col] = v0;
+                }
+                if (col + 1 < n) {
+                    var v1 = acc[m_blk][n_blk][1] + (if (has_bias != 0) bias[col + 1] else 0.0);
+                    if (activation != 0) v1 = 0.5 * v1 * (1.0 + erf(v1 * 0.7071067811865476));
+                    c[c_base + r0 * n + col + 1] = v1;
+                }
+            }
+
+            if (r1 < m) {
+                if (col < n) {
+                    var v2 = acc[m_blk][n_blk][2] + (if (has_bias != 0) bias[col] else 0.0);
+                    if (activation != 0) v2 = 0.5 * v2 * (1.0 + erf(v2 * 0.7071067811865476));
+                    c[c_base + r1 * n + col] = v2;
+                }
+                if (col + 1 < n) {
+                    var v3 = acc[m_blk][n_blk][3] + (if (has_bias != 0) bias[col + 1] else 0.0);
+                    if (activation != 0) v3 = 0.5 * v3 * (1.0 + erf(v3 * 0.7071067811865476));
+                    c[c_base + r1 * n + col + 1] = v3;
                 }
             }
         }
@@ -1164,6 +1654,135 @@ fn convTranspose2dGemm(
     }
 }
 
+const attention_rows_per_lane = 8;
+const attention_query_rows = 16 * attention_rows_per_lane;
+
+var q_tile: [attention_query_rows][64]f32 addrspace(.shared) = undefined;
+var k_tile: [64][16]f32 addrspace(.shared) = undefined;
+var v_tile: [16][64]f32 addrspace(.shared) = undefined;
+var scores_tile: [attention_query_rows][16]f32 addrspace(.shared) = undefined;
+
+fn attention(
+    q: [*]addrspace(.global) const f32,
+    kt: [*]addrspace(.global) const f32,
+    v: [*]addrspace(.global) const f32,
+    out: [*]addrspace(.global) f32,
+    queries: u32,
+    keys: u32,
+    scale: f32,
+) callconv(.kernel) void {
+    @setEvalBranchQuota(5000);
+    const tx = gpu.threadIndex();
+    const ty = gpu.threadIndexY();
+    const slot = ty * 16 + tx;
+    const batch = gpu.blockIndexY();
+    const row_base = gpu.blockIndex() * attention_query_rows;
+
+    const q_base = batch * queries * 64;
+    const kt_base = batch * 64 * keys;
+    const v_base = batch * keys * 64;
+    const out_base = batch * queries * 64;
+
+    inline for (0..attention_query_rows * 64 / 256) |slab| {
+        const idx = slot + slab * 256;
+        const qr = idx / 64;
+        const qc = idx % 64;
+        q_tile[qr][qc] = if (row_base + qr < queries)
+            q[q_base + (row_base + qr) * 64 + qc]
+        else
+            0.0;
+    }
+
+    var out_acc: [attention_rows_per_lane][4]f32 = @splat(@splat(0.0));
+    var running_max: [attention_rows_per_lane]f32 = @splat(neg_inf);
+    var running_sum: [attention_rows_per_lane]f32 = @splat(0.0);
+
+    var key_base: u32 = 0;
+    while (key_base < keys) : (key_base += 16) {
+        inline for (0..4) |slab| {
+            const idx = slot + slab * 256;
+            const kd = idx / 16;
+            const kk = idx % 16;
+            k_tile[kd][kk] = if (key_base + kk < keys)
+                kt[kt_base + kd * keys + key_base + kk]
+            else
+                0.0;
+        }
+
+        inline for (0..4) |slab| {
+            const idx = slot + slab * 256;
+            const vk = idx / 64;
+            const vd = idx % 64;
+            v_tile[vk][vd] = if (key_base + vk < keys)
+                v[v_base + (key_base + vk) * 64 + vd]
+            else
+                0.0;
+        }
+        gpu.syncThreads();
+
+        inline for (0..attention_rows_per_lane) |qr| {
+            const row = ty + qr * 16;
+            var s: f32 = 0.0;
+            inline for (0..64) |d| {
+                s = @mulAdd(f32, q_tile[row][d], k_tile[d][tx], s);
+            }
+            s *= scale;
+            if (row_base + row >= queries or key_base + tx >= keys) {
+                s = neg_inf;
+            }
+            scores_tile[row][tx] = s;
+        }
+        gpu.syncThreads();
+
+        var new_max: [attention_rows_per_lane]f32 = undefined;
+        var alpha: [attention_rows_per_lane]f32 = undefined;
+        inline for (0..attention_rows_per_lane) |qr| {
+            const row = ty + qr * 16;
+            var cur_max: f32 = neg_inf;
+            inline for (0..16) |k| {
+                cur_max = @max(cur_max, scores_tile[row][k]);
+            }
+            new_max[qr] = @max(running_max[qr], cur_max);
+            alpha[qr] = if (running_max[qr] == neg_inf) 0.0 else exp(running_max[qr] - new_max[qr]);
+            const score_val = scores_tile[row][tx];
+            scores_tile[row][tx] = if (score_val == neg_inf) 0.0 else exp(score_val - new_max[qr]);
+        }
+        gpu.syncThreads();
+
+        const d_col = tx * 4;
+        inline for (0..attention_rows_per_lane) |qr| {
+            const row = ty + qr * 16;
+            var cur_sum: f32 = 0.0;
+            inline for (0..16) |k| {
+                cur_sum += scores_tile[row][k];
+            }
+            running_sum[qr] = running_sum[qr] * alpha[qr] + cur_sum;
+            running_max[qr] = new_max[qr];
+            inline for (0..4) |i| {
+                out_acc[qr][i] *= alpha[qr];
+            }
+            inline for (0..16) |k| {
+                const p_val = scores_tile[row][k];
+                inline for (0..4) |i| {
+                    out_acc[qr][i] = @mulAdd(f32, p_val, v_tile[k][d_col + i], out_acc[qr][i]);
+                }
+            }
+        }
+        gpu.syncThreads();
+    }
+
+    const d_col = tx * 4;
+    inline for (0..attention_rows_per_lane) |qr| {
+        const row = ty + qr * 16;
+        if (row_base + row < queries) {
+            const inv_sum = if (running_sum[qr] > 0.0) (1.0 / running_sum[qr]) else 0.0;
+            inline for (0..4) |i| {
+                out[out_base + (row_base + row) * 64 + d_col + i] = out_acc[qr][i] * inv_sum;
+            }
+        }
+    }
+}
+
 export fn anchor() usize {
     return @intFromPtr(&binary) ^ @intFromPtr(&unary) ^ @intFromPtr(&copy) ^
         @intFromPtr(&fill) ^ @intFromPtr(&select) ^ @intFromPtr(&tile) ^ @intFromPtr(&conv2dGemm) ^
@@ -1172,6 +1791,8 @@ export fn anchor() usize {
         @intFromPtr(&clip) ^ @intFromPtr(&scatter) ^
         @intFromPtr(&concatCopy) ^ @intFromPtr(&pad) ^
         @intFromPtr(&gather) ^ @intFromPtr(&layerNorm) ^
-        @intFromPtr(&softmax) ^ @intFromPtr(&matmul) ^ @intFromPtr(&conv2d) ^
-        @intFromPtr(&convTranspose2d) ^ @intFromPtr(&convTranspose2dGemm);
+        @intFromPtr(&softmax) ^ @intFromPtr(&matmul) ^
+        (if (ptx_options.ampere_or_newer) @intFromPtr(&matmulTensor) else 0) ^
+        @intFromPtr(&matmulPost) ^ @intFromPtr(&conv2d) ^
+        @intFromPtr(&convTranspose2d) ^ @intFromPtr(&convTranspose2dGemm) ^ @intFromPtr(&attention);
 }
