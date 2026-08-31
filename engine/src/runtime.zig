@@ -41,9 +41,10 @@ const metadata_words = 4 * max_rank;
 const metadata_slots = 4096;
 
 /// The block tile `kernels.matmul` is written around, mirrored here so the
-/// host can size the grid. A block of 16x16 threads covers this much of C.
+/// host can size the grid. CUDA carries eight columns per thread while the
+/// OpenCL and Metal kernels carry four, so their tile widths differ.
 const matmul_tile_m = 128;
-const matmul_tile_n = 128;
+const matmul_tile_n = if (@hasDecl(driver, "is_opencl") or @hasDecl(driver, "is_metal")) 64 else 128;
 
 /// The same for `kernels.matmulXmx`, whose work group is 16 sub-groups of 16
 /// lanes. Kept in step with DP_TILE_M and DP_TILE_N there.
