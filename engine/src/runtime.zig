@@ -114,8 +114,6 @@ pub fn lastError() []const u8 {
     return error_buffer[0..error_length];
 }
 
-pub fn init(_: std.mem.Allocator, _: std.Io) !void {}
-
 pub fn version() []const u8 {
     return if (@hasDecl(driver, "is_opencl"))
         "native OpenCL"
@@ -164,79 +162,6 @@ const Pool = struct {
             entry.value_ptr.deinit(allocator);
         }
         self.buckets.deinit(allocator);
-    }
-};
-
-/// Per-operator timing for one graph, switched on with SAM3_PROFILE=1. Each
-/// node is timed behind its own synchronize, so a profiled run is slower than
-/// a normal one but every number belongs to exactly one operator.
-const Profile = struct {
-    const Row = struct {
-        op: []const u8,
-        nanoseconds: u64 = 0,
-        calls: usize = 0,
-        slowest: u64 = 0,
-        slowest_node: usize = 0,
-    };
-
-    rows: std.StringHashMapUnmanaged(Row) = .empty,
-
-    var cached_enabled: ?bool = null;
-
-    fn enabled() bool {
-        if (cached_enabled == null) cached_enabled = std.c.getenv("SAM3_PROFILE") != null;
-        return cached_enabled.?;
-    }
-
-    fn record(self: *Profile, allocator: std.mem.Allocator, op: []const u8, node: usize, elapsed: u64) void {
-        const entry = self.rows.getOrPut(allocator, op) catch return;
-        if (!entry.found_existing) entry.value_ptr.* = .{ .op = op };
-        entry.value_ptr.nanoseconds += elapsed;
-        entry.value_ptr.calls += 1;
-        if (elapsed > entry.value_ptr.slowest) {
-            entry.value_ptr.slowest = elapsed;
-            entry.value_ptr.slowest_node = node;
-        }
-    }
-
-    fn milliseconds(nanoseconds: u64) f64 {
-        return @as(f64, @floatFromInt(nanoseconds)) / std.time.ns_per_ms;
-    }
-
-    fn report(self: *Profile, allocator: std.mem.Allocator) void {
-        var rows: std.ArrayList(Row) = .empty;
-        defer rows.deinit(allocator);
-        var total: u64 = 0;
-        var values = self.rows.valueIterator();
-        while (values.next()) |row| {
-            total += row.nanoseconds;
-            rows.append(allocator, row.*) catch return;
-        }
-        std.mem.sort(Row, rows.items, {}, struct {
-            fn lessThan(_: void, a: Row, b: Row) bool {
-                return a.nanoseconds > b.nanoseconds;
-            }
-        }.lessThan);
-
-        std.debug.print("\n  profile: {d:.1} ms on the GPU\n", .{milliseconds(total)});
-        std.debug.print("    {s:<22}{s:>10}{s:>8}{s:>8}{s:>12}{s:>8}\n", .{
-            "operator", "total ms", "share", "calls", "slowest ms", "node",
-        });
-        for (rows.items) |row| {
-            std.debug.print("    {s:<22}{d:>10.1}{d:>7.1}%{d:>8}{d:>12.2}{d:>8}\n", .{
-                row.op,
-                milliseconds(row.nanoseconds),
-                100 * @as(f64, @floatFromInt(row.nanoseconds)) / @as(f64, @floatFromInt(@max(total, 1))),
-                row.calls,
-                milliseconds(row.slowest),
-                row.slowest_node,
-            });
-        }
-        std.debug.print("\n", .{});
-    }
-
-    fn deinit(self: *Profile, allocator: std.mem.Allocator) void {
-        self.rows.deinit(allocator);
     }
 };
 
@@ -460,17 +385,6 @@ const Fusion = struct {
         rotary,
         biased_product,
         biased_product_gelu,
-
-        /// What the profile calls it, since the graph has no such operator.
-        fn label(self: Kind) []const u8 {
-            return switch (self) {
-                .attention => "Attention",
-                .gelu => "Gelu",
-                .rotary => "Rotary",
-                .biased_product => "MatMulAdd",
-                .biased_product_gelu => "MatMulAddGelu",
-            };
-        }
     };
 
     fn inputs(self: *const Fusion) []const []const u8 {
@@ -549,16 +463,8 @@ const SessionState = struct {
             try values.put(arena, std.mem.span(name_z), tensor);
         }
 
-        const profiling = Profile.enabled();
-        var profile: Profile = .{};
-        defer if (profiling) {
-            profile.report(self.env.allocator);
-            profile.deinit(self.env.allocator);
-        };
-
         for (self.graph.nodes, 0..) |node, node_index| {
             if (self.folded.contains(node_index)) continue;
-            const started = if (profiling) std.Io.Timestamp.now(self.env.io, .awake) else undefined;
             self.execute(arena, &values, node, node_index) catch |err| {
                 const detail = if (err == error.Cuda or err == error.OpenCL or err == error.Metal) driver.lastError() else "";
                 setError("node {d} {s} ({s}): {t}{s}{s}", .{
@@ -571,16 +477,6 @@ const SessionState = struct {
                 });
                 return err;
             };
-            if (profiling) {
-                try self.env.gpu.synchronize();
-                const now = std.Io.Timestamp.now(self.env.io, .awake);
-                profile.record(
-                    self.env.allocator,
-                    if (self.fused.get(node_index)) |plan| plan.kind.label() else node.op_type,
-                    node_index,
-                    @intCast(now.nanoseconds - started.nanoseconds),
-                );
-            }
             for (self.effectiveInputs(node_index, node)) |name| {
                 if (name.len == 0) continue;
                 const remaining = uses.getPtr(name) orelse continue;

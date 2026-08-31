@@ -161,7 +161,7 @@ const Server = struct {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
-        const embedding = self.encode(body) catch |err| {
+        const embedding = self.encode(body, false) catch |err| {
             std.debug.print("  ! could not encode the frame: {t}: {s}\n", .{ err, sam3.onnx.lastError() });
             return request.respond("image encoder failed\n", .{ .status = .internal_server_error });
         };
@@ -181,29 +181,29 @@ const Server = struct {
         return self.respondMasks(request, masks);
     }
 
-    fn encode(self: *Server, body: []const u8) !sam3.Embedding {
+    fn encode(self: *Server, body: []const u8, comptime concept: bool) !(if (concept) sam3.ConceptEmbedding else sam3.Embedding) {
+        const cache = if (concept) &self.concept_cache else &self.cache;
         const hash = std.hash.Wyhash.hash(0, body);
-        if (self.cache) |cached| {
-            if (cached.hash == hash) return cached.embedding;
-        }
+        if (cache.*) |cached| if (cached.hash == hash) return cached.embedding;
         // Both encoder embeddings are large GPU allocations. Retain only the
         // prompting mode currently in use so switching modes cannot exhaust
         // device memory.
-        dropCache(&self.concept_cache);
+        dropCache(if (concept) &self.cache else &self.concept_cache);
 
         var img = try sam3.decode(self.gpa, body);
         defer img.deinit(self.gpa);
 
         const started = Io.Timestamp.now(self.io, .awake);
-        const embedding = try self.model.encode(img);
-        std.debug.print("  encoded {d}x{d} in {d:.2} s\n", .{
+        const embedding = if (concept) try self.model.encodeConcept(img) else try self.model.encode(img);
+        std.debug.print("  {s}encoded {d}x{d} in {d:.2} s\n", .{
+            if (concept) "concept-" else "",
             img.width,
             img.height,
             secondsSince(self.io, started),
         });
 
-        dropCache(&self.cache);
-        self.cache = .{ .hash = hash, .embedding = embedding };
+        dropCache(cache);
+        cache.* = .{ .hash = hash, .embedding = embedding };
         return embedding;
     }
 
@@ -231,7 +231,7 @@ const Server = struct {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
-        const embedding = self.encodeConcept(body) catch |err| {
+        const embedding = self.encode(body, true) catch |err| {
             std.debug.print("  ! concept encoder failed: {t}: {s}\n", .{ err, sam3.onnx.lastError() });
             return request.respond("could not encode that image\n", .{ .status = .bad_request });
         };
@@ -260,29 +260,6 @@ const Server = struct {
                 .{ .name = "cache-control", .value = "no-store" },
             },
         });
-    }
-
-    fn encodeConcept(self: *Server, body: []const u8) !sam3.ConceptEmbedding {
-        const hash = std.hash.Wyhash.hash(0, body);
-        if (self.concept_cache) |cached| {
-            if (cached.hash == hash) return cached.embedding;
-        }
-        dropCache(&self.cache);
-
-        var img = try sam3.decode(self.gpa, body);
-        defer img.deinit(self.gpa);
-
-        const started = Io.Timestamp.now(self.io, .awake);
-        const embedding = try self.model.encodeConcept(img);
-        std.debug.print("  concept-encoded {d}x{d} in {d:.2} s\n", .{
-            img.width,
-            img.height,
-            secondsSince(self.io, started),
-        });
-
-        dropCache(&self.concept_cache);
-        self.concept_cache = .{ .hash = hash, .embedding = embedding };
-        return embedding;
     }
 };
 

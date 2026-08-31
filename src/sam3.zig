@@ -81,8 +81,6 @@ pub const Model = struct {
     concept_tokenizer: tokenizer.Tokenizer,
 
     pub fn open(allocator: std.mem.Allocator, io: std.Io, paths: Paths) !Model {
-        try onnx.init(allocator, io);
-
         const env = try onnx.Env.init(allocator, io);
         errdefer env.deinit();
 
@@ -126,7 +124,7 @@ pub const Model = struct {
     }
 
     pub fn encode(self: *Model, img: Image) !Embedding {
-        const pixels = try self.preprocess(img);
+        const pixels = try preprocessCpu(self.allocator, img, @splat(0.5), @splat(0.5));
         defer self.allocator.free(pixels);
 
         const pixel_shape = [_]i64{ 1, 3, image_size, image_size };
@@ -187,7 +185,12 @@ pub const Model = struct {
     }
 
     pub fn encodeConcept(self: *Model, img: Image) !ConceptEmbedding {
-        const pixels = try self.preprocessConcept(img);
+        const pixels = try preprocessCpu(
+            self.allocator,
+            img,
+            .{ 0.485, 0.456, 0.406 },
+            .{ 0.229, 0.224, 0.225 },
+        );
         defer self.allocator.free(pixels);
 
         const pixel_shape = [_]i64{ 1, 3, image_size, image_size };
@@ -239,41 +242,21 @@ pub const Model = struct {
         defer for (results) |result| result.deinit();
         return Masks.takeConcept(self.allocator, results[0], results[2], threshold);
     }
-
-    fn preprocess(self: *Model, img: Image) ![]f32 {
-        return self.preprocessNormalized(img, @splat(0.5), @splat(0.5));
-    }
-
-    fn preprocessConcept(self: *Model, img: Image) ![]f32 {
-        return self.preprocessNormalized(
-            img,
-            .{ 0.485, 0.456, 0.406 },
-            .{ 0.229, 0.224, 0.225 },
-        );
-    }
-
-    fn preprocessNormalized(self: *Model, img: Image, mean: [3]f32, deviation: [3]f32) ![]f32 {
-        return preprocessCpu(self.allocator, img, mean, deviation);
-    }
 };
 
-pub const Embedding = struct {
-    levels: [embedding_names.len]onnx.Value,
+pub const Embedding = EmbeddingOf(embedding_names.len);
+pub const ConceptEmbedding = EmbeddingOf(concept_embedding_names.len);
 
-    pub fn deinit(self: *Embedding) void {
-        for (self.levels) |level| level.deinit();
-        self.* = undefined;
-    }
-};
+fn EmbeddingOf(comptime levels: usize) type {
+    return struct {
+        levels: [levels]onnx.Value,
 
-pub const ConceptEmbedding = struct {
-    levels: [concept_embedding_names.len]onnx.Value,
-
-    pub fn deinit(self: *ConceptEmbedding) void {
-        for (self.levels) |level| level.deinit();
-        self.* = undefined;
-    }
-};
+        pub fn deinit(self: *@This()) void {
+            for (self.levels) |level| level.deinit();
+            self.* = undefined;
+        }
+    };
+}
 
 pub const Masks = struct {
     allocator: std.mem.Allocator,
@@ -412,34 +395,14 @@ fn preprocessCpu(allocator: std.mem.Allocator, img: Image, mean: [3]f32, deviati
             const p10 = row1[x0];
             const p11 = row1[x1];
             const index = y * image_size + x;
+            const a: [3]f32 = .{ @floatFromInt(p00.r), @floatFromInt(p00.g), @floatFromInt(p00.b) };
+            const b: [3]f32 = .{ @floatFromInt(p01.r), @floatFromInt(p01.g), @floatFromInt(p01.b) };
+            const c: [3]f32 = .{ @floatFromInt(p10.r), @floatFromInt(p10.g), @floatFromInt(p10.b) };
+            const d: [3]f32 = .{ @floatFromInt(p11.r), @floatFromInt(p11.g), @floatFromInt(p11.b) };
 
             inline for (0..3) |channel| {
-                const a: f32 = @floatFromInt(switch (channel) {
-                    0 => p00.r,
-                    1 => p00.g,
-                    2 => p00.b,
-                    else => unreachable,
-                });
-                const b: f32 = @floatFromInt(switch (channel) {
-                    0 => p01.r,
-                    1 => p01.g,
-                    2 => p01.b,
-                    else => unreachable,
-                });
-                const c: f32 = @floatFromInt(switch (channel) {
-                    0 => p10.r,
-                    1 => p10.g,
-                    2 => p10.b,
-                    else => unreachable,
-                });
-                const d: f32 = @floatFromInt(switch (channel) {
-                    0 => p11.r,
-                    1 => p11.g,
-                    2 => p11.b,
-                    else => unreachable,
-                });
-                const top = a + (b - a) * wx;
-                const bottom = c + (d - c) * wx;
+                const top = a[channel] + (b[channel] - a[channel]) * wx;
+                const bottom = c[channel] + (d[channel] - c[channel]) * wx;
                 const resized = (top + (bottom - top) * wy) * byte_scale;
                 out[channel * plane_size + index] = (resized - mean[channel]) / deviation[channel];
             }

@@ -62,11 +62,7 @@ pub fn main(init: std.process.Init) !void {
         .concept_tokenizer_json = tokenizer_json,
     }) catch |err| {
         const last = sam3.onnx.lastError();
-        if (last.len > 0) {
-            std.debug.print("Failed to initialize model: {t}: {s}\n", .{ err, last });
-        } else {
-            std.debug.print("Failed to initialize model: {t}\n", .{err});
-        }
+        std.debug.print("Failed to initialize model: {t}{s}{s}\n", .{ err, if (last.len > 0) ": " else "", last });
         return err;
     };
     defer model.deinit();

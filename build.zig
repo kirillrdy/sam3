@@ -124,35 +124,26 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.setCwd(b.path("."));
 
-    const mod_tests = b.addTest(.{ .root_module = mod });
-    const run_mod_tests = b.addRunArtifact(mod_tests);
-
-    const web_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("web/server.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "sam3", .module = mod },
-            },
-        }),
-    });
-    const run_web_tests = b.addRunArtifact(web_tests);
-
-    const client_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("web/client.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zigimg", .module = zigimg.module("zigimg") },
-            },
-        }),
-    });
-    const run_client_tests = b.addRunArtifact(client_tests);
-
     const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_web_tests.step);
-    test_step.dependOn(&run_client_tests.step);
+    addTest(b, test_step, mod);
+    addTest(b, test_step, b.createModule(.{
+        .root_source_file = b.path("web/server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sam3", .module = mod },
+        },
+    }));
+    addTest(b, test_step, b.createModule(.{
+        .root_source_file = b.path("web/client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zigimg", .module = zigimg.module("zigimg") },
+        },
+    }));
+}
+
+fn addTest(b: *std.Build, step: *std.Build.Step, module: *std.Build.Module) void {
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
 }
