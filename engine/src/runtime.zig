@@ -986,6 +986,7 @@ const SessionState = struct {
         if (std.mem.eql(u8, node.op_type, "QuantizeLinear")) return self.quantizeLinear(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "ReduceMean")) return self.reduceMean(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "ReduceMax")) return self.reduceMax(arena, values, node);
+        if (std.mem.eql(u8, node.op_type, "LSTM")) return self.lstm(arena, values, node);
         return Error.UnsupportedOperator;
     }
 
@@ -3686,6 +3687,162 @@ const SessionState = struct {
         errdefer self.releaseStorage(storage);
         try uploadFloats(arena, storage.buffer, out);
         try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
+    }
+
+    fn lstm(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
+        const x = try self.input(arena, values, node.inputs[0]);
+        const w = try self.input(arena, values, node.inputs[1]);
+        const r = try self.input(arena, values, node.inputs[2]);
+
+        if (x.dims.len != 3 or w.dims.len != 3 or r.dims.len != 3) return Error.InvalidShape;
+
+        const seq_len: usize = @intCast(x.dims[0]);
+        const batch_size: usize = @intCast(x.dims[1]);
+        const input_size: usize = @intCast(x.dims[2]);
+        const num_directions: usize = @intCast(w.dims[0]);
+        const hidden_size: usize = @intCast(r.dims[2]);
+
+        const bias = if (node.inputs.len > 3 and node.inputs[3].len != 0)
+            try self.input(arena, values, node.inputs[3])
+        else
+            null;
+
+        const initial_h = if (node.inputs.len > 5 and node.inputs[5].len != 0)
+            try self.input(arena, values, node.inputs[5])
+        else
+            null;
+
+        const initial_c = if (node.inputs.len > 6 and node.inputs[6].len != 0)
+            try self.input(arena, values, node.inputs[6])
+        else
+            null;
+
+        const x_data = try arena.alloc(f32, try x.count());
+        try downloadFloats(arena, try x.gpuBuffer(), x_data);
+
+        const w_data = try arena.alloc(f32, try w.count());
+        try downloadFloats(arena, try w.gpuBuffer(), w_data);
+
+        const r_data = try arena.alloc(f32, try r.count());
+        try downloadFloats(arena, try r.gpuBuffer(), r_data);
+
+        const b_data = if (bias) |b| blk: {
+            const buf = try arena.alloc(f32, try b.count());
+            try downloadFloats(arena, try b.gpuBuffer(), buf);
+            break :blk buf;
+        } else null;
+
+        const h_init_data = if (initial_h) |h0| blk: {
+            const buf = try arena.alloc(f32, try h0.count());
+            try downloadFloats(arena, try h0.gpuBuffer(), buf);
+            break :blk buf;
+        } else null;
+
+        const c_init_data = if (initial_c) |c0| blk: {
+            const buf = try arena.alloc(f32, try c0.count());
+            try downloadFloats(arena, try c0.gpuBuffer(), buf);
+            break :blk buf;
+        } else null;
+
+        const y_count = seq_len * num_directions * batch_size * hidden_size;
+        const y_data = try arena.alloc(f32, y_count);
+
+        const yh_count = num_directions * batch_size * hidden_size;
+        const yh_data = try arena.alloc(f32, yh_count);
+
+        const yc_count = num_directions * batch_size * hidden_size;
+        const yc_data = try arena.alloc(f32, yc_count);
+
+        const h_prev = try arena.alloc(f32, num_directions * batch_size * hidden_size);
+        const c_prev = try arena.alloc(f32, num_directions * batch_size * hidden_size);
+
+        if (h_init_data) |h0| {
+            @memcpy(h_prev, h0);
+        } else {
+            @memset(h_prev, 0);
+        }
+
+        if (c_init_data) |c0| {
+            @memcpy(c_prev, c0);
+        } else {
+            @memset(c_prev, 0);
+        }
+
+        const gates = try arena.alloc(f32, 4 * hidden_size);
+
+        for (0..num_directions) |d| {
+            const w_dir = w_data[d * 4 * hidden_size * input_size .. (d + 1) * 4 * hidden_size * input_size];
+            const r_dir = r_data[d * 4 * hidden_size * hidden_size .. (d + 1) * 4 * hidden_size * hidden_size];
+            const wb_dir = if (b_data) |b| b[d * 8 * hidden_size .. d * 8 * hidden_size + 4 * hidden_size] else null;
+            const rb_dir = if (b_data) |b| b[d * 8 * hidden_size + 4 * hidden_size .. (d + 1) * 8 * hidden_size] else null;
+
+            for (0..seq_len) |t_step| {
+                const t = if (d == 0) t_step else seq_len - 1 - t_step;
+
+                for (0..batch_size) |b_idx| {
+                    const x_t = x_data[(t * batch_size + b_idx) * input_size .. (t * batch_size + b_idx + 1) * input_size];
+                    const h_t_prev = h_prev[(d * batch_size + b_idx) * hidden_size .. (d * batch_size + b_idx + 1) * hidden_size];
+                    const c_t_prev = c_prev[(d * batch_size + b_idx) * hidden_size .. (d * batch_size + b_idx + 1) * hidden_size];
+
+                    for (0..4 * hidden_size) |g| {
+                        var val: f32 = 0;
+                        const w_row = w_dir[g * input_size .. (g + 1) * input_size];
+                        for (x_t, w_row) |xi, wi| val += xi * wi;
+
+                        const r_row = r_dir[g * hidden_size .. (g + 1) * hidden_size];
+                        for (h_t_prev, r_row) |hi, ri| val += hi * ri;
+
+                        if (wb_dir) |wb| val += wb[g];
+                        if (rb_dir) |rb| val += rb[g];
+
+                        gates[g] = val;
+                    }
+
+                    const y_out = y_data[((t * num_directions + d) * batch_size + b_idx) * hidden_size .. ((t * num_directions + d) * batch_size + b_idx + 1) * hidden_size];
+
+                    for (0..hidden_size) |h| {
+                        const i_gate = 1.0 / (1.0 + @exp(-gates[h]));
+                        const o_gate = 1.0 / (1.0 + @exp(-gates[hidden_size + h]));
+                        const f_gate = 1.0 / (1.0 + @exp(-gates[2 * hidden_size + h]));
+                        const c_gate = std.math.tanh(gates[3 * hidden_size + h]);
+
+                        const c_new = f_gate * c_t_prev[h] + i_gate * c_gate;
+                        const h_new = o_gate * std.math.tanh(c_new);
+
+                        c_t_prev[h] = c_new;
+                        h_t_prev[h] = h_new;
+                        y_out[h] = h_new;
+                    }
+                }
+            }
+        }
+
+        @memcpy(yh_data, h_prev);
+        @memcpy(yc_data, c_prev);
+
+        if (node.outputs.len > 0 and node.outputs[0].len > 0) {
+            const y_dims = try arena.dupe(i64, &.{ @intCast(seq_len), @intCast(num_directions), @intCast(batch_size), @intCast(hidden_size) });
+            const y_storage = try self.newStorage(y_count);
+            errdefer self.releaseStorage(y_storage);
+            try uploadFloats(arena, y_storage.buffer, y_data);
+            try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = y_dims, .data = .{ .gpu = y_storage } });
+        }
+
+        if (node.outputs.len > 1 and node.outputs[1].len > 0) {
+            const yh_dims = try arena.dupe(i64, &.{ @intCast(num_directions), @intCast(batch_size), @intCast(hidden_size) });
+            const yh_storage = try self.newStorage(yh_count);
+            errdefer self.releaseStorage(yh_storage);
+            try uploadFloats(arena, yh_storage.buffer, yh_data);
+            try self.put(arena, values, node.outputs[1], .{ .dtype = .f32, .dims = yh_dims, .data = .{ .gpu = yh_storage } });
+        }
+
+        if (node.outputs.len > 2 and node.outputs[2].len > 0) {
+            const yc_dims = try arena.dupe(i64, &.{ @intCast(num_directions), @intCast(batch_size), @intCast(hidden_size) });
+            const yc_storage = try self.newStorage(yc_count);
+            errdefer self.releaseStorage(yc_storage);
+            try uploadFloats(arena, yc_storage.buffer, yc_data);
+            try self.put(arena, values, node.outputs[2], .{ .dtype = .f32, .dims = yc_dims, .data = .{ .gpu = yc_storage } });
+        }
     }
 };
 
