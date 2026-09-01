@@ -3,18 +3,17 @@
 Native SAM 3 image segmentation and text lookup with CUDA, Intel ARC, OpenCL, and Metal
 backends. Model graphs execute through the repository's Zig ONNX runtime.
 
-## Run the web UI
+- support CUDA, Intel Arc, OpenCL, Metal
+- zero dependencies ( except for metal backend )
+- native Zig PTX output without cuda toolchain
+- fast compilation
+- small binaries
+- target older GPUs  `-Dsm=sm_61`
 
-On NVIDIA GPUs (defaults to Ada `sm_89`):
+## Run the web UI
 
 ```sh
 zig build run --release=fast -Ddevice=cuda
-```
-
-For older GPUs (e.g. GTX 1080 / Pascal `sm_61`), set the compute capability with `-Dsm`:
-
-```sh
-zig build run --release=fast -Ddevice=cuda -Dsm=sm_61
 ```
 
 Then open <http://127.0.0.1:3000/>.
