@@ -496,6 +496,11 @@ const SessionState = struct {
                 if (remaining.* == 0) self.release(tensor);
             }
         }
+
+        var it = values.valueIterator();
+        while (it.next()) |tensor_ptr| {
+            self.release(tensor_ptr.*);
+        }
     }
 
     /// Finds every `MatMul -> Softmax -> MatMul` an attention is spelled as,
@@ -1088,6 +1093,7 @@ const SessionState = struct {
                     self.env.pool.give(self.env.allocator, storage.buffer);
                     self.env.allocator.destroy(storage);
                 }
+                tensor.data = .{ .host = &.{} };
             },
             else => {},
         }
