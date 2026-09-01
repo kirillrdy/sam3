@@ -395,6 +395,7 @@ const Fusion = struct {
 const SessionState = struct {
     env: *State,
     graph: onnx.Graph,
+    arena: std.mem.Allocator = undefined,
     constants: std.StringHashMapUnmanaged(driver.Buffer(Element)) = .empty,
     /// Transposed convolution weights, reordered once into the row per output
     /// channel and tap that the matrix product wants.
@@ -429,6 +430,7 @@ const SessionState = struct {
         var arena_state: std.heap.ArenaAllocator = .init(self.env.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
+        self.arena = arena;
 
         var values: std.StringHashMapUnmanaged(*Tensor) = .empty;
         defer values.deinit(arena);
@@ -1079,8 +1081,7 @@ const SessionState = struct {
     }
 
     fn newStorage(self: *SessionState, count: usize) !*Storage {
-        const storage = try self.env.allocator.create(Storage);
-        errdefer self.env.allocator.destroy(storage);
+        const storage = try self.arena.create(Storage);
         storage.* = .{ .buffer = try self.env.pool.take(count) };
         return storage;
     }
@@ -1091,7 +1092,6 @@ const SessionState = struct {
                 storage.references -= 1;
                 if (storage.references == 0) {
                     self.env.pool.give(self.env.allocator, storage.buffer);
-                    self.env.allocator.destroy(storage);
                 }
                 tensor.data = .{ .host = &.{} };
             },
@@ -1440,8 +1440,10 @@ const SessionState = struct {
     }
 
     fn releaseStorage(self: *SessionState, storage: *Storage) void {
-        self.env.pool.give(self.env.allocator, storage.buffer);
-        self.env.allocator.destroy(storage);
+        storage.references -= 1;
+        if (storage.references == 0) {
+            self.env.pool.give(self.env.allocator, storage.buffer);
+        }
     }
 
     fn shape(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
