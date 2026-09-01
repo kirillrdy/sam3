@@ -1114,21 +1114,42 @@ const SessionState = struct {
     fn conv(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
         const x = try self.input(arena, values, node.inputs[0]);
         const weight = try self.input(arena, values, node.inputs[1]);
-        if (x.dims.len != 4 or weight.dims.len != 4) return Error.InvalidShape;
+        const is_1d = x.dims.len == 3 and weight.dims.len == 3;
+        if (!is_1d and (x.dims.len != 4 or weight.dims.len != 4)) return Error.InvalidShape;
+
+        const x_d0 = x.dims[0];
+        const x_c = x.dims[1];
+        const x_h: i64 = if (is_1d) 1 else x.dims[2];
+        const x_w: i64 = if (is_1d) x.dims[2] else x.dims[3];
+
+        const w_out = weight.dims[0];
+        const w_in = weight.dims[1];
+        const w_h: i64 = if (is_1d) 1 else weight.dims[2];
+        const w_w: i64 = if (is_1d) weight.dims[2] else weight.dims[3];
+
         const strides = node.ints("strides");
         const pads = node.ints("pads");
         const dilations = node.ints("dilations");
-        const sh: i64 = if (strides.len == 0) 1 else strides[0];
-        const sw: i64 = if (strides.len == 0) 1 else strides[1];
-        const ph0: i64 = if (pads.len == 0) 0 else pads[0];
-        const pw0: i64 = if (pads.len == 0) 0 else pads[1];
-        const ph1: i64 = if (pads.len < 4) ph0 else pads[2];
-        const pw1: i64 = if (pads.len < 4) pw0 else pads[3];
-        const dh: i64 = if (dilations.len == 0) 1 else dilations[0];
-        const dw: i64 = if (dilations.len == 0) 1 else dilations[1];
-        const out_h = @divFloor(x.dims[2] + ph0 + ph1 - dh * (weight.dims[2] - 1) - 1, sh) + 1;
-        const out_w = @divFloor(x.dims[3] + pw0 + pw1 - dw * (weight.dims[3] - 1) - 1, sw) + 1;
-        const dims = try arena.dupe(i64, &.{ x.dims[0], weight.dims[0], out_h, out_w });
+
+        const sh: i64 = if (is_1d) 1 else (if (strides.len == 0) 1 else strides[0]);
+        const sw: i64 = if (is_1d) (if (strides.len == 0) 1 else strides[0]) else (if (strides.len < 2) 1 else strides[1]);
+
+        const ph0: i64 = if (is_1d) 0 else (if (pads.len == 0) 0 else pads[0]);
+        const pw0: i64 = if (is_1d) (if (pads.len == 0) 0 else pads[0]) else (if (pads.len < 2) 0 else pads[1]);
+        const ph1: i64 = if (is_1d) 0 else (if (pads.len < 4) ph0 else pads[2]);
+        const pw1: i64 = if (is_1d) (if (pads.len < 2) pw0 else pads[1]) else (if (pads.len < 4) pw0 else pads[3]);
+
+        const dh: i64 = if (is_1d) 1 else (if (dilations.len == 0) 1 else dilations[0]);
+        const dw: i64 = if (is_1d) (if (dilations.len == 0) 1 else dilations[0]) else (if (dilations.len < 2) 1 else dilations[1]);
+
+        const out_h = @divFloor(x_h + ph0 + ph1 - dh * (w_h - 1) - 1, sh) + 1;
+        const out_w = @divFloor(x_w + pw0 + pw1 - dw * (w_w - 1) - 1, sw) + 1;
+
+        const dims = if (is_1d)
+            try arena.dupe(i64, &.{ x_d0, w_out, out_w })
+        else
+            try arena.dupe(i64, &.{ x_d0, w_out, out_h, out_w });
+
         const count = try elementCount(dims);
         const storage = try self.newStorage(count);
         errdefer self.releaseStorage(storage);
@@ -1144,16 +1165,16 @@ const SessionState = struct {
             // kernel is an order of magnitude faster than walking the window
             // one tap at a time.
             const meta = [_]u32{
-                @intCast(x.dims[1]),      @intCast(x.dims[2]), @intCast(x.dims[3]),
-                @intCast(out_h),          @intCast(out_w),     @intCast(weight.dims[2]),
-                @intCast(weight.dims[3]), @intCast(sh),        @intCast(sw),
-                @intCast(ph0),            @intCast(pw0),       @intCast(dh),
+                @intCast(x_c),   @intCast(x_h),   @intCast(x_w),
+                @intCast(out_h), @intCast(out_w), @intCast(w_h),
+                @intCast(w_w),   @intCast(sh),    @intCast(sw),
+                @intCast(ph0),   @intCast(pw0),   @intCast(dh),
                 @intCast(dw),
             };
             try self.env.uploadMetadata(&meta);
-            const rows = weight.dims[0];
+            const rows = w_out;
             const pixels = out_h * out_w;
-            const depth = weight.dims[1] * weight.dims[2] * weight.dims[3];
+            const depth = w_in * w_h * w_w;
             const engines: enum { tensor, xmx, staged } = if (self.env.gpu.conv2d_gemm_tensor != null)
                 .tensor
             else if (self.env.gpu.conv2d_gemm_xmx != null)
@@ -1178,7 +1199,7 @@ const SessionState = struct {
             try kernel.launch(.{
                 .x = @intCast(@divFloor(pixels + tile_n - 1, tile_n)),
                 .y = @intCast(@divFloor(rows + tile_m - 1, tile_m)),
-                .z = @intCast(x.dims[0]),
+                .z = @intCast(x_d0),
             }, .{ .x = 16, .y = switch (engines) {
                 .tensor => conv_tensor_subgroups,
                 .xmx => matmul_xmx_subgroups,
@@ -1198,10 +1219,10 @@ const SessionState = struct {
         }
 
         const meta = [_]u32{
-            @intCast(x.dims[1]), @intCast(x.dims[2]), @intCast(x.dims[3]),      @intCast(weight.dims[0]),
-            @intCast(out_h),     @intCast(out_w),     @intCast(weight.dims[2]), @intCast(weight.dims[3]),
-            @intCast(sh),        @intCast(sw),        @intCast(ph0),            @intCast(pw0),
-            @intCast(dh),        @intCast(dw),        @intCast(groups),
+            @intCast(x_c),   @intCast(x_h),   @intCast(x_w), @intCast(w_out),
+            @intCast(out_h), @intCast(out_w), @intCast(w_h), @intCast(w_w),
+            @intCast(sh),    @intCast(sw),    @intCast(ph0), @intCast(pw0),
+            @intCast(dh),    @intCast(dw),    @intCast(groups),
         };
         try self.env.uploadMetadata(&meta);
         const block: u32 = 256;
