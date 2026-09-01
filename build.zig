@@ -47,6 +47,12 @@ pub fn build(b: *std.Build) void {
         "Port the web UI listens on (default: 3000)",
     ) orelse 3000;
 
+    const zig_http = b.option(
+        bool,
+        "zig-http",
+        "Use Zig's built-in HTTP client for model downloads instead of curl (default: false)",
+    ) orelse false;
+
     const zigimg = b.dependency("zigimg", .{
         .target = target,
         .optimize = optimize,
@@ -73,6 +79,7 @@ pub fn build(b: *std.Build) void {
     const server_options = b.addOptions();
     server_options.addOption([]const u8, "host", host);
     server_options.addOption(u16, "port", port);
+    server_options.addOption(bool, "zig_http", zig_http);
 
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,

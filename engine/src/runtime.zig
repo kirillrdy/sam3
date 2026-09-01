@@ -973,6 +973,12 @@ const SessionState = struct {
         if (std.mem.eql(u8, node.op_type, "Identity")) return self.identity(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "Softmax")) return self.softmax(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "LayerNormalization")) return self.layerNorm(arena, values, node);
+        if (std.mem.eql(u8, node.op_type, "DynamicQuantizeLinear")) return self.dynamicQuantizeLinear(arena, values, node);
+        if (std.mem.eql(u8, node.op_type, "MatMulInteger")) return self.matmulInteger(arena, values, node);
+        if (std.mem.eql(u8, node.op_type, "DequantizeLinear")) return self.dequantizeLinear(arena, values, node);
+        if (std.mem.eql(u8, node.op_type, "QuantizeLinear")) return self.quantizeLinear(arena, values, node);
+        if (std.mem.eql(u8, node.op_type, "ReduceMean")) return self.reduceMean(arena, values, node);
+        if (std.mem.eql(u8, node.op_type, "ReduceMax")) return self.reduceMax(arena, values, node);
         return Error.UnsupportedOperator;
     }
 
@@ -2884,8 +2890,21 @@ const SessionState = struct {
         const count = try x.count();
         if (to == .f32) {
             if (!x.onHost()) return Error.UnsupportedDataType;
-            const storage = try self.deviceMask(arena, x.*);
+            const out = try arena.alloc(f32, count);
+            for (out, 0..) |*value, i| {
+                value.* = switch (x.dtype) {
+                    .i64 => @floatFromInt((try x.i64s())[i]),
+                    .i32 => @floatFromInt(@as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, x.data.host)))[i]),
+                    .u8 => @floatFromInt(x.data.host[i]),
+                    .i8 => @floatFromInt(@as(i8, @bitCast(x.data.host[i]))),
+                    .bool => if (x.data.host[i] != 0) 1.0 else 0.0,
+                    .f32 => @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, x.data.host)))[i],
+                    else => return Error.UnsupportedDataType,
+                };
+            }
+            const storage = try self.newStorage(count);
             errdefer self.releaseStorage(storage);
+            try uploadFloats(arena, storage.buffer, out);
             return self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
         }
 
@@ -2910,6 +2929,48 @@ const SessionState = struct {
                     value.* = if (downloaded) |f| @intFromFloat(@trunc(f[i])) else try x.element(i);
                 }
                 try self.put(arena, values, node.outputs[0], .{ .dtype = .i64, .dims = dims, .data = .{ .host = std.mem.sliceAsBytes(out) } });
+            },
+            .i32 => {
+                const out = try arena.alloc(i32, count);
+                for (out, 0..) |*value, i| {
+                    value.* = if (downloaded) |f| @intFromFloat(@trunc(f[i])) else switch (x.dtype) {
+                        .i64 => @intCast((try x.i64s())[i]),
+                        .i32 => @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, x.data.host)))[i],
+                        .u8 => x.data.host[i],
+                        .i8 => @as(i8, @bitCast(x.data.host[i])),
+                        .bool => x.data.host[i],
+                        else => @intCast(try x.element(i)),
+                    };
+                }
+                try self.put(arena, values, node.outputs[0], .{ .dtype = .i32, .dims = dims, .data = .{ .host = std.mem.sliceAsBytes(out) } });
+            },
+            .u8 => {
+                const out = try arena.alloc(u8, count);
+                for (out, 0..) |*value, i| {
+                    value.* = if (downloaded) |f| @intFromFloat(std.math.clamp(f[i], 0, 255)) else switch (x.dtype) {
+                        .i64 => @intCast((try x.i64s())[i]),
+                        .i32 => @intCast(@as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, x.data.host)))[i]),
+                        .u8 => x.data.host[i],
+                        .i8 => x.data.host[i],
+                        .bool => x.data.host[i],
+                        else => @intCast(try x.element(i)),
+                    };
+                }
+                try self.put(arena, values, node.outputs[0], .{ .dtype = .u8, .dims = dims, .data = .{ .host = out } });
+            },
+            .i8 => {
+                const out = try arena.alloc(u8, count);
+                for (out, 0..) |*value, i| {
+                    value.* = if (downloaded) |f| @bitCast(@as(i8, @intFromFloat(std.math.clamp(f[i], -128, 127)))) else switch (x.dtype) {
+                        .i64 => @bitCast(@as(i8, @intCast((try x.i64s())[i]))),
+                        .i32 => @bitCast(@as(i8, @intCast(@as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, x.data.host)))[i]))),
+                        .u8 => x.data.host[i],
+                        .i8 => x.data.host[i],
+                        .bool => x.data.host[i],
+                        else => @bitCast(@as(i8, @intCast(try x.element(i)))),
+                    };
+                }
+                try self.put(arena, values, node.outputs[0], .{ .dtype = .i8, .dims = dims, .data = .{ .host = out } });
             },
             else => return Error.UnsupportedDataType,
         }
@@ -3179,6 +3240,424 @@ const SessionState = struct {
         });
         try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
     }
+
+    fn dynamicQuantizeLinear(
+        self: *SessionState,
+        arena: std.mem.Allocator,
+        values: *std.StringHashMapUnmanaged(*Tensor),
+        node: onnx.Node,
+    ) !void {
+        const x = try self.input(arena, values, node.inputs[0]);
+        const count = try x.count();
+        const dims = try arena.dupe(i64, x.dims);
+
+        var x_f32: []const f32 = undefined;
+        if (x.onHost()) {
+            if (x.dtype == .f32) {
+                x_f32 = @alignCast(std.mem.bytesAsSlice(f32, x.data.host));
+            } else {
+                return Error.UnsupportedDataType;
+            }
+        } else {
+            const host = try arena.alloc(f32, count);
+            try downloadFloats(arena, try x.gpuBuffer(), host);
+            x_f32 = host;
+        }
+
+        var min_val: f32 = 0.0;
+        var max_val: f32 = 0.0;
+        if (x_f32.len > 0) {
+            for (x_f32) |v| {
+                if (v < min_val) min_val = v;
+                if (v > max_val) max_val = v;
+            }
+        }
+
+        const qmin: f32 = 0.0;
+        const qmax: f32 = 255.0;
+        const scale: f32 = if (max_val == min_val) 1.0 else (max_val - min_val) / (qmax - qmin);
+        const zero_point: u8 = @intFromFloat(std.math.clamp(std.math.round(-min_val / scale), qmin, qmax));
+
+        const y = try arena.alloc(u8, count);
+        const inv_scale = 1.0 / scale;
+        const zp_f32 = @as(f32, @floatFromInt(zero_point));
+        for (x_f32, y) |v, *out| {
+            const q = std.math.round(v * inv_scale) + zp_f32;
+            out.* = @intFromFloat(std.math.clamp(q, qmin, qmax));
+        }
+
+        try self.put(arena, values, node.outputs[0], .{
+            .dtype = .u8,
+            .dims = dims,
+            .data = .{ .host = y },
+        });
+
+        if (node.outputs.len > 1 and node.outputs[1].len > 0) {
+            const scale_buf = try arena.alloc(f32, 1);
+            scale_buf[0] = scale;
+            const scale_dims = try arena.dupe(i64, &.{});
+            try self.put(arena, values, node.outputs[1], .{
+                .dtype = .f32,
+                .dims = scale_dims,
+                .data = .{ .host = std.mem.sliceAsBytes(scale_buf) },
+            });
+        }
+
+        if (node.outputs.len > 2 and node.outputs[2].len > 0) {
+            const zp_buf = try arena.alloc(u8, 1);
+            zp_buf[0] = zero_point;
+            const zp_dims = try arena.dupe(i64, &.{});
+            try self.put(arena, values, node.outputs[2], .{
+                .dtype = .u8,
+                .dims = zp_dims,
+                .data = .{ .host = zp_buf },
+            });
+        }
+    }
+
+    fn matmulInteger(
+        self: *SessionState,
+        arena: std.mem.Allocator,
+        values: *std.StringHashMapUnmanaged(*Tensor),
+        node: onnx.Node,
+    ) !void {
+        const a = try self.input(arena, values, node.inputs[0]);
+        const b = try self.input(arena, values, node.inputs[1]);
+
+        var a_zp: i32 = 0;
+        if (node.inputs.len > 2 and node.inputs[2].len != 0) {
+            const a_zp_tensor = try self.input(arena, values, node.inputs[2]);
+            if (a_zp_tensor.data.host.len > 0) {
+                a_zp = switch (a_zp_tensor.dtype) {
+                    .u8 => a_zp_tensor.data.host[0],
+                    .i8 => @as(i8, @bitCast(a_zp_tensor.data.host[0])),
+                    .i32 => @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, a_zp_tensor.data.host)))[0],
+                    else => 0,
+                };
+            }
+        }
+
+        var b_zp: i32 = 0;
+        if (node.inputs.len > 3 and node.inputs[3].len != 0) {
+            const b_zp_tensor = try self.input(arena, values, node.inputs[3]);
+            if (b_zp_tensor.data.host.len > 0) {
+                b_zp = switch (b_zp_tensor.dtype) {
+                    .u8 => b_zp_tensor.data.host[0],
+                    .i8 => @as(i8, @bitCast(b_zp_tensor.data.host[0])),
+                    .i32 => @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, b_zp_tensor.data.host)))[0],
+                    else => 0,
+                };
+            }
+        }
+
+        const rank_a = a.dims.len;
+        const rank_b = b.dims.len;
+        if (rank_a < 2 or rank_b < 2) return Error.UnsupportedOperator;
+
+        const m = a.dims[rank_a - 2];
+        const k = a.dims[rank_a - 1];
+        const bk = b.dims[rank_b - 2];
+        const n = b.dims[rank_b - 1];
+        if (k != bk) return Error.InvalidShape;
+
+        const batch_dims = try broadcastShape(arena, a.dims[0 .. rank_a - 2], b.dims[0 .. rank_b - 2]);
+        const dims = try arena.alloc(i64, batch_dims.len + 2);
+        @memcpy(dims[0..batch_dims.len], batch_dims);
+        dims[dims.len - 2] = m;
+        dims[dims.len - 1] = n;
+
+        const batches = try elementCount(batch_dims);
+        const a_batches = try elementCount(a.dims[0 .. rank_a - 2]);
+        const b_batches = try elementCount(b.dims[0 .. rank_b - 2]);
+
+        const out_count = try elementCount(dims);
+        const out = try arena.alloc(i32, out_count);
+
+        const a_bytes = a.data.host;
+        const b_bytes = b.data.host;
+
+        const m_usize: usize = @intCast(m);
+        const n_usize: usize = @intCast(n);
+        const k_usize: usize = @intCast(k);
+
+        for (0..batches) |batch_idx| {
+            const a_batch_idx = if (a_batches == 1) 0 else batch_idx;
+            const b_batch_idx = if (b_batches == 1) 0 else batch_idx;
+
+            const a_slice = a_bytes[a_batch_idx * m_usize * k_usize .. (a_batch_idx + 1) * m_usize * k_usize];
+            const b_slice = b_bytes[b_batch_idx * k_usize * n_usize .. (b_batch_idx + 1) * k_usize * n_usize];
+            const c_slice = out[batch_idx * m_usize * n_usize .. (batch_idx + 1) * m_usize * n_usize];
+
+            for (0..m_usize) |row| {
+                const a_row = a_slice[row * k_usize .. (row + 1) * k_usize];
+                const c_row = c_slice[row * n_usize .. (row + 1) * n_usize];
+
+                for (0..n_usize) |col| {
+                    var sum: i32 = 0;
+                    for (0..k_usize) |depth| {
+                        const a_val: i32 = @as(i32, a_row[depth]) - a_zp;
+                        const b_val: i32 = @as(i32, b_slice[depth * n_usize + col]) - b_zp;
+                        sum += a_val * b_val;
+                    }
+                    c_row[col] = sum;
+                }
+            }
+        }
+
+        try self.put(arena, values, node.outputs[0], .{
+            .dtype = .i32,
+            .dims = dims,
+            .data = .{ .host = std.mem.sliceAsBytes(out) },
+        });
+    }
+
+    fn dequantizeLinear(
+        self: *SessionState,
+        arena: std.mem.Allocator,
+        values: *std.StringHashMapUnmanaged(*Tensor),
+        node: onnx.Node,
+    ) !void {
+        const x = try self.input(arena, values, node.inputs[0]);
+        const scale_tensor = try self.input(arena, values, node.inputs[1]);
+        const scale: f32 = @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, scale_tensor.data.host)))[0];
+
+        var zp: f32 = 0.0;
+        if (node.inputs.len > 2 and node.inputs[2].len != 0) {
+            const zp_tensor = try self.input(arena, values, node.inputs[2]);
+            if (zp_tensor.data.host.len > 0) {
+                zp = switch (zp_tensor.dtype) {
+                    .u8 => @floatFromInt(zp_tensor.data.host[0]),
+                    .i8 => @floatFromInt(@as(i8, @bitCast(zp_tensor.data.host[0]))),
+                    .i32 => @floatFromInt(@as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, zp_tensor.data.host)))[0]),
+                    .f32 => @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, zp_tensor.data.host)))[0],
+                    else => 0.0,
+                };
+            }
+        }
+
+        const count = try x.count();
+        const dims = try arena.dupe(i64, x.dims);
+        const out = try arena.alloc(f32, count);
+
+        for (out, 0..) |*val, i| {
+            const x_val: f32 = switch (x.dtype) {
+                .u8 => @floatFromInt(x.data.host[i]),
+                .i8 => @floatFromInt(@as(i8, @bitCast(x.data.host[i]))),
+                .i32 => @floatFromInt(@as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, x.data.host)))[i]),
+                .f32 => @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, x.data.host)))[i],
+                else => return Error.UnsupportedDataType,
+            };
+            val.* = (x_val - zp) * scale;
+        }
+
+        const storage = try self.newStorage(count);
+        errdefer self.releaseStorage(storage);
+        try uploadFloats(arena, storage.buffer, out);
+        try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
+    }
+
+    fn quantizeLinear(
+        self: *SessionState,
+        arena: std.mem.Allocator,
+        values: *std.StringHashMapUnmanaged(*Tensor),
+        node: onnx.Node,
+    ) !void {
+        const x = try self.input(arena, values, node.inputs[0]);
+        const scale_tensor = try self.input(arena, values, node.inputs[1]);
+        const scale: f32 = @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, scale_tensor.data.host)))[0];
+
+        var zp: f32 = 0.0;
+        if (node.inputs.len > 2 and node.inputs[2].len != 0) {
+            const zp_tensor = try self.input(arena, values, node.inputs[2]);
+            if (zp_tensor.data.host.len > 0) {
+                zp = switch (zp_tensor.dtype) {
+                    .u8 => @floatFromInt(zp_tensor.data.host[0]),
+                    .i8 => @floatFromInt(@as(i8, @bitCast(zp_tensor.data.host[0]))),
+                    .i32 => @floatFromInt(@as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, zp_tensor.data.host)))[0]),
+                    .f32 => @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, zp_tensor.data.host)))[0],
+                    else => 0.0,
+                };
+            }
+        }
+
+        const count = try x.count();
+        const dims = try arena.dupe(i64, x.dims);
+
+        var x_f32: []const f32 = undefined;
+        if (x.onHost()) {
+            if (x.dtype == .f32) {
+                x_f32 = @alignCast(std.mem.bytesAsSlice(f32, x.data.host));
+            } else {
+                return Error.UnsupportedDataType;
+            }
+        } else {
+            const host = try arena.alloc(f32, count);
+            try downloadFloats(arena, try x.gpuBuffer(), host);
+            x_f32 = host;
+        }
+
+        const y = try arena.alloc(u8, count);
+        const inv_scale = 1.0 / scale;
+        for (x_f32, y) |v, *out| {
+            const q = std.math.round(v * inv_scale) + zp;
+            out.* = @intFromFloat(std.math.clamp(q, 0.0, 255.0));
+        }
+
+        try self.put(arena, values, node.outputs[0], .{
+            .dtype = .u8,
+            .dims = dims,
+            .data = .{ .host = y },
+        });
+    }
+
+    fn reduceMean(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
+        const x = try self.input(arena, values, node.inputs[0]);
+        if (x.dims.len > max_rank) return Error.RankTooLarge;
+        const axes = if (node.inputs.len > 1 and node.inputs[1].len != 0)
+            try (try self.input(arena, values, node.inputs[1])).i64s()
+        else
+            node.ints("axes");
+        if (axes.len == 0) return Error.UnsupportedOperator;
+
+        var strides: [max_rank]u32 = @splat(0);
+        denseStrides(x.dims, &strides);
+
+        const kept = try arena.dupe(i64, x.dims);
+        var collapsed: [max_rank]bool = @splat(false);
+        var swept_dims: [max_rank]u32 = @splat(0);
+        var swept_strides: [max_rank]u32 = @splat(0);
+        var reduced: usize = 0;
+        var swept: usize = 1;
+        for (axes) |raw| {
+            const axis = normalizeAxis(raw, x.dims.len);
+            if (collapsed[axis]) return Error.InvalidShape;
+            collapsed[axis] = true;
+            swept_dims[reduced] = @intCast(x.dims[axis]);
+            swept_strides[reduced] = strides[axis];
+            swept *= @intCast(x.dims[axis]);
+            kept[axis] = 1;
+            reduced += 1;
+        }
+
+        const rank = x.dims.len;
+        var metadata: [4 * max_rank]u32 = @splat(0);
+        for (kept, 0..) |dim, i| metadata[i] = @intCast(dim);
+        @memcpy(metadata[rank..][0..rank], strides[0..rank]);
+        @memcpy(metadata[2 * rank ..][0..reduced], swept_dims[0..reduced]);
+        @memcpy(metadata[2 * rank + reduced ..][0..reduced], swept_strides[0..reduced]);
+        try self.env.uploadMetadata(metadata[0 .. 2 * rank + 2 * reduced]);
+
+        const count = try elementCount(kept);
+        const storage = try self.newStorage(count);
+        errdefer self.releaseStorage(storage);
+        const xb = try x.gpuBuffer();
+        const block: u32 = 256;
+        try self.env.gpu.sum_axes.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{
+            xb.ptr,
+            storage.buffer.ptr,
+            self.env.metadata.ptr,
+            @as(u32, @intCast(rank)),
+            @as(u32, @intCast(reduced)),
+            @as(u32, @intCast(swept)),
+            @as(u32, @intCast(count)),
+        });
+
+        const inv_swept: f32 = 1.0 / @as(f32, @floatFromInt(swept));
+        const factor_storage = try self.newStorage(1);
+        defer self.releaseStorage(factor_storage);
+        try uploadFloats(arena, factor_storage.buffer, &.{inv_swept});
+
+        var mul_meta: [3 * max_rank]u32 = @splat(0);
+        for (kept, 0..) |dim, i| mul_meta[i] = @intCast(dim);
+        var kept_strides: [max_rank]u32 = @splat(0);
+        denseStrides(kept, &kept_strides);
+        @memcpy(mul_meta[rank .. 2 * rank][0..rank], kept_strides[0..rank]);
+        try self.env.uploadMetadata(mul_meta[0 .. 3 * rank]);
+
+        try self.env.gpu.binary.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{
+            storage.buffer.ptr,
+            factor_storage.buffer.ptr,
+            storage.buffer.ptr,
+            self.env.metadata.ptr,
+            @as(u32, @intCast(rank)),
+            @as(u32, @intCast(count)),
+            @intFromEnum(Binary.Mul),
+            @as(u32, @intCast(count)),
+            @as(u32, 0),
+        });
+
+        var dims = kept;
+        if (node.int("keepdims", 1) == 0) {
+            var shrunk: std.ArrayList(i64) = .empty;
+            for (kept, 0..) |dim, axis| if (!collapsed[axis]) try shrunk.append(arena, dim);
+            dims = shrunk.items;
+        }
+        try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
+    }
+
+    fn reduceMax(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
+        const x = try self.input(arena, values, node.inputs[0]);
+        const axes = if (node.inputs.len > 1 and node.inputs[1].len != 0)
+            try (try self.input(arena, values, node.inputs[1])).i64s()
+        else
+            node.ints("axes");
+        if (axes.len == 0) return Error.UnsupportedOperator;
+
+        const count = try x.count();
+        const rank = x.dims.len;
+        const kept = try arena.dupe(i64, x.dims);
+        var collapsed: [max_rank]bool = @splat(false);
+        for (axes) |raw| {
+            const axis = normalizeAxis(raw, rank);
+            collapsed[axis] = true;
+            kept[axis] = 1;
+        }
+
+        var strides: [max_rank]u32 = @splat(0);
+        denseStrides(x.dims, &strides);
+
+        const out_count = try elementCount(kept);
+        const out = try arena.alloc(f32, out_count);
+        @memset(out, -std.math.inf(f32));
+
+        var x_f32: []const f32 = undefined;
+        if (x.onHost()) {
+            if (x.dtype == .f32) {
+                x_f32 = @alignCast(std.mem.bytesAsSlice(f32, x.data.host));
+            } else {
+                return Error.UnsupportedDataType;
+            }
+        } else {
+            const host = try arena.alloc(f32, count);
+            try downloadFloats(arena, try x.gpuBuffer(), host);
+            x_f32 = host;
+        }
+
+        for (x_f32, 0..) |val, i| {
+            var out_idx: usize = 0;
+            var rem = i;
+            for (0..rank) |d| {
+                const coord = rem / strides[d];
+                rem %= strides[d];
+                if (!collapsed[d]) {
+                    out_idx = out_idx * @as(usize, @intCast(x.dims[d])) + coord;
+                }
+            }
+            if (val > out[out_idx]) out[out_idx] = val;
+        }
+
+        var dims = kept;
+        if (node.int("keepdims", 1) == 0) {
+            var shrunk: std.ArrayList(i64) = .empty;
+            for (kept, 0..) |dim, axis| if (!collapsed[axis]) try shrunk.append(arena, dim);
+            dims = shrunk.items;
+        }
+
+        const storage = try self.newStorage(out_count);
+        errdefer self.releaseStorage(storage);
+        try uploadFloats(arena, storage.buffer, out);
+        try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
+    }
 };
 
 /// Compares a string attribute against what a kernel actually implements,
@@ -3215,7 +3694,8 @@ fn broadcastShape(arena: std.mem.Allocator, a: []const i64, b: []const i64) ![]i
 }
 
 /// Row-major strides for a dense tensor, the layout every buffer here is in.
-fn denseStrides(dims: []const i64, result: *[max_rank]u32) void {
+fn denseStrides(dims: []const i64, result: []u32) void {
+    std.debug.assert(result.len >= dims.len);
     var stride: u32 = 1;
     var axis = dims.len;
     while (axis > 0) {
@@ -3379,8 +3859,13 @@ pub const Value = struct {
     pub fn deinit(self: Value) void {
         if (self.owned_allocator) |allocator| {
             allocator.free(self.dims);
-            if (self.owned_f32) |data| allocator.free(data);
-            if (self.owned_i64) |data| allocator.free(data);
+            if (self.owned_f32) |data| {
+                allocator.free(data);
+            } else if (self.owned_i64) |data| {
+                allocator.free(data);
+            } else if (self.bytes.len != 0) {
+                allocator.free(self.bytes);
+            }
         }
     }
 
@@ -3418,6 +3903,10 @@ pub const Value = struct {
                 const data = try allocator.dupe(i64, source);
                 return .{ .dtype = .i64, .bytes = std.mem.sliceAsBytes(data), .dims = dims, .owned_allocator = allocator, .owned_i64 = data };
             },
+            .i32, .u8, .i8, .bool => {
+                const data = try allocator.dupe(u8, tensor.data.host);
+                return .{ .dtype = tensor.dtype, .bytes = data, .dims = dims, .owned_allocator = allocator };
+            },
             else => return Error.UnsupportedDataType,
         }
     }
@@ -3425,4 +3914,42 @@ pub const Value = struct {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "INT8 DynamicQuantizeLinear and MatMulInteger math" {
+    const testing = std.testing;
+
+    // Test DynamicQuantizeLinear calculation
+    const x = [_]f32{ -1.0, 0.0, 1.0, 2.0 };
+    var min_val: f32 = 0.0;
+    var max_val: f32 = 0.0;
+    for (x) |v| {
+        if (v < min_val) min_val = v;
+        if (v > max_val) max_val = v;
+    }
+    const scale = (max_val - min_val) / 255.0;
+    const zero_point: u8 = @intFromFloat(std.math.clamp(std.math.round(-min_val / scale), 0.0, 255.0));
+
+    try testing.expect(scale > 0.0);
+    try testing.expectEqual(@as(u8, 85), zero_point);
+
+    // Test 2x2 integer matrix product
+    const a = [_]u8{ 1, 2, 3, 4 };
+    const b = [_]u8{ 5, 6, 7, 8 };
+    var c = [_]i32{ 0, 0, 0, 0 };
+
+    for (0..2) |row| {
+        for (0..2) |col| {
+            var sum: i32 = 0;
+            for (0..2) |k| {
+                sum += @as(i32, a[row * 2 + k]) * @as(i32, b[k * 2 + col]);
+            }
+            c[row * 2 + col] = sum;
+        }
+    }
+
+    try testing.expectEqual(@as(i32, 19), c[0]);
+    try testing.expectEqual(@as(i32, 22), c[1]);
+    try testing.expectEqual(@as(i32, 43), c[2]);
+    try testing.expectEqual(@as(i32, 50), c[3]);
 }

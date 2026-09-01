@@ -9,7 +9,7 @@ const client_wasm = @embedFile("client_wasm");
 const Asset = struct {
     name: []const u8,
     url: []const u8,
-    sha256: ?[]const u8,
+    sha256: []const u8,
 };
 
 const assets = [_]Asset{
@@ -23,7 +23,7 @@ const assets = [_]Asset{
     .{ .name = "text_encoder_int4.onnx.data", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/text_encoder_int4.onnx.data", .sha256 = "fcf5adcd6ad7b5155409367efde4ee981a5482fd5700191499a666ba4b637db5" },
     .{ .name = "decoder_int4.onnx", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/decoder_int4.onnx", .sha256 = "2354b510382d025ab897fa158abe7da94d065c8f880d60aed35b01820361b06d" },
     .{ .name = "tokenizer.json", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/tokenizer.json", .sha256 = "6d9109cc838977f3ca94a379eec36aecc7c807e1785cd729660ca2fc0171fb35" },
-    .{ .name = "cat.png", .url = "https://images.unsplash.com/photo-1514888286974-6c03e2ca1dba?w=800&fm=png", .sha256 = null },
+    .{ .name = "cat.png", .url = "https://images.unsplash.com/photo-1514888286974-6c03e2ca1dba?w=800&fm=png", .sha256 = "073adcb0112290e6928d6978789a6fa8266d2fa30a3d7c4330591d0b8c59d6a3" },
 };
 
 const CachedAssets = struct {
@@ -110,13 +110,9 @@ fn ensureAsset(
     asset: Asset,
     path: []const u8,
 ) !void {
-    if (asset.sha256) |want| {
-        if (try hashFile(io, path)) |have| {
-            if (std.ascii.eqlIgnoreCase(&have, want)) return;
-            std.debug.print("  {s}: present but checksum differs, re-downloading\n", .{asset.name});
-        }
-    } else if (fileExists(io, path)) {
-        return;
+    if (try hashFile(io, path)) |have| {
+        if (std.ascii.eqlIgnoreCase(&have, asset.sha256)) return;
+        std.debug.print("  {s}: present but checksum differs, re-downloading\n", .{asset.name});
     }
 
     const part_path = try std.fmt.allocPrint(allocator, "{s}.part", .{path});
@@ -125,29 +121,22 @@ fn ensureAsset(
     std.debug.print("  {s}: downloading\n", .{asset.name});
     try download(allocator, io, asset.url, part_path);
 
-    if (asset.sha256) |want| {
-        const have = (try hashFile(io, part_path)) orelse return error.DownloadDisappeared;
-        if (!std.ascii.eqlIgnoreCase(&have, want)) {
-            std.debug.print(
-                \\  {s}: SHA-256 mismatch
-                \\    expected {s}
-                \\    actual   {s}
-                \\
-            , .{ asset.name, want, &have });
-            std.Io.Dir.cwd().deleteFile(io, part_path) catch {};
-            return error.ChecksumMismatch;
-        }
-        std.debug.print("  {s}: verified against the published SHA-256\n", .{asset.name});
+    const have = (try hashFile(io, part_path)) orelse return error.DownloadDisappeared;
+    if (!std.ascii.eqlIgnoreCase(&have, asset.sha256)) {
+        std.debug.print(
+            \\  {s}: SHA-256 mismatch
+            \\    expected {s}
+            \\    actual   {s}
+            \\
+        , .{ asset.name, asset.sha256, &have });
+        std.Io.Dir.cwd().deleteFile(io, part_path) catch {};
+        return error.ChecksumMismatch;
     }
+    std.debug.print("  {s}: verified against the published SHA-256\n", .{asset.name});
 
     const cwd = std.Io.Dir.cwd();
     try cwd.rename(part_path, cwd, path, io);
     std.debug.print("  {s}: cached in {s}\n", .{ asset.name, path });
-}
-
-fn fileExists(io: std.Io, path: []const u8) bool {
-    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
-    return true;
 }
 
 fn download(
@@ -156,9 +145,10 @@ fn download(
     url: []const u8,
     dest_path: []const u8,
 ) !void {
-    downloadWithCurl(allocator, io, url, dest_path) catch {
+    if (build_options.zig_http) {
         return downloadZig(allocator, io, url, dest_path);
-    };
+    }
+    return downloadWithCurl(allocator, io, url, dest_path);
 }
 
 fn downloadWithCurl(

@@ -19,5 +19,8 @@ zig build run --release=fast -Ddevice=cuda -Dsm=sm_61
 
 Then open <http://127.0.0.1:3000/>.
 
+Model downloads use `curl` by default. If `curl` is not available, build with
+`-Dzig-http=true` to use Zig's built-in HTTP client instead.
+
 The CUDA backend runs pure native Zig + PTX kernels (including double-buffered
 TF32 Tensor Core MMA and fused bias/GELU epilogues on Ampere+, with synchronous staging fallbacks for earlier architectures) directly on the CUDA driver API without linking or requiring cuBLAS.
