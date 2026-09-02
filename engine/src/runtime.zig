@@ -344,6 +344,7 @@ const Tensor = struct {
             .u8 => self.data.host[index],
             .i8 => @as(i8, @bitCast(self.data.host[index])),
             .bool => (try self.bools())[index],
+            .f32 => @intFromFloat(@trunc(@as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, self.data.host)))[index])),
             else => Error.UnsupportedDataType,
         };
     }
@@ -2996,7 +2997,12 @@ const SessionState = struct {
 
         // Anything but f32 lives on the host already; f32 has to come back
         // down. The copy is stream-ordered, so it sees the finished tensor.
-        const downloaded: ?[]f32 = if (x.onHost()) null else blk: {
+        const downloaded: ?[]const f32 = if (x.onHost()) blk: {
+            if (x.dtype == .f32) {
+                break :blk @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, x.data.host)));
+            }
+            break :blk null;
+        } else blk: {
             const host = try arena.alloc(f32, count);
             try downloadFloats(arena, try x.gpuBuffer(), host);
             break :blk host;
