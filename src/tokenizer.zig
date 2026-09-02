@@ -11,42 +11,85 @@ pub const Encoding = struct {
 
 pub const Tokenizer = struct {
     allocator: std.mem.Allocator,
-    json: std.json.Parsed(std.json.Value),
+    /// Owns every key the two maps point at. Held by pointer because a
+    /// `Tokenizer` is returned and stored by value, and an arena cannot be
+    /// allocated from once it has been copied.
+    strings: *std.heap.ArenaAllocator,
     vocab: std.StringHashMapUnmanaged(i64) = .empty,
     merges: std.StringHashMapUnmanaged(usize) = .empty,
 
+    /// Reads the vocabulary and the merge ranks straight off the token stream.
+    /// Building a `std.json.Value` of the whole file instead costs a few
+    /// hundred megabytes for the life of the process, against the ~1.5 MiB of
+    /// keys that are actually wanted.
     pub fn init(allocator: std.mem.Allocator, bytes: []const u8) !Tokenizer {
-        var json = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
-        errdefer json.deinit();
+        const strings = try allocator.create(std.heap.ArenaAllocator);
+        strings.* = .init(allocator);
 
-        var self: Tokenizer = .{ .allocator = allocator, .json = json };
+        // Owns `strings` from here on, so releasing it is `deinit`'s alone.
+        var self: Tokenizer = .{ .allocator = allocator, .strings = strings };
         errdefer self.deinit();
 
-        const model = self.json.value.object.get("model") orelse return error.BadTokenizer;
-        const vocab = model.object.get("vocab") orelse return error.BadTokenizer;
-        var vocab_it = vocab.object.iterator();
-        while (vocab_it.next()) |entry| {
-            try self.vocab.put(allocator, entry.key_ptr.*, entry.value_ptr.integer);
+        var scratch: std.heap.ArenaAllocator = .init(allocator);
+        defer scratch.deinit();
+
+        var scanner: std.json.Scanner = .initCompleteInput(allocator, bytes);
+        defer scanner.deinit();
+
+        try expect(&scanner, .object_begin);
+        while (try nextKey(&scanner, scratch.allocator())) |key| {
+            if (!std.mem.eql(u8, key, "model")) {
+                try scanner.skipValue();
+                continue;
+            }
+            try expect(&scanner, .object_begin);
+            while (try nextKey(&scanner, scratch.allocator())) |field| {
+                if (std.mem.eql(u8, field, "vocab")) {
+                    try self.readVocab(&scanner, scratch.allocator());
+                } else if (std.mem.eql(u8, field, "merges")) {
+                    try self.readMerges(&scanner, scratch.allocator());
+                } else {
+                    try scanner.skipValue();
+                }
+            }
         }
 
-        const merges = model.object.get("merges") orelse return error.BadTokenizer;
-        for (merges.array.items, 0..) |merge, rank| {
-            if (merge.array.items.len != 2) return error.BadTokenizer;
-            const left = merge.array.items[0].string;
-            const right = merge.array.items[1].string;
-            const key = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ left, right });
-            errdefer allocator.free(key);
-            try self.merges.put(allocator, key, rank);
-        }
+        if (self.vocab.count() == 0 or self.merges.count() == 0) return error.BadTokenizer;
         return self;
     }
 
+    fn readVocab(self: *Tokenizer, scanner: *std.json.Scanner, scratch: std.mem.Allocator) !void {
+        try expect(scanner, .object_begin);
+        while (try nextKey(scanner, scratch)) |token| {
+            const id = try nextInteger(scanner, scratch);
+            const owned = try self.strings.allocator().dupe(u8, token);
+            try self.vocab.put(self.allocator, owned, id);
+        }
+    }
+
+    fn readMerges(self: *Tokenizer, scanner: *std.json.Scanner, scratch: std.mem.Allocator) !void {
+        try expect(scanner, .array_begin);
+        var rank: usize = 0;
+        while (true) : (rank += 1) {
+            switch (try scanner.next()) {
+                .array_begin => {},
+                .array_end => return,
+                else => return error.BadTokenizer,
+            }
+            const left = try nextString(scanner, scratch);
+            const right = try nextString(scanner, scratch);
+            try expect(scanner, .array_end);
+
+            const key = try std.fmt.allocPrint(self.strings.allocator(), "{s}\x00{s}", .{ left, right });
+            try self.merges.put(self.allocator, key, rank);
+        }
+    }
+
     pub fn deinit(self: *Tokenizer) void {
-        var merge_it = self.merges.keyIterator();
-        while (merge_it.next()) |key| self.allocator.free(key.*);
         self.merges.deinit(self.allocator);
         self.vocab.deinit(self.allocator);
-        self.json.deinit();
+        self.strings.deinit();
+        self.allocator.destroy(self.strings);
         self.* = undefined;
     }
 
@@ -135,6 +178,35 @@ pub const Tokenizer = struct {
     }
 };
 
+fn expect(scanner: *std.json.Scanner, want: std.meta.Tag(std.json.Token)) !void {
+    if (std.meta.activeTag(try scanner.next()) != want) return error.BadTokenizer;
+}
+
+/// The next object key, or null once the object has ended. The slice is only
+/// valid until `scratch` is released.
+fn nextKey(scanner: *std.json.Scanner, scratch: std.mem.Allocator) !?[]const u8 {
+    return switch (try scanner.nextAlloc(scratch, .alloc_if_needed)) {
+        .string, .allocated_string => |text| text,
+        .object_end => null,
+        else => error.BadTokenizer,
+    };
+}
+
+fn nextString(scanner: *std.json.Scanner, scratch: std.mem.Allocator) ![]const u8 {
+    return switch (try scanner.nextAlloc(scratch, .alloc_if_needed)) {
+        .string, .allocated_string => |text| text,
+        else => error.BadTokenizer,
+    };
+}
+
+fn nextInteger(scanner: *std.json.Scanner, scratch: std.mem.Allocator) !i64 {
+    const digits = switch (try scanner.nextAlloc(scratch, .alloc_if_needed)) {
+        .number, .allocated_number => |text| text,
+        else => return error.BadTokenizer,
+    };
+    return std.fmt.parseInt(i64, digits, 10) catch error.BadTokenizer;
+}
+
 fn nextPiece(text: []const u8, cursor: *usize) ?[]const u8 {
     while (cursor.* < text.len and std.ascii.isWhitespace(text[cursor.*])) cursor.* += 1;
     if (cursor.* == text.len) return null;
@@ -184,6 +256,43 @@ fn byteCodepoint(byte: u8) u21 {
             value >= 0xae)) offset += 1;
     }
     return 256 + offset;
+}
+
+test "the vocabulary and the merge ranks are read past everything else" {
+    const json =
+        \\{
+        \\  "version": "1.0",
+        \\  "added_tokens": [{"id": 0, "content": "<|startoftext|>"}],
+        \\  "normalizer": {"type": "Sequence", "normalizers": []},
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "dropout": null,
+        \\    "vocab": {"a</w>": 7, "in": 11, "\u00e9": 12, "\"": 13},
+        \\    "merges": [["i", "n"], ["t", "h"]]
+        \\  }
+        \\}
+    ;
+
+    var tok = try Tokenizer.init(std.testing.allocator, json);
+    defer tok.deinit();
+
+    try std.testing.expectEqual(4, tok.vocab.count());
+    try std.testing.expectEqual(@as(i64, 7), tok.vocab.get("a</w>").?);
+    try std.testing.expectEqual(@as(i64, 11), tok.vocab.get("in").?);
+    // Escapes have to survive the stream, since keys are matched byte for byte.
+    try std.testing.expectEqual(@as(i64, 12), tok.vocab.get("\u{e9}").?);
+    try std.testing.expectEqual(@as(i64, 13), tok.vocab.get("\"").?);
+
+    try std.testing.expectEqual(2, tok.merges.count());
+    try std.testing.expectEqual(@as(usize, 0), tok.merges.get("i\x00n").?);
+    try std.testing.expectEqual(@as(usize, 1), tok.merges.get("t\x00h").?);
+}
+
+test "a document with no BPE model in it is refused" {
+    try std.testing.expectError(
+        error.BadTokenizer,
+        Tokenizer.init(std.testing.allocator, "{\"version\": \"1.0\"}"),
+    );
 }
 
 test "CLIP byte encoding uses the GPT-2 alphabet" {
