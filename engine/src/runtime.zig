@@ -2243,15 +2243,20 @@ const SessionState = struct {
     fn binary(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node, op: Binary) !void {
         const a = try self.input(arena, values, node.inputs[0]);
         const b = try self.input(arena, values, node.inputs[1]);
-        if (a.dtype == .i64 and b.dtype == .i64) {
+        if ((a.dtype == .i64 or a.dtype == .i32) and (b.dtype == .i64 or b.dtype == .i32)) {
             const dims = try broadcastShape(arena, a.dims, b.dims);
             if (dims.len > max_rank) return Error.RankTooLarge;
             var astrides: [max_rank]u32 = @splat(0);
             var bstrides: [max_rank]u32 = @splat(0);
             makeBroadcastStrides(a.dims, dims, &astrides);
             makeBroadcastStrides(b.dims, dims, &bstrides);
-            const av = try a.i64s();
-            const bv = try b.i64s();
+            const a_count = try a.count();
+            const b_count = try b.count();
+            const av = try arena.alloc(i64, a_count);
+            for (0..a_count) |i| av[i] = if (a.dtype == .i64) (try a.i64s())[i] else @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, a.data.host)))[i];
+            const bv = try arena.alloc(i64, b_count);
+            for (0..b_count) |i| bv[i] = if (b.dtype == .i64) (try b.i64s())[i] else @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, b.data.host)))[i];
+
             const out = try arena.alloc(i64, try elementCount(dims));
             const modulo = std.mem.eql(u8, node.op_type, "Mod");
             for (out, 0..) |*value, i| {
@@ -2267,9 +2272,52 @@ const SessionState = struct {
                     else => return Error.UnsupportedOperator,
                 };
             }
-            return self.put(arena, values, node.outputs[0], .{ .dtype = .i64, .dims = dims, .data = .{ .host = std.mem.sliceAsBytes(out) } });
+            return self.put(arena, values, node.outputs[0], .{ .dtype = if (a.dtype == .i64 or b.dtype == .i64) .i64 else .i32, .dims = dims, .data = .{ .host = std.mem.sliceAsBytes(out) } });
         }
         if (a.dtype != .f32 or b.dtype != .f32) return Error.UnsupportedDataType;
+
+        if (a.onHost() and b.onHost()) {
+            const dims = try broadcastShape(arena, a.dims, b.dims);
+            if (dims.len > max_rank) return Error.RankTooLarge;
+            var astrides: [max_rank]u32 = @splat(0);
+            var bstrides: [max_rank]u32 = @splat(0);
+            makeBroadcastStrides(a.dims, dims, &astrides);
+            makeBroadcastStrides(b.dims, dims, &bstrides);
+            const av: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, a.data.host));
+            const bv: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, b.data.host));
+            const out = try arena.alloc(f32, try elementCount(dims));
+            for (out, 0..) |*value, i| {
+                const x = av[hostOffset(i, dims, &astrides)];
+                const y = bv[hostOffset(i, dims, &bstrides)];
+                value.* = switch (op) {
+                    .Add => x + y,
+                    .Sub => x - y,
+                    .Mul => x * y,
+                    .Div => x / y,
+                    .Min => @min(x, y),
+                    .Max => @max(x, y),
+                    .Pow => std.math.pow(f32, x, y),
+                    else => return Error.UnsupportedOperator,
+                };
+            }
+            return self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .host = std.mem.sliceAsBytes(out) } });
+        }
+
+        if (a.onHost()) {
+            const count = try a.count();
+            const storage = try self.newStorage(count);
+            errdefer self.releaseStorage(storage);
+            try uploadFloats(arena, storage.buffer, @alignCast(std.mem.bytesAsSlice(f32, a.data.host)));
+            a.* = .{ .dtype = .f32, .dims = a.dims, .data = .{ .gpu = storage } };
+        }
+        if (b.onHost()) {
+            const count = try b.count();
+            const storage = try self.newStorage(count);
+            errdefer self.releaseStorage(storage);
+            try uploadFloats(arena, storage.buffer, @alignCast(std.mem.bytesAsSlice(f32, b.data.host)));
+            b.* = .{ .dtype = .f32, .dims = b.dims, .data = .{ .gpu = storage } };
+        }
+
         const rank = @max(a.dims.len, b.dims.len);
         if (rank > 8) return Error.InvalidShape;
         const dims = try broadcastShape(arena, a.dims, b.dims);
