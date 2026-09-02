@@ -2865,7 +2865,6 @@ const SessionState = struct {
     fn compare(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node, op: Compare) !void {
         const a = try self.input(arena, values, node.inputs[0]);
         const b = try self.input(arena, values, node.inputs[1]);
-        if (!a.onHost() or !b.onHost()) return Error.UnsupportedDataType;
         const dims = try broadcastShape(arena, a.dims, b.dims);
         if (dims.len > max_rank) return Error.RankTooLarge;
         var astrides: [max_rank]u32 = @splat(0);
@@ -2874,16 +2873,48 @@ const SessionState = struct {
         makeBroadcastStrides(b.dims, dims, &bstrides);
 
         const out = try arena.alloc(u8, try elementCount(dims));
-        for (out, 0..) |*value, i| {
-            const x = try a.element(hostOffset(i, dims, &astrides));
-            const y = try b.element(hostOffset(i, dims, &bstrides));
-            value.* = @intFromBool(switch (op) {
-                .Equal => x == y,
-                .Greater => x > y,
-                .GreaterOrEqual => x >= y,
-                .Less => x < y,
-                .LessOrEqual => x <= y,
-            });
+
+        if (a.dtype == .f32 or b.dtype == .f32) {
+            const a_count = try a.count();
+            const b_count = try b.count();
+            const a_f32: []const f32 = if (a.onHost())
+                @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, a.data.host)))
+            else blk: {
+                const host = try arena.alloc(f32, a_count);
+                try downloadFloats(arena, try a.gpuBuffer(), host);
+                break :blk host;
+            };
+            const b_f32: []const f32 = if (b.onHost())
+                @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, b.data.host)))
+            else blk: {
+                const host = try arena.alloc(f32, b_count);
+                try downloadFloats(arena, try b.gpuBuffer(), host);
+                break :blk host;
+            };
+
+            for (out, 0..) |*value, i| {
+                const x = a_f32[hostOffset(i, dims, &astrides)];
+                const y = b_f32[hostOffset(i, dims, &bstrides)];
+                value.* = @intFromBool(switch (op) {
+                    .Equal => x == y,
+                    .Greater => x > y,
+                    .GreaterOrEqual => x >= y,
+                    .Less => x < y,
+                    .LessOrEqual => x <= y,
+                });
+            }
+        } else {
+            for (out, 0..) |*value, i| {
+                const x = try a.element(hostOffset(i, dims, &astrides));
+                const y = try b.element(hostOffset(i, dims, &bstrides));
+                value.* = @intFromBool(switch (op) {
+                    .Equal => x == y,
+                    .Greater => x > y,
+                    .GreaterOrEqual => x >= y,
+                    .Less => x < y,
+                    .LessOrEqual => x <= y,
+                });
+            }
         }
         try self.put(arena, values, node.outputs[0], .{ .dtype = .bool, .dims = dims, .data = .{ .host = out } });
     }
@@ -2915,7 +2946,7 @@ const SessionState = struct {
         makeBroadcastStrides(a.dims, dims, &astrides);
         makeBroadcastStrides(b.dims, dims, &bstrides);
 
-        if (a.dtype == .i64 and b.dtype == .i64) {
+        if ((a.dtype == .i64 or a.dtype == .i32) and (b.dtype == .i64 or b.dtype == .i32)) {
             const out = try arena.alloc(i64, count);
             for (out, 0..) |*value, i| {
                 value.* = if (try condition.element(hostOffset(i, dims, &cstrides)) != 0)
@@ -2923,7 +2954,28 @@ const SessionState = struct {
                 else
                     try b.element(hostOffset(i, dims, &bstrides));
             }
-            return self.put(arena, values, node.outputs[0], .{ .dtype = .i64, .dims = dims, .data = .{ .host = std.mem.sliceAsBytes(out) } });
+            if (a.dtype == .i64 or b.dtype == .i64) {
+                return self.put(arena, values, node.outputs[0], .{ .dtype = .i64, .dims = dims, .data = .{ .host = std.mem.sliceAsBytes(out) } });
+            } else {
+                const out_i32 = try arena.alloc(i32, count);
+                for (out, out_i32) |src, *dst| dst.* = @intCast(src);
+                return self.put(arena, values, node.outputs[0], .{ .dtype = .i32, .dims = dims, .data = .{ .host = std.mem.sliceAsBytes(out_i32) } });
+            }
+        }
+
+        if (a.onHost() and a.dtype == .f32) {
+            const a_count = try a.count();
+            const a_storage = try self.newStorage(a_count);
+            errdefer self.releaseStorage(a_storage);
+            try uploadFloats(arena, a_storage.buffer, @alignCast(std.mem.bytesAsSlice(f32, a.data.host)));
+            a.* = .{ .dtype = .f32, .dims = a.dims, .data = .{ .gpu = a_storage } };
+        }
+        if (b.onHost() and b.dtype == .f32) {
+            const b_count = try b.count();
+            const b_storage = try self.newStorage(b_count);
+            errdefer self.releaseStorage(b_storage);
+            try uploadFloats(arena, b_storage.buffer, @alignCast(std.mem.bytesAsSlice(f32, b.data.host)));
+            b.* = .{ .dtype = .f32, .dims = b.dims, .data = .{ .gpu = b_storage } };
         }
 
         // The condition is a host boolean but the branches are on the device,
