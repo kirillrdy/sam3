@@ -3142,9 +3142,42 @@ const SessionState = struct {
     }
 
     fn range(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
-        const start = try (try self.input(arena, values, node.inputs[0])).element(0);
-        const limit = try (try self.input(arena, values, node.inputs[1])).element(0);
-        const delta = try (try self.input(arena, values, node.inputs[2])).element(0);
+        const inp0 = try self.input(arena, values, node.inputs[0]);
+        const inp1 = try self.input(arena, values, node.inputs[1]);
+        const inp2 = try self.input(arena, values, node.inputs[2]);
+
+        if (inp0.dtype == .f32 or inp1.dtype == .f32 or inp2.dtype == .f32) {
+            const start: f32 = if (inp0.onHost()) @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, inp0.data.host)))[0] else blk: {
+                var f: [1]f32 = undefined;
+                try downloadFloats(arena, try inp0.gpuBuffer(), &f);
+                break :blk f[0];
+            };
+            const limit: f32 = if (inp1.onHost()) @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, inp1.data.host)))[0] else blk: {
+                var f: [1]f32 = undefined;
+                try downloadFloats(arena, try inp1.gpuBuffer(), &f);
+                break :blk f[0];
+            };
+            const delta: f32 = if (inp2.onHost()) @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, inp2.data.host)))[0] else blk: {
+                var f: [1]f32 = undefined;
+                try downloadFloats(arena, try inp2.gpuBuffer(), &f);
+                break :blk f[0];
+            };
+            if (delta == 0) return Error.InvalidShape;
+
+            var count: usize = 0;
+            if (delta > 0 and limit > start) count = @intFromFloat(@ceil((limit - start) / delta));
+            if (delta < 0 and limit < start) count = @intFromFloat(@ceil((start - limit) / -delta));
+
+            const out = try arena.alloc(f32, count);
+            for (out, 0..) |*value, i| value.* = start + @as(f32, @floatFromInt(i)) * delta;
+            const dims = try arena.dupe(i64, &.{@as(i64, @intCast(count))});
+            try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .host = std.mem.sliceAsBytes(out) } });
+            return;
+        }
+
+        const start = try inp0.element(0);
+        const limit = try inp1.element(0);
+        const delta = try inp2.element(0);
         if (delta == 0) return Error.InvalidShape;
 
         var count: usize = 0;
