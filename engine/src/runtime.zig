@@ -268,7 +268,6 @@ pub const Session = struct {
             state.folded.deinit(env.state.allocator);
         }
         try state.findFusions();
-        state.graph.releaseWeights();
         return .{ .state = state };
     }
 
@@ -938,6 +937,7 @@ const SessionState = struct {
                 read_since_release = 0;
             }
         }
+        if (read_since_release > 0) self.graph.releaseWeights();
         self.initializers_preloaded = true;
     }
 
