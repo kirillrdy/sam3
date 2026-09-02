@@ -3596,11 +3596,30 @@ const SessionState = struct {
     fn reduceMean(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
         const x = try self.input(arena, values, node.inputs[0]);
         if (x.dims.len > max_rank) return Error.RankTooLarge;
-        const axes = if (node.inputs.len > 1 and node.inputs[1].len != 0)
-            try (try self.input(arena, values, node.inputs[1])).i64s()
-        else
-            node.ints("axes");
-        if (axes.len == 0) return Error.UnsupportedOperator;
+        const axes_raw = if (node.inputs.len > 1 and node.inputs[1].len != 0) blk: {
+            const inp = try self.input(arena, values, node.inputs[1]);
+            const inp_count = try inp.count();
+            const ax = try arena.alloc(i64, inp_count);
+            for (0..inp_count) |i| {
+                ax[i] = if (inp.dtype == .i64) (try inp.i64s())[i] else @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, inp.data.host)))[i];
+            }
+            break :blk ax;
+        } else node.ints("axes");
+
+        const axes = if (axes_raw.len == 0) blk: {
+            if (node.int("noop_with_empty_axes", 0) == 1) {
+                break :blk @as([]const i64, &.{});
+            } else {
+                const all_axes = try arena.alloc(i64, x.dims.len);
+                for (all_axes, 0..) |*a, i| a.* = @intCast(i);
+                break :blk all_axes;
+            }
+        } else axes_raw;
+
+        if (axes.len == 0) {
+            const dims = try arena.dupe(i64, x.dims);
+            return self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = x.data });
+        }
 
         var strides: [max_rank]u32 = @splat(0);
         denseStrides(x.dims, &strides);
@@ -3680,11 +3699,30 @@ const SessionState = struct {
 
     fn reduceMax(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
         const x = try self.input(arena, values, node.inputs[0]);
-        const axes = if (node.inputs.len > 1 and node.inputs[1].len != 0)
-            try (try self.input(arena, values, node.inputs[1])).i64s()
-        else
-            node.ints("axes");
-        if (axes.len == 0) return Error.UnsupportedOperator;
+        const axes_raw = if (node.inputs.len > 1 and node.inputs[1].len != 0) blk: {
+            const inp = try self.input(arena, values, node.inputs[1]);
+            const inp_count = try inp.count();
+            const ax = try arena.alloc(i64, inp_count);
+            for (0..inp_count) |i| {
+                ax[i] = if (inp.dtype == .i64) (try inp.i64s())[i] else @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, inp.data.host)))[i];
+            }
+            break :blk ax;
+        } else node.ints("axes");
+
+        const axes = if (axes_raw.len == 0) blk: {
+            if (node.int("noop_with_empty_axes", 0) == 1) {
+                break :blk @as([]const i64, &.{});
+            } else {
+                const all_axes = try arena.alloc(i64, x.dims.len);
+                for (all_axes, 0..) |*a, i| a.* = @intCast(i);
+                break :blk all_axes;
+            }
+        } else axes_raw;
+
+        if (axes.len == 0) {
+            const dims = try arena.dupe(i64, x.dims);
+            return self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = x.data });
+        }
 
         const count = try x.count();
         const rank = x.dims.len;
