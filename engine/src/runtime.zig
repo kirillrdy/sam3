@@ -3738,46 +3738,106 @@ const SessionState = struct {
         denseStrides(x.dims, &strides);
 
         const out_count = try elementCount(kept);
-        const out = try arena.alloc(f32, out_count);
-        @memset(out, -std.math.inf(f32));
 
-        var x_f32: []const f32 = undefined;
-        if (x.onHost()) {
-            if (x.dtype == .f32) {
+        if (x.dtype == .f32) {
+            const out = try arena.alloc(f32, out_count);
+            @memset(out, -std.math.inf(f32));
+
+            var x_f32: []const f32 = undefined;
+            if (x.onHost()) {
                 x_f32 = @alignCast(std.mem.bytesAsSlice(f32, x.data.host));
             } else {
-                return Error.UnsupportedDataType;
+                const host = try arena.alloc(f32, count);
+                try downloadFloats(arena, try x.gpuBuffer(), host);
+                x_f32 = host;
             }
-        } else {
-            const host = try arena.alloc(f32, count);
-            try downloadFloats(arena, try x.gpuBuffer(), host);
-            x_f32 = host;
-        }
 
-        for (x_f32, 0..) |val, i| {
-            var out_idx: usize = 0;
-            var rem = i;
-            for (0..rank) |d| {
-                const coord = rem / strides[d];
-                rem %= strides[d];
-                if (!collapsed[d]) {
-                    out_idx = out_idx * @as(usize, @intCast(x.dims[d])) + coord;
+            for (x_f32, 0..) |val, i| {
+                var out_idx: usize = 0;
+                var rem = i;
+                for (0..rank) |d| {
+                    const coord = rem / strides[d];
+                    rem %= strides[d];
+                    if (!collapsed[d]) {
+                        out_idx = out_idx * @as(usize, @intCast(x.dims[d])) + coord;
+                    }
                 }
+                if (val > out[out_idx]) out[out_idx] = val;
             }
-            if (val > out[out_idx]) out[out_idx] = val;
-        }
 
-        var dims = kept;
-        if (node.int("keepdims", 1) == 0) {
-            var shrunk: std.ArrayList(i64) = .empty;
-            for (kept, 0..) |dim, axis| if (!collapsed[axis]) try shrunk.append(arena, dim);
-            dims = shrunk.items;
-        }
+            var dims = kept;
+            if (node.int("keepdims", 1) == 0) {
+                var shrunk: std.ArrayList(i64) = .empty;
+                for (kept, 0..) |dim, axis| if (!collapsed[axis]) try shrunk.append(arena, dim);
+                dims = shrunk.items;
+            }
 
-        const storage = try self.newStorage(out_count);
-        errdefer self.releaseStorage(storage);
-        try uploadFloats(arena, storage.buffer, out);
-        try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
+            const storage = try self.newStorage(out_count);
+            errdefer self.releaseStorage(storage);
+            try uploadFloats(arena, storage.buffer, out);
+            try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
+        } else if (x.dtype == .i64 or x.dtype == .i32) {
+            const out = try arena.alloc(i64, out_count);
+            @memset(out, std.math.minInt(i64));
+
+            const av = try arena.alloc(i64, count);
+            for (0..count) |i| av[i] = if (x.dtype == .i64) (try x.i64s())[i] else @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, x.data.host)))[i];
+
+            for (av, 0..) |val, i| {
+                var out_idx: usize = 0;
+                var rem = i;
+                for (0..rank) |d| {
+                    const coord = rem / strides[d];
+                    rem %= strides[d];
+                    if (!collapsed[d]) {
+                        out_idx = out_idx * @as(usize, @intCast(x.dims[d])) + coord;
+                    }
+                }
+                if (val > out[out_idx]) out[out_idx] = val;
+            }
+
+            var dims = kept;
+            if (node.int("keepdims", 1) == 0) {
+                var shrunk: std.ArrayList(i64) = .empty;
+                for (kept, 0..) |dim, axis| if (!collapsed[axis]) try shrunk.append(arena, dim);
+                dims = shrunk.items;
+            }
+
+            if (x.dtype == .i64) {
+                try self.put(arena, values, node.outputs[0], .{ .dtype = .i64, .dims = dims, .data = .{ .host = std.mem.sliceAsBytes(out) } });
+            } else {
+                const out_i32 = try arena.alloc(i32, out_count);
+                for (out, out_i32) |src, *dst| dst.* = @intCast(src);
+                try self.put(arena, values, node.outputs[0], .{ .dtype = .i32, .dims = dims, .data = .{ .host = std.mem.sliceAsBytes(out_i32) } });
+            }
+        } else if (x.dtype == .u8) {
+            const out = try arena.alloc(u8, out_count);
+            @memset(out, 0);
+
+            for (x.data.host, 0..) |val, i| {
+                var out_idx: usize = 0;
+                var rem = i;
+                for (0..rank) |d| {
+                    const coord = rem / strides[d];
+                    rem %= strides[d];
+                    if (!collapsed[d]) {
+                        out_idx = out_idx * @as(usize, @intCast(x.dims[d])) + coord;
+                    }
+                }
+                if (val > out[out_idx]) out[out_idx] = val;
+            }
+
+            var dims = kept;
+            if (node.int("keepdims", 1) == 0) {
+                var shrunk: std.ArrayList(i64) = .empty;
+                for (kept, 0..) |dim, axis| if (!collapsed[axis]) try shrunk.append(arena, dim);
+                dims = shrunk.items;
+            }
+
+            try self.put(arena, values, node.outputs[0], .{ .dtype = .u8, .dims = dims, .data = .{ .host = out } });
+        } else {
+            return Error.UnsupportedDataType;
+        }
     }
 
     fn lstm(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
