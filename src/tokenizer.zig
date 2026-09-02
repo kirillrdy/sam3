@@ -11,85 +11,53 @@ pub const Encoding = struct {
 
 pub const Tokenizer = struct {
     allocator: std.mem.Allocator,
-    /// Owns every key the two maps point at. Held by pointer because a
-    /// `Tokenizer` is returned and stored by value, and an arena cannot be
-    /// allocated from once it has been copied.
-    strings: *std.heap.ArenaAllocator,
+    arena: std.heap.ArenaAllocator,
     vocab: std.StringHashMapUnmanaged(i64) = .empty,
     merges: std.StringHashMapUnmanaged(usize) = .empty,
 
-    /// Reads the vocabulary and the merge ranks straight off the token stream.
-    /// Building a `std.json.Value` of the whole file instead costs a few
-    /// hundred megabytes for the life of the process, against the ~1.5 MiB of
-    /// keys that are actually wanted.
     pub fn init(allocator: std.mem.Allocator, bytes: []const u8) !Tokenizer {
-        const strings = try allocator.create(std.heap.ArenaAllocator);
-        strings.* = .init(allocator);
+        const TokenizerData = struct {
+            model: ?struct {
+                vocab: std.json.ArrayHashMap(i64),
+                merges: []const [2][]const u8,
+            } = null,
+        };
 
-        // Owns `strings` from here on, so releasing it is `deinit`'s alone.
-        var self: Tokenizer = .{ .allocator = allocator, .strings = strings };
+        var parsed = std.json.parseFromSlice(TokenizerData, allocator, bytes, .{
+            .ignore_unknown_fields = true,
+        }) catch return error.BadTokenizer;
+        defer parsed.deinit();
+
+        const model = parsed.value.model orelse return error.BadTokenizer;
+        if (model.vocab.map.count() == 0 or model.merges.len == 0) return error.BadTokenizer;
+
+        var self: Tokenizer = .{
+            .allocator = allocator,
+            .arena = .init(allocator),
+        };
         errdefer self.deinit();
 
-        var scratch: std.heap.ArenaAllocator = .init(allocator);
-        defer scratch.deinit();
+        const strings = self.arena.allocator();
 
-        var scanner: std.json.Scanner = .initCompleteInput(allocator, bytes);
-        defer scanner.deinit();
-
-        try expect(&scanner, .object_begin);
-        while (try nextKey(&scanner, scratch.allocator())) |key| {
-            if (!std.mem.eql(u8, key, "model")) {
-                try scanner.skipValue();
-                continue;
-            }
-            try expect(&scanner, .object_begin);
-            while (try nextKey(&scanner, scratch.allocator())) |field| {
-                if (std.mem.eql(u8, field, "vocab")) {
-                    try self.readVocab(&scanner, scratch.allocator());
-                } else if (std.mem.eql(u8, field, "merges")) {
-                    try self.readMerges(&scanner, scratch.allocator());
-                } else {
-                    try scanner.skipValue();
-                }
-            }
+        try self.vocab.ensureTotalCapacity(allocator, @intCast(model.vocab.map.count()));
+        for (model.vocab.map.keys(), model.vocab.map.values()) |k, v| {
+            const owned = try strings.dupe(u8, k);
+            self.vocab.putAssumeCapacity(owned, v);
         }
 
-        if (self.vocab.count() == 0 or self.merges.count() == 0) return error.BadTokenizer;
+        try self.merges.ensureTotalCapacity(allocator, @intCast(model.merges.len));
+        for (model.merges, 0..) |m, rank| {
+            const key = try std.fmt.allocPrint(strings, "{s}\x00{s}", .{ m[0], m[1] });
+            self.merges.putAssumeCapacity(key, rank);
+        }
+
         return self;
-    }
-
-    fn readVocab(self: *Tokenizer, scanner: *std.json.Scanner, scratch: std.mem.Allocator) !void {
-        try expect(scanner, .object_begin);
-        while (try nextKey(scanner, scratch)) |token| {
-            const id = try nextInteger(scanner, scratch);
-            const owned = try self.strings.allocator().dupe(u8, token);
-            try self.vocab.put(self.allocator, owned, id);
-        }
-    }
-
-    fn readMerges(self: *Tokenizer, scanner: *std.json.Scanner, scratch: std.mem.Allocator) !void {
-        try expect(scanner, .array_begin);
-        var rank: usize = 0;
-        while (true) : (rank += 1) {
-            switch (try scanner.next()) {
-                .array_begin => {},
-                .array_end => return,
-                else => return error.BadTokenizer,
-            }
-            const left = try nextString(scanner, scratch);
-            const right = try nextString(scanner, scratch);
-            try expect(scanner, .array_end);
-
-            const key = try std.fmt.allocPrint(self.strings.allocator(), "{s}\x00{s}", .{ left, right });
-            try self.merges.put(self.allocator, key, rank);
-        }
     }
 
     pub fn deinit(self: *Tokenizer) void {
         self.merges.deinit(self.allocator);
         self.vocab.deinit(self.allocator);
-        self.strings.deinit();
-        self.allocator.destroy(self.strings);
+        self.arena.deinit();
         self.* = undefined;
     }
 
@@ -177,35 +145,6 @@ pub const Tokenizer = struct {
         return ids;
     }
 };
-
-fn expect(scanner: *std.json.Scanner, want: std.meta.Tag(std.json.Token)) !void {
-    if (std.meta.activeTag(try scanner.next()) != want) return error.BadTokenizer;
-}
-
-/// The next object key, or null once the object has ended. The slice is only
-/// valid until `scratch` is released.
-fn nextKey(scanner: *std.json.Scanner, scratch: std.mem.Allocator) !?[]const u8 {
-    return switch (try scanner.nextAlloc(scratch, .alloc_if_needed)) {
-        .string, .allocated_string => |text| text,
-        .object_end => null,
-        else => error.BadTokenizer,
-    };
-}
-
-fn nextString(scanner: *std.json.Scanner, scratch: std.mem.Allocator) ![]const u8 {
-    return switch (try scanner.nextAlloc(scratch, .alloc_if_needed)) {
-        .string, .allocated_string => |text| text,
-        else => error.BadTokenizer,
-    };
-}
-
-fn nextInteger(scanner: *std.json.Scanner, scratch: std.mem.Allocator) !i64 {
-    const digits = switch (try scanner.nextAlloc(scratch, .alloc_if_needed)) {
-        .number, .allocated_number => |text| text,
-        else => return error.BadTokenizer,
-    };
-    return std.fmt.parseInt(i64, digits, 10) catch error.BadTokenizer;
-}
 
 fn nextPiece(text: []const u8, cursor: *usize) ?[]const u8 {
     while (cursor.* < text.len and std.ascii.isWhitespace(text[cursor.*])) cursor.* += 1;
