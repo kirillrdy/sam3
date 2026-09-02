@@ -1485,8 +1485,6 @@ const SessionState = struct {
         const indices = try self.input(arena, values, node.inputs[1]);
         if (data.dims.len == 0) return Error.InvalidShape;
         const axis = normalizeAxis(node.int("axis", 0), data.dims.len);
-        const ids = try indices.i64s();
-
         const axis_len: usize = @intCast(data.dims[axis]);
         const outer = try elementCount(data.dims[0..axis]);
         const inner = try elementCount(data.dims[axis + 1 ..]);
@@ -1501,11 +1499,19 @@ const SessionState = struct {
 
         // Resolve the negative indices once: both paths want them folded away,
         // and the kernel takes them unsigned.
-        const resolved = try arena.alloc(u32, ids.len);
-        for (ids, resolved) |index, *out| {
-            const normalized = if (index < 0) @as(i64, @intCast(axis_len)) + index else index;
+        const ids_count = try indices.count();
+        const resolved = try arena.alloc(u32, ids_count);
+        for (0..ids_count) |i| {
+            const raw_id: i64 = switch (indices.dtype) {
+                .i64 => (try indices.i64s())[i],
+                .i32 => @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, indices.data.host)))[i],
+                .u8 => indices.data.host[i],
+                .i8 => @as(i8, @bitCast(indices.data.host[i])),
+                else => return Error.UnsupportedDataType,
+            };
+            const normalized = if (raw_id < 0) @as(i64, @intCast(axis_len)) + raw_id else raw_id;
             if (normalized < 0 or normalized >= axis_len) return Error.InvalidShape;
-            out.* = @intCast(normalized);
+            resolved[i] = @intCast(normalized);
         }
 
         if (data.onHost()) {
@@ -3917,8 +3923,20 @@ fn hostSelect(arena: std.mem.Allocator, tensor: Tensor, sources: []const usize) 
             for (out, sources) |*value, index| value.* = source[index];
             return std.mem.sliceAsBytes(out);
         },
-        .bool => {
-            const source = try tensor.bools();
+        .f32 => {
+            const source: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, tensor.data.host));
+            const out = try arena.alloc(f32, sources.len);
+            for (out, sources) |*value, index| value.* = source[index];
+            return std.mem.sliceAsBytes(out);
+        },
+        .i32 => {
+            const source: []const i32 = @alignCast(std.mem.bytesAsSlice(i32, tensor.data.host));
+            const out = try arena.alloc(i32, sources.len);
+            for (out, sources) |*value, index| value.* = source[index];
+            return std.mem.sliceAsBytes(out);
+        },
+        .u8, .i8, .bool => {
+            const source = tensor.data.host;
             const out = try arena.alloc(u8, sources.len);
             for (out, sources) |*value, index| value.* = source[index];
             return out;
