@@ -2297,7 +2297,6 @@ const SessionState = struct {
                     .Min => @min(x, y),
                     .Max => @max(x, y),
                     .Pow => std.math.pow(f32, x, y),
-                    else => return Error.UnsupportedOperator,
                 };
             }
             return self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .host = std.mem.sliceAsBytes(out) } });
