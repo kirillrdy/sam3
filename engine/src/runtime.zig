@@ -340,6 +340,9 @@ const Tensor = struct {
     fn element(self: Tensor, index: usize) !i64 {
         return switch (self.dtype) {
             .i64 => (try self.i64s())[index],
+            .i32 => @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, self.data.host)))[index],
+            .u8 => self.data.host[index],
+            .i8 => @as(i8, @bitCast(self.data.host[index])),
             .bool => (try self.bools())[index],
             else => Error.UnsupportedDataType,
         };
