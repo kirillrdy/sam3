@@ -268,6 +268,7 @@ pub const Session = struct {
             state.folded.deinit(env.state.allocator);
         }
         try state.findFusions();
+        state.graph.releaseWeights();
         return .{ .state = state };
     }
 
@@ -911,8 +912,15 @@ const SessionState = struct {
         return plan.inputs();
     }
 
+    /// How much of the weight blob may be resident at once while it is being
+    /// uploaded. An initializer is read once, so the pages behind the ones
+    /// already on the device are dead, and dropping them keeps the peak
+    /// bounded instead of proportional to the size of the export.
+    const preload_residency = 64 * 1024 * 1024;
+
     fn preloadInitializers(self: *SessionState) !void {
         if (self.initializers_preloaded) return;
+        var read_since_release: usize = 0;
         for (self.graph.initializers) |source| {
             if (source.dtype != .f32 or source.name.len == 0) continue;
             const entry = try self.constants.getOrPut(self.env.allocator, source.name);
@@ -923,6 +931,12 @@ const SessionState = struct {
                 _ = self.constants.remove(source.name);
             }
             try uploadFloats(self.env.allocator, entry.value_ptr.*, source.f32s());
+
+            read_since_release += source.data.len;
+            if (read_since_release >= preload_residency) {
+                self.graph.releaseWeights();
+                read_since_release = 0;
+            }
         }
         self.initializers_preloaded = true;
     }
@@ -4226,11 +4240,25 @@ fn collapseAxes(given: []u32) []u32 {
 /// it through a scratch buffer first.
 fn uploadFloats(allocator: std.mem.Allocator, buffer: driver.Buffer(Element), source: []const f32) !void {
     if (Element == f32) return buffer.upload(source);
-    const scratch = try allocator.alloc(Element, source.len);
+    // Narrowed a window at a time. Sizing the scratch to the source instead
+    // means an embedding table briefly holds a second copy of itself on the
+    // host, which is the largest single allocation an export asks for.
+    const window = @min(source.len, narrowing_window);
+    const scratch = try allocator.alloc(Element, window);
     defer allocator.free(scratch);
-    for (scratch, source) |*narrow, value| narrow.* = @floatCast(value);
-    try buffer.upload(scratch);
+
+    var start: usize = 0;
+    while (start < source.len) {
+        const part = source[start..@min(start + window, source.len)];
+        for (scratch[0..part.len], part) |*narrow, value| narrow.* = @floatCast(value);
+        try buffer.slice(start, part.len).upload(scratch[0..part.len]);
+        start += part.len;
+    }
 }
+
+/// Elements narrowed per pass, so the scratch stays a few mebibytes whatever
+/// the weight it is feeding.
+const narrowing_window = 2 * 1024 * 1024;
 
 /// The same in reverse, for the graph outputs and the handful of operators
 /// that finish their work on the host.

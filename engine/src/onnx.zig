@@ -101,8 +101,11 @@ pub const ValueInfo = struct {
 
 pub const Graph = struct {
     arena: std.heap.ArenaAllocator,
+    io: std.Io,
     file: []align(std.heap.page_size_min) u8,
     weights: []align(std.heap.page_size_min) u8,
+    /// Where `weights` came from, so the mapping can be replaced in place.
+    weights_path: []const u8,
 
     nodes: []Node,
     initializers: []Tensor,
@@ -127,8 +130,10 @@ pub const Graph = struct {
         var graph = try parser.parseModel(file);
 
         graph.arena = arena;
+        graph.io = io;
         graph.file = file;
         graph.weights = parser.weights;
+        graph.weights_path = parser.weights_path;
         return graph;
     }
 
@@ -142,6 +147,30 @@ pub const Graph = struct {
 
     pub fn constant(self: Graph, name: []const u8) ?Tensor {
         return self.constants.get(name);
+    }
+
+    /// Drops the external weight blob out of the resident set without
+    /// invalidating anything that points into it. Every float initializer is
+    /// on the device once a session has opened, but the blob is still
+    /// addressed for the quantized and host-side constants, so it is replaced
+    /// in place rather than unmapped: the same file lands at the same
+    /// addresses, and whatever is still read faults back in a page at a time.
+    ///
+    /// Advising the range away is not enough on Darwin, which deactivates the
+    /// pages but leaves them counted as resident. A 1.8 GiB export otherwise
+    /// sits in the resident set for the life of the process.
+    pub fn releaseWeights(self: Graph) void {
+        if (self.weights.len == 0) return;
+        const file = std.Io.Dir.cwd().openFile(self.io, self.weights_path, .{}) catch return;
+        defer file.close(self.io);
+        _ = std.posix.mmap(
+            self.weights.ptr,
+            self.weights.len,
+            .{ .READ = true },
+            .{ .TYPE = .PRIVATE, .FIXED = true },
+            file.handle,
+            0,
+        ) catch return;
     }
 };
 
@@ -223,6 +252,7 @@ const Parser = struct {
     io: std.Io,
     directory: []const u8,
     weights: []align(std.heap.page_size_min) u8 = &.{},
+    weights_path: []const u8 = &.{},
 
     fn appendF32(self: *Parser, values: *std.ArrayList(f32), r: *Reader, wire: u3) !void {
         if (wire != 2) return values.append(self.arena, @bitCast(try r.fixed32()));
@@ -269,8 +299,10 @@ const Parser = struct {
 
         return .{
             .arena = undefined,
+            .io = self.io,
             .file = &.{},
             .weights = &.{},
+            .weights_path = &.{},
             .nodes = nodes.items,
             .initializers = initializers.items,
             .inputs = inputs.items,
@@ -395,6 +427,7 @@ const Parser = struct {
         if (self.weights.len != 0) return self.weights;
         const path = try std.fs.path.join(self.arena, &.{ self.directory, location });
         self.weights = try mapFile(self.io, path);
+        self.weights_path = path;
         return self.weights;
     }
 
