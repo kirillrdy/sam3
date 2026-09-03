@@ -1886,6 +1886,8 @@ const SessionState = struct {
     const Activation = enum(u32) { none, gelu };
 
     fn product(self: *SessionState, args: Product) !void {
+        if (args.m == 0 or args.n == 0 or args.batches == 0) return;
+
         // A 2D block load reads a plane whose base is 64 byte aligned, in rows
         // a multiple of 16 bytes wide and at least 64 wide, and it has nowhere
         // to put a transposed right operand. Where all of that holds the
