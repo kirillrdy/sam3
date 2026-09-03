@@ -141,11 +141,18 @@ function paint() {
   ctx.putImageData(new ImageData(pixels.slice(), w, h), 0, 0);
 }
 
-function showFrame(bytes) {
+// Puts a frame in front of the wasm client. Loading one clears the masks with
+// it, since they described the frame before.
+function loadFrame(bytes) {
   upload = bytes;
   const ptr = send(bytes);
   const ok = wasm.loadImage(ptr, bytes.length) === 0;
   wasm.dealloc(ptr, bytes.length);
+  return ok;
+}
+
+function showFrame(bytes) {
+  const ok = loadFrame(bytes);
   if (ok) paint();
   return ok;
 }
@@ -454,7 +461,12 @@ async function follow() {
     while (following && time <= duration) {
       await seek(time);
       const bytes = await grabFrame();
-      if (!bytes || !showFrame(bytes)) break;
+      // Loaded but not painted. A frame takes about a second to come back
+      // masked, and painting it bare on the way in would leave the canvas
+      // showing an unmasked object for that second and the masked one for the
+      // instant before the next frame replaced it. The canvas holds the last
+      // masked frame until this one is masked too.
+      if (!bytes || !loadFrame(bytes)) break;
 
       const query = trackQuery(phrase ? 'text=' + encodeURIComponent(phrase) : '');
       const response = await fetch('/track?' + query, { method: 'POST', body: bytes });
@@ -466,6 +478,7 @@ async function follow() {
           ? `Lost it at ${time.toFixed(1)} s. It may have left the frame — if not, ` +
             'scrub back to just before here and click it again.'
           : 'Server: ' + reason);
+        paint();
         break;
       }
       pendingReset = false;
@@ -473,6 +486,7 @@ async function follow() {
       const count = loadAnswer(await response.arrayBuffer());
       if (count < 0) {
         say('The server sent something this cannot read.');
+        paint();
         break;
       }
       seeded = seeded || count > 0;
