@@ -8,7 +8,8 @@
          font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; }
   main { max-width: 1000px; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
   .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-  button, label.file, input[type=text] { background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+  .bar[hidden] { display: none; }
+  button, label.file, input[type=text], select { background: var(--panel); color: var(--ink); border: 1px solid var(--line);
                        border-radius: 6px; padding: 3px 10px; font: inherit; cursor: pointer; }
   input[type=text] { cursor: text; min-width: 220px; }
   button:hover, label.file:hover { border-color: var(--dim); }
@@ -18,15 +19,27 @@
   #stage { border: 1px solid var(--line); border-radius: 8px; background: var(--panel);
            padding: 8px; min-height: 120px; display: flex; justify-content: center; }
   canvas { max-width: 100%; height: auto; border-radius: 4px; cursor: crosshair; display: none; }
+  /* Kept in the render tree rather than display:none: the callback that
+     measures the frame rate fires when a frame is presented, and a video the
+     browser is not compositing may never present one. */
+  video { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
   #status { color: var(--dim); min-height: 21px; }
   #masks { display: flex; flex-wrap: wrap; gap: 8px; }
-  #masks button { text-align: left; line-height: 1.35; }
+  #masks button, #masks .chip { text-align: left; line-height: 1.35; }
   #masks small { display: block; color: var(--dim); }
+  #masks .chip { display: flex; align-items: center; gap: 8px; background: var(--panel);
+                 border: 1px solid var(--line); border-radius: 6px; padding: 3px 10px; }
+  #masks .chip i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  #masks .chip small { display: inline; }
+  .hint { color: var(--dim); }
+  #scrub { flex: 1; min-width: 200px; cursor: pointer; accent-color: var(--accent); }
+  #clock { font-variant-numeric: tabular-nums; }
 </style>
 
 <main>
   <div class="bar">
     <label class="file">Open image<input type="file" id="file" accept="image/*"></label>
+    <label class="file">Open video<input type="file" id="video-file" accept="video/*"></label>
     <button id="sample">Sample image</button>
     <button id="mode" aria-pressed="true">Clicks add to the mask</button>
     <button id="clear">Clear points</button>
@@ -35,30 +48,79 @@
     <input id="concept" type="text" maxlength="160" placeholder="Find objects, e.g. cat or red car">
     <button id="find">Find by word</button>
   </div>
+  <div class="bar" id="video-bar" hidden>
+    <button id="track">Follow through the video</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="another">Follow another object</button>
+  </div>
+  <div class="bar" id="scrub-bar" hidden>
+    <button id="back" title="Back one frame">◀</button>
+    <input type="range" id="scrub" min="0" max="0" step="0.01" value="0">
+    <button id="forward" title="Forward one frame">▶</button>
+    <span id="clock" class="hint">0.0 s</span>
+  </div>
 
   <div id="status">Loading the wasm client…</div>
   <div id="stage"><canvas id="canvas"></canvas></div>
   <div id="masks"></div>
 </main>
 
+<video id="video" muted playsinline preload="auto"></video>
+
 <script>
 const ui = {
   file: document.getElementById('file'),
+  videoFile: document.getElementById('video-file'),
   sample: document.getElementById('sample'),
   mode: document.getElementById('mode'),
   clear: document.getElementById('clear'),
   concept: document.getElementById('concept'),
   find: document.getElementById('find'),
+  videoBar: document.getElementById('video-bar'),
+  track: document.getElementById('track'),
+  stop: document.getElementById('stop'),
+  another: document.getElementById('another'),
+  scrubBar: document.getElementById('scrub-bar'),
+  scrub: document.getElementById('scrub'),
+  back: document.getElementById('back'),
+  forward: document.getElementById('forward'),
+  clock: document.getElementById('clock'),
   status: document.getElementById('status'),
   canvas: document.getElementById('canvas'),
   masks: document.getElementById('masks'),
+  video: document.getElementById('video'),
 };
 const ctx = ui.canvas.getContext('2d');
+const scratch = document.createElement('canvas');
+
+// The longest edge a frame is sent at. The encoder resamples to its own square
+// anyway, so anything larger is bytes on the wire and nothing else.
+const max_frame_edge = 1280;
+
+// What to assume one frame lasts when the browser will not say. Videos this
+// misses are stepped a little coarsely or a little finely, not wrongly.
+const assumed_frame_interval = 1 / 30;
 
 let wasm = null;
+// Whatever is on the canvas, as the bytes the server will be given: an image
+// file, or the current video frame encoded as one.
 let upload = null;
+let source = 'image';
 let include = true;
 let busy = false;
+let following = false;
+// The next request starts a new video rather than continuing the last one.
+let pendingReset = true;
+// Something has been pointed at and is being followed.
+let seeded = false;
+let lastPhrase = '';
+// Where the scrubber has been dragged to while an earlier seek is still
+// running. Only the latest one is worth honouring.
+let pendingSeek = null;
+let seeking = false;
+// How long one frame of the open video lasts. Every frame is followed, so this
+// is the step for both the run and the step buttons.
+let frameInterval = assumed_frame_interval;
 
 const say = (text) => { ui.status.textContent = text; };
 
@@ -77,6 +139,23 @@ function paint() {
   ui.canvas.style.display = 'block';
   const pixels = new Uint8ClampedArray(wasm.memory.buffer, wasm.framePtr(), w * h * 4);
   ctx.putImageData(new ImageData(pixels.slice(), w, h), 0, 0);
+}
+
+function showFrame(bytes) {
+  upload = bytes;
+  const ptr = send(bytes);
+  const ok = wasm.loadImage(ptr, bytes.length) === 0;
+  wasm.dealloc(ptr, bytes.length);
+  if (ok) paint();
+  return ok;
+}
+
+function loadAnswer(buffer) {
+  const answer = new Uint8Array(buffer);
+  const ptr = send(answer);
+  const count = wasm.loadMasks(ptr, answer.length);
+  wasm.dealloc(ptr, answer.length);
+  return count;
 }
 
 function listMasks() {
@@ -99,16 +178,188 @@ function listMasks() {
   ui.masks.children[best].setAttribute('aria-pressed', 'true');
 }
 
+function listTracks() {
+  ui.masks.replaceChildren();
+  for (let i = 0; i < wasm.maskCount(); i++) {
+    const color = '#' + wasm.maskColor(i).toString(16).padStart(6, '0');
+    const chip = document.createElement('div');
+    chip.className = 'chip';
+    chip.innerHTML = `<i style="background:${color}"></i>Object ${wasm.maskId(i)}` +
+      `<small>${wasm.maskScore(i).toFixed(2)}</small>`;
+    ui.masks.append(chip);
+  }
+}
+
+function setControls() {
+  ui.videoBar.hidden = source !== 'video';
+  ui.scrubBar.hidden = source !== 'video';
+  ui.track.disabled = following || busy || seeking;
+  ui.stop.disabled = !following;
+  ui.another.disabled = following;
+  // Not while seeking: the scrubber has to stay live for the rest of a drag.
+  ui.scrub.disabled = following || busy;
+  ui.back.disabled = following || busy || seeking;
+  ui.forward.disabled = following || busy || seeking;
+  ui.find.disabled = busy;
+}
+
+// Where the video is parked, on the scrubber and next to it.
+function showTime(time) {
+  ui.scrub.value = time;
+  ui.clock.textContent = `${time.toFixed(1)} s`;
+}
+
+// Whatever was being followed was being followed on other frames than the one
+// we are about to land on, so none of it carries.
+function forgetTracking() {
+  ui.masks.replaceChildren();
+  seeded = false;
+  pendingReset = true;
+  lastPhrase = '';
+}
+
 async function openImage(bytes) {
   if (!wasm) return say('The wasm client is still loading.');
-  upload = bytes;
-  const ptr = send(bytes);
-  const ok = wasm.loadImage(ptr, bytes.length) === 0;
-  wasm.dealloc(ptr, bytes.length);
-  ui.masks.replaceChildren();
-  if (!ok) return say('That file is not an image this can decode.');
-  paint();
+  source = 'image';
+  forgetTracking();
+  setControls();
+  if (!showFrame(bytes)) return say('That file is not an image this can decode.');
   say(`${wasm.imageWidth()} × ${wasm.imageHeight()} — click the object you want.`);
+}
+
+async function openVideo(file) {
+  if (!wasm) return say('The wasm client is still loading.');
+  source = 'video';
+  forgetTracking();
+  setControls();
+
+  ui.video.src = URL.createObjectURL(file);
+  const loaded = await new Promise((resolve) => {
+    ui.video.onloadeddata = () => resolve(true);
+    ui.video.onerror = () => resolve(false);
+  });
+  if (!loaded) return say('That file is not a video this browser can play.');
+
+  const duration = ui.video.duration;
+  const scrubbable = Number.isFinite(duration) && duration > 0;
+  ui.scrub.max = scrubbable ? duration : 0;
+  ui.scrub.disabled = !scrubbable;
+  showTime(0);
+
+  say('Reading the frame rate…');
+  frameInterval = await measureFrameInterval();
+
+  await seek(0);
+  const bytes = await grabFrame();
+  if (!bytes || !showFrame(bytes)) return say('That video frame could not be read.');
+  // A video that opens on a title card or a fade has nothing to point at on
+  // its first frame, so say up front that it does not have to start there.
+  say(`${wasm.imageWidth()} × ${wasm.imageHeight()}, ${duration.toFixed(1)} s, ` +
+      `${frameCount()} frames at ${(1 / frameInterval).toFixed(0)} fps — ` +
+      'scrub to a frame the object is on, then click it or type what to look for.');
+}
+
+function frameCount() {
+  const duration = ui.video.duration;
+  if (!Number.isFinite(duration)) return 0;
+  return Math.max(1, Math.round(duration / frameInterval));
+}
+
+// Every frame costs a pass of the vision encoder, and a clip holds a lot of
+// frames, so a run says how much of it is left rather than only where it is.
+function timeLeft(doneFrames, totalFrames, elapsed) {
+  if (doneFrames === 0 || doneFrames >= totalFrames) return '';
+  const left = (elapsed / doneFrames) * (totalFrames - doneFrames) / 1000;
+  if (left < 90) return ` · about ${Math.round(left)} s left`;
+  return ` · about ${Math.round(left / 60)} min left`;
+}
+
+// Parks the video on another frame, at the viewer's asking. Dragging the
+// scrubber outruns seeking a video by a long way, so only the latest position
+// asked for is honoured, and the ones passed over on the way are dropped.
+async function goTo(time) {
+  if (source !== 'video' || following || busy) return;
+  pendingSeek = Math.max(0, Math.min(time, ui.video.duration || 0));
+  showTime(pendingSeek);
+  if (seeking) return;
+
+  seeking = true;
+  setControls();
+  forgetTracking();
+  try {
+    while (pendingSeek !== null) {
+      const target = pendingSeek;
+      pendingSeek = null;
+      await seek(target);
+      const bytes = await grabFrame();
+      if (!bytes || !showFrame(bytes)) return say('That video frame could not be read.');
+    }
+    showTime(ui.video.currentTime);
+    say('Click what to follow, or type what to look for.');
+  } finally {
+    pendingSeek = null;
+    seeking = false;
+    setControls();
+  }
+}
+
+// How long one frame of this video lasts.
+//
+// There is no property that says, so it is measured: play a moment with the
+// sound off and watch how far the presentation time moves between the frames
+// the browser hands over. Videos whose frames are not evenly spaced are
+// stepped by their average, which lands on each frame once nearly always and
+// twice occasionally.
+async function measureFrameInterval() {
+  const perFrame = ui.video.requestVideoFrameCallback?.bind(ui.video);
+  if (!perFrame) return assumed_frame_interval;
+
+  const measured = await new Promise((resolve) => {
+    const times = [];
+    const done = () => {
+      clearTimeout(patience);
+      const span = times.at(-1) - times[0];
+      resolve(times.length > 1 && span > 0 ? span / (times.length - 1) : null);
+    };
+    const patience = setTimeout(done, 2000);
+    const tick = (now, frame) => {
+      times.push(frame.mediaTime);
+      if (times.length >= 6) return done();
+      perFrame(tick);
+    };
+    perFrame(tick);
+    ui.video.play().catch(done);
+  });
+
+  ui.video.pause();
+  return measured ?? assumed_frame_interval;
+}
+
+function seek(time) {
+  const target = Math.max(0, Math.min(time, ui.video.duration || 0));
+  if (Math.abs(ui.video.currentTime - target) < 1e-3) return Promise.resolve();
+  return new Promise((resolve) => {
+    ui.video.onseeked = () => { ui.video.onseeked = null; resolve(); };
+    ui.video.currentTime = target;
+  });
+}
+
+// The frame the video is parked on, as the bytes of an image.
+async function grabFrame() {
+  const width = ui.video.videoWidth, height = ui.video.videoHeight;
+  if (!width || !height) return null;
+  const scale = Math.min(1, max_frame_edge / Math.max(width, height));
+  scratch.width = Math.round(width * scale);
+  scratch.height = Math.round(height * scale);
+  scratch.getContext('2d').drawImage(ui.video, 0, 0, scratch.width, scratch.height);
+  const blob = await new Promise((resolve) => scratch.toBlob(resolve, 'image/jpeg', 0.85));
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+function trackQuery(extra) {
+  const params = extra ? [extra] : [];
+  if (pendingReset) params.push('reset=1');
+  return params.join('&');
 }
 
 async function segment() {
@@ -121,10 +372,7 @@ async function segment() {
     const response = await fetch('/segment?' + query, { method: 'POST', body: upload });
     if (!response.ok) return say('Server: ' + (await response.text()));
 
-    const answer = new Uint8Array(await response.arrayBuffer());
-    const ptr = send(answer);
-    const count = wasm.loadMasks(ptr, answer.length);
-    wasm.dealloc(ptr, answer.length);
+    const count = loadAnswer(await response.arrayBuffer());
     if (count < 0) return say('The server sent something this cannot read.');
 
     wasm.render(wasm.bestMask());
@@ -135,12 +383,124 @@ async function segment() {
     say('Request failed: ' + error.message);
   } finally {
     busy = false;
+    setControls();
+  }
+}
+
+// Points at an object on the frame the video is parked on, and starts
+// following it. Clicking again sharpens the same object; "follow another"
+// first, and the next click names a second one.
+async function point() {
+  if (busy || !upload || wasm.pointCount() === 0) return;
+  busy = true;
+  setControls();
+  say('Segmenting what you pointed at…');
+  try {
+    let query = new TextDecoder().decode(
+      new Uint8Array(wasm.memory.buffer, wasm.queryPtr(), wasm.queryLen()));
+    // The first point of a prompt names an object; the ones after it sharpen
+    // the same object rather than naming another.
+    if (wasm.pointCount() === 1) query += '&new=1';
+    const response = await fetch('/track?' + trackQuery(query), { method: 'POST', body: upload });
+    if (!response.ok) return say('Server: ' + (await response.text()));
+    pendingReset = false;
+
+    const count = loadAnswer(await response.arrayBuffer());
+    if (count < 0) return say('The server sent something this cannot read.');
+
+    seeded = count > 0;
+    wasm.renderAll();
+    paint();
+    listTracks();
+    say(count === 0
+      ? 'Nothing was found there.'
+      : `Following ${count} object${count === 1 ? '' : 's'} — press follow to run the video.`);
+  } catch (error) {
+    say('Request failed: ' + error.message);
+  } finally {
+    busy = false;
+    setControls();
+  }
+}
+
+async function follow() {
+  if (busy || following || seeking || source !== 'video') return;
+
+  const phrase = ui.concept.value.trim();
+  if (!phrase && !seeded) {
+    return say('Click what you want followed, or type what to look for, first.');
+  }
+  // A different phrase is a different question: none of the old answers carry.
+  if (phrase && phrase !== lastPhrase) {
+    pendingReset = true;
+    lastPhrase = phrase;
+  }
+
+  following = true;
+  busy = true;
+  setControls();
+
+  const duration = ui.video.duration;
+  const startedAt = Date.now();
+  try {
+    // A clicked object was already found on the frame we are parked on, so the
+    // run starts on the next one. A phrase has not been asked yet.
+    const start = phrase ? ui.video.currentTime : ui.video.currentTime + frameInterval;
+    const toGo = Math.max(1, Math.round((duration - start) / frameInterval));
+    // Counted off the start rather than added up, so that a long run does not
+    // drift off the frames by fractions of one.
+    let frame = 0;
+    let time = start;
+    while (following && time <= duration) {
+      await seek(time);
+      const bytes = await grabFrame();
+      if (!bytes || !showFrame(bytes)) break;
+
+      const query = trackQuery(phrase ? 'text=' + encodeURIComponent(phrase) : '');
+      const response = await fetch('/track?' + query, { method: 'POST', body: bytes });
+      if (!response.ok) {
+        const reason = await response.text();
+        // A clicked object is only ever carried from the frame before, so once
+        // the server has nothing left to carry, the run is over.
+        say(seeded && !phrase
+          ? `Lost it at ${time.toFixed(1)} s. It may have left the frame — if not, ` +
+            'scrub back to just before here and click it again.'
+          : 'Server: ' + reason);
+        break;
+      }
+      pendingReset = false;
+
+      const count = loadAnswer(await response.arrayBuffer());
+      if (count < 0) {
+        say('The server sent something this cannot read.');
+        break;
+      }
+      seeded = seeded || count > 0;
+
+      wasm.renderAll();
+      paint();
+      listTracks();
+      showTime(ui.video.currentTime);
+      frame += 1;
+      say(`${time.toFixed(1)} s of ${duration.toFixed(1)} s — ` +
+          `${count} object${count === 1 ? '' : 's'} on this frame` +
+          timeLeft(frame, toGo, Date.now() - startedAt) + '.');
+      time = start + frame * frameInterval;
+    }
+    if (following && time > duration) say(`Reached the end at ${duration.toFixed(1)} s.`);
+  } catch (error) {
+    say('Request failed: ' + error.message);
+  } finally {
+    following = false;
+    busy = false;
+    setControls();
   }
 }
 
 async function lookup() {
   const text = ui.concept.value.trim();
   if (busy || !upload || !text) return;
+  if (source === 'video') return follow();
   busy = true;
   say(`Looking for “${text}”… the first lookup on an image also runs the vision encoder.`);
   try {
@@ -149,10 +509,7 @@ async function lookup() {
     });
     if (!response.ok) return say('Server: ' + (await response.text()));
 
-    const answer = new Uint8Array(await response.arrayBuffer());
-    const ptr = send(answer);
-    const count = wasm.loadMasks(ptr, answer.length);
-    wasm.dealloc(ptr, answer.length);
+    const count = loadAnswer(await response.arrayBuffer());
     if (count < 0) return say('The server sent something this cannot read.');
     if (count === 0) {
       ui.masks.replaceChildren();
@@ -169,23 +526,34 @@ async function lookup() {
     say('Request failed: ' + error.message);
   } finally {
     busy = false;
+    setControls();
   }
 }
 
 ui.canvas.addEventListener('contextmenu', (event) => event.preventDefault());
 ui.canvas.addEventListener('mousedown', (event) => {
-  if (busy) return;
+  if (busy || seeking) return;
   const rect = ui.canvas.getBoundingClientRect();
   const positive = include && event.button !== 2 && !event.shiftKey;
   wasm.addPoint(event.clientX - rect.left, event.clientY - rect.top,
                 rect.width, rect.height, positive ? 1 : 0);
-  wasm.render(-1);
-  paint();
-  segment();
+  if (source === 'video') {
+    wasm.renderAll();
+    paint();
+    point();
+  } else {
+    wasm.render(-1);
+    paint();
+    segment();
+  }
 });
 
 ui.file.onchange = async () => {
   if (ui.file.files.length) await openImage(new Uint8Array(await ui.file.files[0].arrayBuffer()));
+};
+
+ui.videoFile.onchange = async () => {
+  if (ui.videoFile.files.length) await openVideo(ui.videoFile.files[0]);
 };
 
 ui.sample.onclick = async () => {
@@ -203,10 +571,25 @@ ui.mode.onclick = () => {
 ui.clear.onclick = () => {
   if (!wasm) return;
   wasm.clearPoints();
-  ui.masks.replaceChildren();
+  forgetTracking();
   paint();
   say('Points cleared.');
 };
+
+ui.another.onclick = () => {
+  if (!wasm) return;
+  wasm.forgetPoints();
+  wasm.renderAll();
+  paint();
+  say('Click the next object you want followed.');
+};
+
+ui.scrub.oninput = () => goTo(Number(ui.scrub.value));
+ui.back.onclick = () => goTo(ui.video.currentTime - frameInterval);
+ui.forward.onclick = () => goTo(ui.video.currentTime + frameInterval);
+
+ui.track.onclick = follow;
+ui.stop.onclick = () => { following = false; say('Stopped.'); };
 
 ui.find.onclick = lookup;
 ui.concept.addEventListener('keydown', (event) => {
@@ -215,6 +598,7 @@ ui.concept.addEventListener('keydown', (event) => {
 
 WebAssembly.instantiateStreaming(fetch('/client.wasm'), {}).then((module) => {
   wasm = module.instance.exports;
+  setControls();
   say('');
 }, (error) => say('Could not load client.wasm: ' + error.message));
 </script>

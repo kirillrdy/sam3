@@ -12,9 +12,9 @@ const Rgb24 = zigimg.color.Rgb24;
 
 const gpa = std.heap.page_allocator;
 
-const mask_color: Rgb24 = .{ .r = 0, .g = 220, .b = 100 };
 const mask_alpha = 0.5;
 const marker_radius = 7;
+const box_thickness = 2;
 
 const max_points = 32;
 
@@ -31,7 +31,7 @@ var masks: Masks = .{};
 
 const Masks = struct {
     logits: []f32 = &.{},
-    scores: []f32 = &.{},
+    instances: []protocol.Instance = &.{},
 
     coverage: []f32 = &.{},
     count: usize = 0,
@@ -46,11 +46,45 @@ const Masks = struct {
 
     fn clear(self: *Masks) void {
         gpa.free(self.logits);
-        gpa.free(self.scores);
+        gpa.free(self.instances);
         gpa.free(self.coverage);
         self.* = .{};
     }
 };
+
+/// The colour an object is drawn in for as long as it is followed.
+///
+/// Identity is the whole point of a track, so the colour has to come from the
+/// number and nothing else: the same object stays the same colour while other
+/// objects come and go around it. Neighbouring numbers are thrown far apart
+/// around the hue circle so that two objects side by side never look alike.
+fn colorFor(id: u32) Rgb24 {
+    // 137.5 degrees, the turn that spreads any run of numbers most evenly.
+    const hue = @as(f32, @floatFromInt(id % 360)) * 137.5;
+    return fromHsv(hue - @floor(hue / 360.0) * 360.0, 0.85, 1.0);
+}
+
+fn fromHsv(hue: f32, saturation: f32, value: f32) Rgb24 {
+    const sector = hue / 60.0;
+    const offset = sector - @floor(sector / 2.0) * 2.0;
+    const chroma = value * saturation;
+    const middle = chroma * (1.0 - @abs(offset - 1.0));
+    const bottom = value - chroma;
+
+    const rgb: [3]f32 = switch (@as(u32, @intFromFloat(sector)) % 6) {
+        0 => .{ chroma, middle, 0 },
+        1 => .{ middle, chroma, 0 },
+        2 => .{ 0, chroma, middle },
+        3 => .{ 0, middle, chroma },
+        4 => .{ middle, 0, chroma },
+        else => .{ chroma, 0, middle },
+    };
+    return .{
+        .r = @intFromFloat(@round((rgb[0] + bottom) * 255.0)),
+        .g = @intFromFloat(@round((rgb[1] + bottom) * 255.0)),
+        .b = @intFromFloat(@round((rgb[2] + bottom) * 255.0)),
+    };
+}
 
 export fn alloc(len: u32) ?[*]u8 {
     const buffer = gpa.alloc(u8, len) catch return null;
@@ -113,6 +147,14 @@ export fn clearPoints() void {
     render(-1);
 }
 
+/// Drops the prompt without dropping what is already on screen. Naming a
+/// second object in a video starts a new prompt over the objects already being
+/// followed, rather than adding to the one that found the first.
+export fn forgetPoints() void {
+    points_len = 0;
+    rebuildQuery();
+}
+
 export fn pointCount() u32 {
     return @intCast(points_len);
 }
@@ -152,23 +194,27 @@ export fn loadMasks(ptr: [*]const u8, len: u32) i32 {
         .height = header.height,
         .object_score = header.object_score,
     };
-    loaded.scores = gpa.alloc(f32, count) catch return -1;
+    loaded.instances = gpa.alloc(protocol.Instance, count) catch return -1;
     loaded.coverage = gpa.alloc(f32, count) catch {
-        gpa.free(loaded.scores);
+        gpa.free(loaded.instances);
         return -1;
     };
     loaded.logits = gpa.alloc(f32, count * stride) catch {
-        gpa.free(loaded.scores);
+        gpa.free(loaded.instances);
         gpa.free(loaded.coverage);
         return -1;
     };
 
-    var offset: usize = protocol.Header.size;
-    for (loaded.scores) |*score| {
-        score.* = readF32(bytes, &offset);
+    for (loaded.instances, 0..) |*instance, i| {
+        instance.* = protocol.Instance.parse(
+            bytes[protocol.Header.instanceOffset(i)..][0..protocol.Instance.size],
+        );
     }
+
+    var offset: usize = header.planeOffset(0);
     for (loaded.logits) |*logit| {
-        logit.* = readF32(bytes, &offset);
+        logit.* = @bitCast(std.mem.readInt(u32, bytes[offset..][0..4], .little));
+        offset += 4;
     }
 
     for (loaded.coverage, 0..) |*share, i| {
@@ -184,18 +230,30 @@ export fn loadMasks(ptr: [*]const u8, len: u32) i32 {
     return @intCast(count);
 }
 
-fn readF32(bytes: []const u8, offset: *usize) f32 {
-    const value: f32 = @bitCast(std.mem.readInt(u32, bytes[offset.*..][0..4], .little));
-    offset.* += 4;
-    return value;
-}
-
 export fn maskCount() u32 {
     return @intCast(masks.count);
 }
 
 export fn maskScore(index: u32) f32 {
-    return if (index < masks.count) masks.scores[index] else 0;
+    return if (index < masks.count) masks.instances[index].score else 0;
+}
+
+/// The number the object keeps for as long as it is followed. On a still image
+/// it is just the mask's place in the reply.
+export fn maskId(index: u32) u32 {
+    return if (index < masks.count) masks.instances[index].id else 0;
+}
+
+/// One edge of the object's box over the frame, in the order x0, y0, x1, y1.
+export fn maskBox(index: u32, edge: u32) f32 {
+    if (index >= masks.count or edge >= 4) return 0;
+    return masks.instances[index].box[edge];
+}
+
+/// The object's colour, packed as 0xRRGGBB so the page can label it to match.
+export fn maskColor(index: u32) u32 {
+    const color = colorFor(maskId(index));
+    return (@as(u32, color.r) << 16) | (@as(u32, color.g) << 8) | color.b;
 }
 
 export fn maskCoverage(index: u32) f32 {
@@ -208,31 +266,59 @@ export fn objectScore() f32 {
 
 export fn bestMask() u32 {
     var winner: usize = 0;
-    for (masks.scores, 0..) |score, i| {
-        if (score > masks.scores[winner]) winner = i;
+    for (masks.instances, 0..) |instance, i| {
+        if (instance.score > masks.instances[winner].score) winner = i;
     }
     return @intCast(winner);
 }
 
+/// Draws the frame with one hypothesis on it, or with none when `index` is
+/// negative. This is how a still image is looked at: the decoder's readings of
+/// a click are alternatives, so only one of them is true at a time.
 export fn render(index: i32) void {
+    if (index < 0) return draw(&.{});
+    const only: [1]usize = .{@intCast(index)};
+    draw(&only);
+}
+
+/// Draws the frame with everything on it at once, each object in its own
+/// colour and inside its own box. This is how a video frame is looked at: the
+/// objects are all there together, and telling them apart is the point.
+export fn renderAll() void {
+    var chosen: [max_instances]usize = undefined;
+    const count = @min(masks.count, max_instances);
+    for (0..count) |i| chosen[i] = i;
+    draw(chosen[0..count]);
+}
+
+/// As many objects as one frame is drawn with. A frame with more than this
+/// many on it is unreadable long before it is reached.
+const max_instances = 64;
+
+fn draw(chosen: []const usize) void {
     const img = image orelse return;
 
     var canvas = zigimg.Image.create(gpa, img.width, img.height, .rgb24) catch return;
     defer canvas.deinit(gpa);
     @memcpy(canvas.pixels.rgb24, img.pixels.rgb24);
 
-    if (index >= 0 and @as(usize, @intCast(index)) < masks.count) {
+    for (chosen) |index| {
+        if (index >= masks.count) continue;
+        const color = colorFor(masks.instances[index].id);
         if (bilinear(
             gpa,
-            masks.plane(@intCast(index)),
+            masks.plane(index),
             masks.width,
             masks.height,
             img.width,
             img.height,
         )) |mask| {
             defer gpa.free(mask);
-            overlayMask(&canvas, mask, mask_color, mask_alpha);
+            overlayMask(&canvas, mask, color, mask_alpha);
         } else |_| {}
+        // Only worth outlining when there is more than one object to tell
+        // apart; on a single mask the box is just clutter over the tint.
+        if (chosen.len > 1) drawBox(&canvas, masks.instances[index].box, color, box_thickness);
     }
 
     for (points[0..points_len]) |p| drawPointMarker(&canvas, p, marker_radius);
@@ -310,6 +396,38 @@ fn overlayMask(img: *zigimg.Image, mask: []const f32, color: Rgb24, alpha: f32) 
         px.g = @intFromFloat(g * keep + tint[1] * alpha);
         px.b = @intFromFloat(b * keep + tint[2] * alpha);
     }
+}
+
+/// Outlines where an object is, so that objects sharing a colour family or
+/// lying on top of one another can still be told apart.
+fn drawBox(img: *zigimg.Image, box: [4]f32, color: Rgb24, thickness: usize) void {
+    const x0 = @max(0, scaled(box[0], img.width));
+    const y0 = @max(0, scaled(box[1], img.height));
+    const x1 = @min(@as(isize, @intCast(img.width)), scaled(box[2], img.width));
+    const y1 = @min(@as(isize, @intCast(img.height)), scaled(box[3], img.height));
+    if (x1 <= x0 or y1 <= y0) return;
+
+    // Four bands rather than a walk over the whole box, each held inside the
+    // box so that one thinner than the outline is filled instead of drawn over
+    // twice.
+    const thick: isize = @intCast(thickness);
+    fillRect(img, x0, y0, x1, @min(y1, y0 + thick), color);
+    fillRect(img, x0, @max(y0, y1 - thick), x1, y1, color);
+    fillRect(img, x0, y0, @min(x1, x0 + thick), y1, color);
+    fillRect(img, @max(x0, x1 - thick), y0, x1, y1, color);
+}
+
+fn fillRect(img: *zigimg.Image, x0: isize, y0: isize, x1: isize, y1: isize, color: Rgb24) void {
+    const width: isize = @intCast(img.width);
+    var y = y0;
+    while (y < y1) : (y += 1) {
+        const row = img.pixels.rgb24[@intCast(y * width)..][@intCast(x0)..@intCast(x1)];
+        @memset(row, color);
+    }
+}
+
+fn scaled(coordinate: f32, extent: usize) isize {
+    return @intFromFloat(@round(coordinate * @as(f32, @floatFromInt(extent))));
 }
 
 fn drawPointMarker(img: *zigimg.Image, point: Point, radius: usize) void {
@@ -405,6 +523,43 @@ test "a file that is not an image leaves the canvas alone" {
     try std.testing.expectEqual(@as(u32, 2), imageHeight());
 }
 
+/// Lays out a reply the way the server does, and hands it to the client.
+fn testLoad(
+    buffer: []u8,
+    width: u32,
+    height: u32,
+    instances: []const protocol.Instance,
+    planes: []const []const f32,
+) !i32 {
+    const header: protocol.Header = .{
+        .count = @intCast(instances.len),
+        .width = width,
+        .height = height,
+        .object_score = 2.5,
+    };
+    const response = buffer[0..header.responseSize()];
+    header.write(response[0..protocol.Header.size]);
+    for (instances, 0..) |instance, i| {
+        instance.write(response[protocol.Header.instanceOffset(i)..][0..protocol.Instance.size]);
+    }
+    for (planes, 0..) |plane, i| {
+        var offset = header.planeOffset(i);
+        for (plane) |logit| {
+            std.mem.writeInt(u32, response[offset..][0..4], @bitCast(logit), .little);
+            offset += 4;
+        }
+    }
+
+    const ptr = alloc(@intCast(response.len)) orelse return error.OutOfMemory;
+    defer dealloc(ptr, @intCast(response.len));
+    @memcpy(ptr[0..response.len], response);
+    return loadMasks(ptr, @intCast(response.len));
+}
+
+fn testFramePixel(index: usize) [4]u8 {
+    return framePtr()[index * 4 ..][0..4].*;
+}
+
 test "a response becomes hypotheses, and the chosen one is tinted over the frame" {
     var buffer: [8192]u8 = undefined;
     const ppm = testPpm(&buffer, 1, 1, .{ .r = 200, .g = 10, .b = 10 });
@@ -412,32 +567,104 @@ test "a response becomes hypotheses, and the chosen one is tinted over the frame
     clearPoints();
     try testOpen(ppm);
 
-    const header: protocol.Header = .{ .count = 2, .width = 1, .height = 1, .object_score = 2.5 };
-    var response: [protocol.Header.size + 2 * 4 + 2 * 4]u8 = undefined;
-    header.write(response[0..protocol.Header.size]);
-    for ([_]f32{ 0.25, 0.75, -1.0, 1.0 }, 0..) |value, i| {
-        std.mem.writeInt(u32, response[protocol.Header.size + i * 4 ..][0..4], @bitCast(value), .little);
-    }
-
-    const ptr = alloc(response.len).?;
-    defer dealloc(ptr, response.len);
-    @memcpy(ptr[0..response.len], &response);
-    try std.testing.expectEqual(@as(i32, 2), loadMasks(ptr, response.len));
+    var response: [8192]u8 = undefined;
+    const first = [_]f32{-1.0};
+    const second = [_]f32{1.0};
+    try std.testing.expectEqual(@as(i32, 2), try testLoad(&response, 1, 1, &.{
+        .{ .id = 0, .score = 0.25, .box = .{ 0, 0, 0, 0 } },
+        .{ .id = 1, .score = 0.75, .box = .{ 0, 0, 1, 1 } },
+    }, &.{ &first, &second }));
 
     try std.testing.expectEqual(@as(u32, 2), maskCount());
     try std.testing.expectEqual(@as(f32, 0.25), maskScore(0));
+    try std.testing.expectEqual(@as(u32, 1), maskId(1));
+    try std.testing.expectEqual(@as(f32, 1.0), maskBox(1, 2));
     try std.testing.expectEqual(@as(f32, 2.5), objectScore());
     try std.testing.expectEqual(@as(u32, 1), bestMask());
     try std.testing.expectEqual(@as(f32, 0.0), maskCoverage(0));
     try std.testing.expectEqual(@as(f32, 1.0), maskCoverage(1));
 
+    // Half the object's colour laid over the pixel that is in it.
+    const tint = colorFor(1);
     render(@intCast(bestMask()));
-    try std.testing.expectEqualSlices(u8, &.{ 100, 115, 55, 255 }, framePtr()[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{
+        @intFromFloat(200.0 * 0.5 + @as(f32, @floatFromInt(tint.r)) * 0.5),
+        @intFromFloat(10.0 * 0.5 + @as(f32, @floatFromInt(tint.g)) * 0.5),
+        @intFromFloat(10.0 * 0.5 + @as(f32, @floatFromInt(tint.b)) * 0.5),
+        255,
+    }, &testFramePixel(0));
 
     render(0);
-    try std.testing.expectEqualSlices(u8, &.{ 200, 10, 10, 255 }, framePtr()[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 200, 10, 10, 255 }, &testFramePixel(0));
     render(-1);
-    try std.testing.expectEqualSlices(u8, &.{ 200, 10, 10, 255 }, framePtr()[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 200, 10, 10, 255 }, &testFramePixel(0));
+}
+
+test "every object on a video frame is drawn at once, each in its own colour" {
+    const size = 12;
+    var buffer: [8192]u8 = undefined;
+    const ppm = testPpm(&buffer, size, size, .{ .r = 0, .g = 0, .b = 0 });
+
+    clearPoints();
+    try testOpen(ppm);
+
+    // Two objects on one frame: a block in the top-left corner, and another in
+    // the bottom-right, each with the box that bounds it.
+    var top_left: [size * size]f32 = @splat(-1.0);
+    var bottom_right: [size * size]f32 = @splat(-1.0);
+    for (0..6) |y| {
+        for (0..6) |x| {
+            top_left[y * size + x] = 1.0;
+            bottom_right[(y + 6) * size + x + 6] = 1.0;
+        }
+    }
+
+    var response: [8192]u8 = undefined;
+    try std.testing.expectEqual(@as(i32, 2), try testLoad(&response, size, size, &.{
+        .{ .id = 3, .score = 0.9, .box = .{ 0.0, 0.0, 0.5, 0.5 } },
+        .{ .id = 8, .score = 0.8, .box = .{ 0.5, 0.5, 1.0, 1.0 } },
+    }, &.{ &top_left, &bottom_right }));
+
+    renderAll();
+
+    // Each object carries the colour its number gives it, and the two of them
+    // do not share it. Inside the box the mask is a tint; on the box itself it
+    // is the colour outright.
+    const three = colorFor(3);
+    const eight = colorFor(8);
+    try std.testing.expect(!std.meta.eql(three, eight));
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ three.r / 2, three.g / 2, three.b / 2, 255 },
+        &testFramePixel(2 * size + 2),
+    );
+    try std.testing.expectEqualSlices(u8, &.{ three.r, three.g, three.b, 255 }, &testFramePixel(0));
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ eight.r / 2, eight.g / 2, eight.b / 2, 255 },
+        &testFramePixel(8 * size + 8),
+    );
+    // Nothing claims the corner neither object is in.
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, &testFramePixel(2 * size + 9));
+
+    // And the page can label them to match.
+    try std.testing.expectEqual(
+        (@as(u32, three.r) << 16) | (@as(u32, three.g) << 8) | three.b,
+        maskColor(0),
+    );
+}
+
+test "an object keeps its colour however many others come and go" {
+    // Nothing but the number decides the colour.
+    try std.testing.expectEqual(colorFor(12), colorFor(12));
+    try std.testing.expect(!std.meta.eql(colorFor(12), colorFor(13)));
+
+    // And every number lands on a colour that is actually visible.
+    for (0..512) |id| {
+        const color = colorFor(@intCast(id));
+        const brightest = @max(color.r, @max(color.g, color.b));
+        try std.testing.expect(brightest > 200);
+    }
 }
 
 test "a response that is not one is refused rather than half read" {
@@ -449,6 +676,7 @@ test "a response that is not one is refused rather than half read" {
 
     const header: protocol.Header = .{ .count = 3, .width = 288, .height = 288, .object_score = 0 };
     var short: [protocol.Header.size]u8 = undefined;
+    // A header promising three masks, with none of them behind it.
     header.write(&short);
     const short_ptr = alloc(short.len).?;
     defer dealloc(short_ptr, short.len);
