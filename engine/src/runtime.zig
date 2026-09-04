@@ -405,6 +405,10 @@ const SessionState = struct {
     /// channel and tap that the matrix product wants.
     shuffled: std.StringHashMapUnmanaged(driver.Buffer(Element)) = .empty,
     initializers_preloaded: bool = false,
+    /// Whether a constant has been uploaded off the weight blob since the last
+    /// release. A quantized matrix only reaches the device the first time the
+    /// node reading it runs, so its pages stay live past the preload.
+    uploaded_since_release: bool = false,
     /// Node index of the surviving operator to what it stands for.
     fused: std.AutoHashMapUnmanaged(usize, Fusion) = .empty,
     /// Node indices the fusion swallowed, which `run` walks past.
@@ -506,6 +510,14 @@ const SessionState = struct {
         var it = values.valueIterator();
         while (it.next()) |tensor_ptr| {
             self.release(tensor_ptr.*);
+        }
+
+        // Whatever this run uploaded is on the device now that the queue has
+        // drained, so the pages behind it go the same way as the preloaded
+        // floats. Only a run that read something new pays for the remap.
+        if (self.uploaded_since_release) {
+            self.graph.releaseWeights();
+            self.uploaded_since_release = false;
         }
     }
 
@@ -937,7 +949,7 @@ const SessionState = struct {
                 read_since_release = 0;
             }
         }
-        if (read_since_release > 0) self.graph.releaseWeights();
+        self.graph.releaseWeights();
         self.initializers_preloaded = true;
     }
 
@@ -1070,6 +1082,7 @@ const SessionState = struct {
         errdefer buffer.free();
         try buffer.upload(reordered);
         try self.shuffled.put(self.env.allocator, name, buffer);
+        self.uploaded_since_release = true;
         return buffer;
     }
 
@@ -1084,6 +1097,7 @@ const SessionState = struct {
         const bytes: driver.Buffer(u8) = .{ .ptr = buffer.ptr, .len = buffer.len * stride };
         try bytes.upload(source.data);
         try self.constants.put(self.env.allocator, name, buffer);
+        self.uploaded_since_release = true;
         return buffer.ptr;
     }
 
