@@ -114,6 +114,9 @@ pub const Graph = struct {
 
     /// Maps every initializer name to its tensor.
     constants: std.StringHashMapUnmanaged(Tensor),
+    /// The model's `metadata_props`: what an export carries for the code that
+    /// drives it, such as normalization statistics and token ids.
+    metadata: std.StringHashMapUnmanaged([]const u8),
 
     pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Graph {
         var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -139,6 +142,7 @@ pub const Graph = struct {
 
     pub fn deinit(self: *Graph) void {
         self.constants.deinit(self.arena.allocator());
+        self.metadata.deinit(self.arena.allocator());
         self.arena.deinit();
         if (self.weights.len != 0) std.posix.munmap(self.weights);
         std.posix.munmap(self.file);
@@ -268,12 +272,39 @@ const Parser = struct {
 
     fn parseModel(self: *Parser, bytes: []const u8) !Graph {
         var model: Reader = .{ .bytes = bytes };
+        var graph: ?Graph = null;
+        var metadata: std.StringHashMapUnmanaged([]const u8) = .empty;
         while (!model.eof()) {
             const f = try model.field();
-            if (f.number == 7 and f.wire == 2) return self.parseGraph(try model.sub());
-            try model.skip(f.wire);
+            switch (f.number) {
+                7 => graph = try self.parseGraph(try model.sub()),
+                14 => {
+                    const entry = try parseStringEntry(try model.sub());
+                    try metadata.put(self.arena, entry.key, entry.value);
+                },
+                else => try model.skip(f.wire),
+            }
         }
-        return error.NoGraph;
+        var result = graph orelse return error.NoGraph;
+        result.metadata = metadata;
+        return result;
+    }
+
+    /// A `StringStringEntryProto`: how the model spells both its metadata and
+    /// the location of an external tensor.
+    fn parseStringEntry(reader: Reader) !struct { key: []const u8, value: []const u8 } {
+        var entry = reader;
+        var key: []const u8 = "";
+        var value: []const u8 = "";
+        while (!entry.eof()) {
+            const ef = try entry.field();
+            switch (ef.number) {
+                1 => key = try entry.slice(),
+                2 => value = try entry.slice(),
+                else => try entry.skip(ef.wire),
+            }
+        }
+        return .{ .key = key, .value = value };
     }
 
     fn parseGraph(self: *Parser, reader: Reader) !Graph {
@@ -308,6 +339,7 @@ const Parser = struct {
             .inputs = inputs.items,
             .outputs = outputs.items,
             .constants = constants,
+            .metadata = .empty,
         };
     }
 
@@ -371,6 +403,9 @@ const Parser = struct {
         // that everything downstream sees one representation.
         var typed_i64: std.ArrayList(i64) = .empty;
         var typed_f32: std.ArrayList(f32) = .empty;
+        // The list every narrower integer type shares, including the 8-bit
+        // zero points of a quantized export.
+        var typed_i32: std.ArrayList(i64) = .empty;
         var external: []const u8 = &.{};
         var offset: u64 = 0;
         var length: u64 = 0;
@@ -381,24 +416,15 @@ const Parser = struct {
                 1 => try self.appendI64(&dims, &r, f.wire),
                 2 => tensor.dtype = @enumFromInt(try r.varint()),
                 4 => try self.appendF32(&typed_f32, &r, f.wire),
+                5 => try self.appendI64(&typed_i32, &r, f.wire),
                 7 => try self.appendI64(&typed_i64, &r, f.wire),
                 8 => tensor.name = try r.slice(),
                 9 => tensor.data = try r.slice(),
                 13 => {
-                    var entry = try r.sub();
-                    var key: []const u8 = "";
-                    var value: []const u8 = "";
-                    while (!entry.eof()) {
-                        const ef = try entry.field();
-                        switch (ef.number) {
-                            1 => key = try entry.slice(),
-                            2 => value = try entry.slice(),
-                            else => try entry.skip(ef.wire),
-                        }
-                    }
-                    if (std.mem.eql(u8, key, "location")) external = value;
-                    if (std.mem.eql(u8, key, "offset")) offset = try std.fmt.parseInt(u64, value, 10);
-                    if (std.mem.eql(u8, key, "length")) length = try std.fmt.parseInt(u64, value, 10);
+                    const entry = try parseStringEntry(try r.sub());
+                    if (std.mem.eql(u8, entry.key, "location")) external = entry.value;
+                    if (std.mem.eql(u8, entry.key, "offset")) offset = try std.fmt.parseInt(u64, entry.value, 10);
+                    if (std.mem.eql(u8, entry.key, "length")) length = try std.fmt.parseInt(u64, entry.value, 10);
                 },
                 else => try r.skip(f.wire),
             }
@@ -407,6 +433,17 @@ const Parser = struct {
         tensor.dims = dims.items;
         if (typed_i64.items.len != 0) tensor.data = std.mem.sliceAsBytes(typed_i64.items);
         if (typed_f32.items.len != 0) tensor.data = std.mem.sliceAsBytes(typed_f32.items);
+        if (typed_i32.items.len != 0) {
+            const size = tensor.dtype.size();
+            if (size == 0 or size > 4) return error.UnsupportedTensorType;
+            const bytes = try self.arena.alignedAlloc(u8, .@"8", typed_i32.items.len * size);
+            for (typed_i32.items, 0..) |value, index| {
+                var little: [4]u8 = undefined;
+                std.mem.writeInt(u32, &little, @truncate(@as(u64, @bitCast(value))), .little);
+                @memcpy(bytes[index * size ..][0..size], little[0..size]);
+            }
+            tensor.data = bytes;
+        }
 
         if (external.len != 0) {
             const blob = try self.externalWeights(external);
