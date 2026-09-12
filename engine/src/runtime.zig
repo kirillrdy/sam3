@@ -169,6 +169,8 @@ const State = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     gpu: device_mod.Device,
+    /// How many ways the host-side operators split their work.
+    cores: usize,
     /// Shapes and strides for the current launch. Bounded by the maximum rank,
     /// so one small allocation serves every node.
     metadata: driver.Buffer(u32),
@@ -222,6 +224,7 @@ pub const Env = struct {
             .allocator = allocator,
             .io = io,
             .gpu = gpu,
+            .cores = std.Thread.getCpuCount() catch 1,
             .metadata = metadata,
             .metadata_staging = metadata_staging,
         };
@@ -259,6 +262,9 @@ pub const Session = struct {
             var shuffled = state.shuffled.valueIterator();
             while (shuffled.next()) |buffer| buffer.free();
             state.shuffled.deinit(env.state.allocator);
+            var dequantized = state.dequantized.valueIterator();
+            while (dequantized.next()) |buffer| buffer.free();
+            state.dequantized.deinit(env.state.allocator);
             state.graph.deinit();
         }
         try env.state.gpu.makeCurrent();
@@ -266,8 +272,13 @@ pub const Session = struct {
         errdefer {
             state.fused.deinit(env.state.allocator);
             state.folded.deinit(env.state.allocator);
+            if (state.constant_nodes) |*map| map.deinit(env.state.allocator);
         }
         try state.findFusions();
+        try state.dequantizeWeights();
+        // Only the fusion matchers read it, and they have run.
+        if (state.constant_nodes) |*map| map.deinit(env.state.allocator);
+        state.constant_nodes = null;
         return .{ .state = state };
     }
 
@@ -279,10 +290,25 @@ pub const Session = struct {
         var shuffled = self.state.shuffled.valueIterator();
         while (shuffled.next()) |buffer| buffer.free();
         self.state.shuffled.deinit(allocator);
+        var sums = self.state.column_sums.valueIterator();
+        while (sums.next()) |entry| allocator.free(entry.*);
+        self.state.column_sums.deinit(allocator);
+        var dequantized = self.state.dequantized.valueIterator();
+        while (dequantized.next()) |buffer| buffer.free();
+        self.state.dequantized.deinit(allocator);
+        var scalars = self.state.scalars.valueIterator();
+        while (scalars.next()) |buffer| buffer.free();
+        self.state.scalars.deinit(allocator);
         self.state.fused.deinit(allocator);
         self.state.folded.deinit(allocator);
         self.state.graph.deinit();
         allocator.destroy(self.state);
+    }
+
+    /// A `metadata_props` entry of the model, or null where the export carries
+    /// none by that name.
+    pub fn metadata(self: Session, key: []const u8) ?[]const u8 {
+        return self.state.graph.metadata.get(key);
     }
 
     pub fn run(
@@ -376,7 +402,10 @@ const Fusion = struct {
     softmax: usize = 0,
     /// What a fused attention multiplies its scores by, where the graph
     /// scaled Q and K before the product and the kernel can do it after.
+    /// For a dequantized product, what the weight's integers are scaled by.
     scale: f32 = 1,
+    /// The integer a dequantized product's weight stands at zero.
+    zero: f32 = 0,
     /// The operators a fused rotary embedding stands for, in graph order, for
     /// the same reason: shapes that turn out not to suit its kernel run them
     /// after all. Unused by the others.
@@ -389,6 +418,14 @@ const Fusion = struct {
         rotary,
         biased_product,
         biased_product_gelu,
+        /// The five operators a quantized export spells a product as, run as
+        /// a float product against a weight dequantized once at open. The
+        /// third operand, where there is one, is a bias.
+        dequantized_product,
+        /// The nine operators a layer normalization is spelled as, run by the
+        /// one kernel. Operands are the input, the scale, and the bias, and
+        /// `scale` carries the epsilon.
+        layer_norm,
     };
 
     fn inputs(self: *const Fusion) []const []const u8 {
@@ -404,6 +441,18 @@ const SessionState = struct {
     /// Transposed convolution weights, reordered once into the row per output
     /// channel and tap that the matrix product wants.
     shuffled: std.StringHashMapUnmanaged(driver.Buffer(Element)) = .empty,
+    /// Column sums of the quantized weights, which the integer product folds
+    /// its zero points through; see `matmulInteger`.
+    column_sums: std.StringHashMapUnmanaged([]const i32) = .empty,
+    /// The weights of the fused quantized products, as floats on the device.
+    dequantized: std.StringHashMapUnmanaged(driver.Buffer(Element)) = .empty,
+    /// One-element device buffers by the float they hold, for the operators
+    /// that scale by a constant; see `scalar`.
+    scalars: std.AutoHashMapUnmanaged(u32, driver.Buffer(Element)) = .empty,
+    /// The value of every `Constant` node by its output name, built on first
+    /// use so the fusion matchers can read constants the graph does not spell
+    /// as initializers. Null until then.
+    constant_nodes: ?std.StringHashMapUnmanaged(onnx.Tensor) = null,
     initializers_preloaded: bool = false,
     /// Whether a constant has been uploaded off the weight blob since the last
     /// release. A quantized matrix only reaches the device the first time the
@@ -577,6 +626,17 @@ const SessionState = struct {
             try self.folded.put(allocator, softmax_at, {});
         }
 
+        // The product a quantized export spells as five operators: the
+        // activation quantized on the fly, the integer product, and the two
+        // scales multiplied back in. Run as one float product against the
+        // weight dequantized at open, it neither leaves the device nor
+        // quantizes the activation at all.
+        for (self.graph.nodes, 0..) |node, index| {
+            const plan = self.dequantizedProductAt(node, producer, uses) orelse continue;
+            try self.fused.put(allocator, index, plan);
+            for (plan.swallowed[0..plan.swallowed_len]) |at| try self.folded.put(allocator, at, {});
+        }
+
         // A product the graph follows with a bias, which the product can add on
         // the way out instead of a second pass reading and writing all of it.
         for (self.graph.nodes, 0..) |node, index| {
@@ -588,18 +648,28 @@ const SessionState = struct {
                 const tensor = self.graph.constant(bias) orelse continue;
                 if (tensor.dtype != .f32 or tensor.dims.len != 1) continue;
                 const at = producer.get(sum) orelse continue;
-                if (self.folded.contains(at) or self.fused.contains(at)) continue;
-                const dot = self.graph.nodes[at];
-                if (!std.mem.eql(u8, dot.op_type, "MatMul") or dot.inputs.len != 2) continue;
+                if (self.folded.contains(at)) continue;
+                var plan: Fusion = undefined;
+                if (self.fused.get(at)) |fused| {
+                    if (fused.kind != .dequantized_product or fused.arity != 2) continue;
+                    plan = fused;
+                    plan.operands[2] = bias;
+                    plan.arity = 3;
+                } else {
+                    const dot = self.graph.nodes[at];
+                    if (!std.mem.eql(u8, dot.op_type, "MatMul") or dot.inputs.len != 2) continue;
+                    plan = .{
+                        .kind = .biased_product,
+                        .operands = .{ dot.inputs[0], dot.inputs[1], bias },
+                        .arity = 3,
+                    };
+                }
                 // The bias runs along the columns the product writes.
-                const weights = self.graph.constant(dot.inputs[1]) orelse continue;
+                const weights = self.graph.constant(plan.operands[1]) orelse continue;
                 if (weights.dims.len == 0 or weights.dims[weights.dims.len - 1] != tensor.dims[0]) continue;
 
-                try self.fused.put(allocator, index, .{
-                    .kind = .biased_product,
-                    .operands = .{ dot.inputs[0], dot.inputs[1], bias },
-                    .arity = 3,
-                });
+                _ = self.fused.remove(at);
+                try self.fused.put(allocator, index, plan);
                 try self.folded.put(allocator, at, {});
                 break;
             }
@@ -633,6 +703,15 @@ const SessionState = struct {
                 plan.swallowed_len += 1;
                 try self.folded.put(allocator, at, {});
             }
+        }
+
+        // The layer normalization these exports spell out in nine operators,
+        // most of them the small reductions and elementwise passes that
+        // otherwise dominate a run. One kernel does the whole of it.
+        for (self.graph.nodes, 0..) |_, index| {
+            const plan = self.layerNormAt(index, producer, uses) orelse continue;
+            try self.fused.put(allocator, index, plan);
+            for (plan.swallowed[0..plan.swallowed_len]) |at| try self.folded.put(allocator, at, {});
         }
 
         // The rotary embedding, where there is a kernel for it. A CUDA build
@@ -670,11 +749,117 @@ const SessionState = struct {
     const Producers = std.StringHashMapUnmanaged(usize);
     const Uses = std.StringHashMapUnmanaged(usize);
 
-    /// The one value a scalar constant holds, if `name` names one.
+    /// The one value a scalar constant holds, if `name` names one -- whether
+    /// it is an initializer or the output of a `Constant` node.
     fn scalarConstant(self: *SessionState, name: []const u8) ?f32 {
-        const tensor = self.graph.constant(name) orelse return null;
+        const tensor = self.graph.constant(name) orelse self.constantNode(name) orelse return null;
         if (tensor.dtype != .f32 or tensor.elementCount() != 1) return null;
         return tensor.f32s()[0];
+    }
+
+    /// The tensor a `Constant` node carries as its value, if one produces
+    /// `name`. Exports that spell their constants this way rather than as
+    /// initializers reach the fusion matchers through here.
+    fn constantNode(self: *SessionState, name: []const u8) ?onnx.Tensor {
+        if (self.constant_nodes == null) {
+            var map: std.StringHashMapUnmanaged(onnx.Tensor) = .empty;
+            for (self.graph.nodes) |node| {
+                if (!std.mem.eql(u8, node.op_type, "Constant") or node.outputs.len != 1) continue;
+                const value = node.attribute("value") orelse continue;
+                map.put(self.env.allocator, node.outputs[0], value.tensor orelse continue) catch return null;
+            }
+            self.constant_nodes = map;
+        }
+        return self.constant_nodes.?.get(name);
+    }
+
+    /// Whether `index` is the final Add of a layer normalization spelled out
+    /// over the last axis:
+    ///
+    ///     m   = ReduceMean(x, -1)
+    ///     d   = Sub(x, m)
+    ///     v   = ReduceMean(Pow(d, 2), -1)
+    ///     out = Add(Mul(Div(d, Sqrt(Add(v, eps))), scale), bias)
+    ///
+    /// and if so, the plan running it on the one kernel with `x`, `scale` and
+    /// `bias` as operands and `eps` in `scale`. Every intermediate is read
+    /// once except `d`, which the variance and the division share.
+    fn layerNormAt(self: *SessionState, index: usize, producer: Producers, uses: Uses) ?Fusion {
+        const bias_add = self.graph.nodes[index];
+        if (!std.mem.eql(u8, bias_add.op_type, "Add") or bias_add.inputs.len != 2) return null;
+        for (0..2) |bias_side| {
+            const bias = bias_add.inputs[bias_side];
+            const scaled = bias_add.inputs[1 - bias_side];
+            const bias_tensor = self.graph.constant(bias) orelse continue;
+            if (bias_tensor.dtype != .f32 or bias_tensor.dims.len != 1) continue;
+            if ((uses.get(scaled) orelse 0) != 1) continue;
+
+            const mul_at = producer.get(scaled) orelse continue;
+            const mul = self.graph.nodes[mul_at];
+            if (!std.mem.eql(u8, mul.op_type, "Mul") or mul.inputs.len != 2) continue;
+            var scale: []const u8 = "";
+            var normalized: []const u8 = "";
+            for (0..2) |s| {
+                const candidate = self.graph.constant(mul.inputs[s]) orelse continue;
+                if (candidate.dtype != .f32 or candidate.dims.len != 1) continue;
+                scale = mul.inputs[s];
+                normalized = mul.inputs[1 - s];
+            }
+            if (scale.len == 0 or (uses.get(normalized) orelse 0) != 1) continue;
+
+            const div_at = producer.get(normalized) orelse continue;
+            const div = self.graph.nodes[div_at];
+            if (!std.mem.eql(u8, div.op_type, "Div") or div.inputs.len != 2) continue;
+            const sub_name = div.inputs[0];
+            if ((uses.get(sub_name) orelse 0) != 2) continue;
+            if ((uses.get(div.inputs[1]) orelse 0) != 1) continue;
+
+            const sqrt_at = producer.get(div.inputs[1]) orelse continue;
+            const sqrt = self.graph.nodes[sqrt_at];
+            if (!std.mem.eql(u8, sqrt.op_type, "Sqrt") or sqrt.inputs.len != 1) continue;
+            if ((uses.get(sqrt.inputs[0]) orelse 0) != 1) continue;
+
+            const eps_at = producer.get(sqrt.inputs[0]) orelse continue;
+            const eps_node = self.graph.nodes[eps_at];
+            const eps = self.scalarOperand(eps_node, "Add") orelse continue;
+            if ((uses.get(eps.tensor) orelse 0) != 1) continue;
+
+            const var_at = producer.get(eps.tensor) orelse continue;
+            const variance = self.graph.nodes[var_at];
+            if (!std.mem.eql(u8, variance.op_type, "ReduceMean") or !self.reducesLastAxis(variance)) continue;
+            if ((uses.get(variance.inputs[0]) orelse 0) != 1) continue;
+
+            const pow_at = producer.get(variance.inputs[0]) orelse continue;
+            const pow = self.graph.nodes[pow_at];
+            const power = self.scalarOperand(pow, "Pow") orelse continue;
+            if (@abs(power.value - 2.0) > 1e-6 or !std.mem.eql(u8, power.tensor, sub_name)) continue;
+
+            const sub_at = producer.get(sub_name) orelse continue;
+            const sub = self.graph.nodes[sub_at];
+            if (!std.mem.eql(u8, sub.op_type, "Sub") or sub.inputs.len != 2) continue;
+            const x = sub.inputs[0];
+            if ((uses.get(sub.inputs[1]) orelse 0) != 1) continue;
+
+            const mean_at = producer.get(sub.inputs[1]) orelse continue;
+            const mean = self.graph.nodes[mean_at];
+            if (!std.mem.eql(u8, mean.op_type, "ReduceMean") or !self.reducesLastAxis(mean)) continue;
+            if (!std.mem.eql(u8, mean.inputs[0], x)) continue;
+
+            var plan: Fusion = .{
+                .kind = .layer_norm,
+                .operands = .{ x, scale, bias },
+                .arity = 3,
+                .scale = eps.value,
+            };
+            plan.swallowed[0..7].* = .{
+                @intCast(mul_at), @intCast(div_at), @intCast(sqrt_at), @intCast(eps_at),
+                @intCast(var_at), @intCast(pow_at), @intCast(sub_at),
+            };
+            plan.swallowed[7] = @intCast(mean_at);
+            plan.swallowed_len = 8;
+            return plan;
+        }
+        return null;
     }
 
     /// A commutative binary node against a scalar constant: which input is the
@@ -685,6 +870,64 @@ const SessionState = struct {
             if (self.scalarConstant(node.inputs[side])) |value| {
                 return .{ .tensor = node.inputs[1 - side], .value = value };
             }
+        }
+        return null;
+    }
+
+    /// Whether `node` closes the five operators a quantized export spells a
+    /// product as:
+    ///
+    ///     q, s, z = DynamicQuantizeLinear(x)
+    ///     y = Mul(Cast(MatMulInteger(q, W, z, Wz)), Mul(s, Ws))
+    ///
+    /// and if so, the plan for running it as `x @ ((W - Wz) * Ws)`. Every
+    /// intermediate has to be read once, or something outside wants a value
+    /// the fused product would not leave behind.
+    fn dequantizedProductAt(self: *SessionState, node: onnx.Node, producer: Producers, uses: Uses) ?Fusion {
+        if (!std.mem.eql(u8, node.op_type, "Mul") or node.inputs.len != 2) return null;
+        for (0..2) |side| {
+            const cast_at = producer.get(node.inputs[side]) orelse continue;
+            const casting = self.graph.nodes[cast_at];
+            if (!std.mem.eql(u8, casting.op_type, "Cast") or casting.int("to", 0) != @intFromEnum(onnx.DataType.f32)) continue;
+            if ((uses.get(node.inputs[side]) orelse 0) != 1) continue;
+
+            const integer_at = producer.get(casting.inputs[0]) orelse continue;
+            const integer = self.graph.nodes[integer_at];
+            if (!std.mem.eql(u8, integer.op_type, "MatMulInteger") or integer.inputs.len != 4) continue;
+            if ((uses.get(casting.inputs[0]) orelse 0) != 1) continue;
+
+            const quantize_at = producer.get(integer.inputs[0]) orelse continue;
+            const quantize = self.graph.nodes[quantize_at];
+            if (!std.mem.eql(u8, quantize.op_type, "DynamicQuantizeLinear") or quantize.outputs.len != 3) continue;
+            if (!std.mem.eql(u8, quantize.outputs[2], integer.inputs[2])) continue;
+            var exclusive = true;
+            for (quantize.outputs) |name| exclusive = exclusive and (uses.get(name) orelse 0) == 1;
+            if (!exclusive) continue;
+
+            const scales_at = producer.get(node.inputs[1 - side]) orelse continue;
+            const scales = self.graph.nodes[scales_at];
+            if (!std.mem.eql(u8, scales.op_type, "Mul") or scales.inputs.len != 2) continue;
+            if ((uses.get(node.inputs[1 - side]) orelse 0) != 1) continue;
+            const activation_scale: usize = if (std.mem.eql(u8, scales.inputs[0], quantize.outputs[1])) 0 else if (std.mem.eql(u8, scales.inputs[1], quantize.outputs[1])) 1 else continue;
+            const weight_scale = self.scalarConstant(scales.inputs[1 - activation_scale]) orelse continue;
+
+            const weight = self.graph.constant(integer.inputs[1]) orelse continue;
+            if ((weight.dtype != .u8 and weight.dtype != .i8) or weight.dims.len != 2) continue;
+            // Another reader would want the integers this replaces.
+            if ((uses.get(integer.inputs[1]) orelse 0) != 1) continue;
+            const zero = self.graph.constant(integer.inputs[3]) orelse continue;
+            if (zero.dtype != weight.dtype or zero.data.len == 0) continue;
+
+            var plan: Fusion = .{
+                .kind = .dequantized_product,
+                .operands = .{ quantize.inputs[0], integer.inputs[1], "" },
+                .arity = 2,
+                .scale = weight_scale,
+                .zero = if (zero.dtype == .i8) @floatFromInt(@as(i8, @bitCast(zero.data[0]))) else @floatFromInt(zero.data[0]),
+            };
+            plan.swallowed[0..4].* = .{ @intCast(quantize_at), @intCast(scales_at), @intCast(integer_at), @intCast(cast_at) };
+            plan.swallowed_len = 4;
+            return plan;
         }
         return null;
     }
@@ -917,10 +1160,74 @@ const SessionState = struct {
         return axes.i64s()[0] == -1;
     }
 
+    /// Whether a ReduceMean reduces exactly the last axis, whether the axis is
+    /// an attribute (as these exports write it) or an input, and keeps the
+    /// dimension so the following broadcast lines up.
+    fn reducesLastAxis(self: *SessionState, node: onnx.Node) bool {
+        if (node.int("keepdims", 1) == 0 or node.int("noop_with_empty_axes", 0) != 0) return false;
+        const attr = node.ints("axes");
+        if (attr.len == 1) return attr[0] == -1;
+        if (attr.len != 0) return false;
+        if (node.inputs.len < 2 or node.inputs[1].len == 0) return false;
+        const axes = self.graph.constant(node.inputs[1]) orelse return false;
+        if (axes.elementCount() != 1) return false;
+        return switch (axes.dtype) {
+            .i64 => axes.i64s()[0] == -1,
+            .i32 => @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, axes.data)))[0] == -1,
+            else => false,
+        };
+    }
+
     /// What a fused node reads, which is not what the graph says it reads.
     fn effectiveInputs(self: *SessionState, index: usize, node: onnx.Node) []const []const u8 {
         const plan = self.fused.getPtr(index) orelse return node.inputs;
         return plan.inputs();
+    }
+
+    /// Uploads the weight of every fused quantized product as floats, the way
+    /// `preloadInitializers` does the float ones. A weight is 8 bits in the
+    /// file and an `Element` on the device, so this is where the export's
+    /// memory saving is spent.
+    fn dequantizeWeights(self: *SessionState) !void {
+        const allocator = self.env.allocator;
+        var plans = self.fused.valueIterator();
+        while (plans.next()) |plan| {
+            if (plan.kind != .dequantized_product) continue;
+            const name = plan.operands[1];
+            if (self.dequantized.contains(name)) continue;
+            const source = self.graph.constant(name) orelse return Error.MissingValue;
+            const count = source.elementCount();
+            const floats = try allocator.alloc(f32, count);
+            defer allocator.free(floats);
+            for (floats, source.data) |*value, quantized| {
+                const integer: f32 = if (source.dtype == .i8) @floatFromInt(@as(i8, @bitCast(quantized))) else @floatFromInt(quantized);
+                value.* = (integer - plan.zero) * plan.scale;
+            }
+            const buffer = try driver.Buffer(Element).alloc(count);
+            errdefer buffer.free();
+            try uploadFloats(allocator, buffer, floats);
+            try self.dequantized.put(allocator, name, buffer);
+        }
+    }
+
+    /// A fused quantized product: the float product against the weight
+    /// `dequantizeWeights` put on the device, which stands in under the
+    /// weight's own name for the rest of the run.
+    fn dequantizedProduct(
+        self: *SessionState,
+        arena: std.mem.Allocator,
+        values: *std.StringHashMapUnmanaged(*Tensor),
+        node: onnx.Node,
+        plan: Fusion,
+    ) !void {
+        const name = plan.operands[1];
+        if (values.get(name) == null) {
+            const source = self.graph.constant(name) orelse return Error.MissingValue;
+            const buffer = self.dequantized.get(name) orelse return Error.MissingValue;
+            try self.put(arena, values, name, .{ .dtype = .f32, .dims = source.dims, .data = .{ .constant_gpu = buffer } });
+        }
+        const bias = if (plan.arity == 3) plan.operands[2] else null;
+        return self.matmulOf(arena, values, plan.operands[0], name, bias, .none, node.outputs[0]);
     }
 
     /// How much of the weight blob may be resident at once while it is being
@@ -966,6 +1273,8 @@ const SessionState = struct {
             .rotary => self.rotary(arena, values, node, plan),
             .biased_product => self.matmulOf(arena, values, plan.operands[0], plan.operands[1], plan.operands[2], .none, node.outputs[0]),
             .biased_product_gelu => self.matmulOf(arena, values, plan.operands[0], plan.operands[1], plan.operands[2], .gelu, node.outputs[0]),
+            .dequantized_product => self.dequantizedProduct(arena, values, node, plan),
+            .layer_norm => self.layerNormOf(arena, values, plan.operands[0], plan.operands[1], plan.operands[2], plan.scale, node.outputs[0], null),
         };
         if (std.mem.eql(u8, node.op_type, "Conv")) return self.conv(arena, values, node);
         if (std.mem.eql(u8, node.op_type, "ConvTranspose")) return self.convTranspose(arena, values, node);
@@ -1252,9 +1561,9 @@ const SessionState = struct {
         }
 
         const meta = [_]u32{
-            @intCast(x_c),   @intCast(x_h),   @intCast(x_w), @intCast(w_out),
-            @intCast(out_h), @intCast(out_w), @intCast(w_h), @intCast(w_w),
-            @intCast(sh),    @intCast(sw),    @intCast(ph0), @intCast(pw0),
+            @intCast(x_c),   @intCast(x_h),   @intCast(x_w),    @intCast(w_out),
+            @intCast(out_h), @intCast(out_w), @intCast(w_h),    @intCast(w_w),
+            @intCast(sh),    @intCast(sw),    @intCast(ph0),    @intCast(pw0),
             @intCast(dh),    @intCast(dw),    @intCast(groups),
         };
         try self.env.uploadMetadata(&meta);
@@ -1491,6 +1800,20 @@ const SessionState = struct {
             @as(u32, @intCast(src_offset)),
             @as(u32, @intCast(dst_offset)),
         });
+    }
+
+    /// A one-element device buffer holding `value`, uploaded the first time
+    /// it is asked for and kept for the life of the session. An operator
+    /// that scales by a constant otherwise pays a blocking write each run.
+    fn scalar(self: *SessionState, value: f32) !driver.Buffer(Element) {
+        const entry = try self.scalars.getOrPut(self.env.allocator, @bitCast(value));
+        if (!entry.found_existing) {
+            errdefer _ = self.scalars.remove(@bitCast(value));
+            entry.value_ptr.* = try driver.Buffer(Element).alloc(1);
+            errdefer entry.value_ptr.free();
+            try uploadFloats(self.env.allocator, entry.value_ptr.*, &.{value});
+        }
+        return entry.value_ptr.*;
     }
 
     fn releaseStorage(self: *SessionState, storage: *Storage) void {
@@ -2340,14 +2663,14 @@ const SessionState = struct {
             const count = try a.count();
             const storage = try self.newStorage(count);
             errdefer self.releaseStorage(storage);
-            try uploadFloats(arena, storage.buffer, @alignCast(std.mem.bytesAsSlice(f32, a.data.host)));
+            try stageFloats(arena, storage.buffer, @alignCast(std.mem.bytesAsSlice(f32, a.data.host)));
             a.* = .{ .dtype = .f32, .dims = a.dims, .data = .{ .gpu = storage } };
         }
         if (b.onHost()) {
             const count = try b.count();
             const storage = try self.newStorage(count);
             errdefer self.releaseStorage(storage);
-            try uploadFloats(arena, storage.buffer, @alignCast(std.mem.bytesAsSlice(f32, b.data.host)));
+            try stageFloats(arena, storage.buffer, @alignCast(std.mem.bytesAsSlice(f32, b.data.host)));
             b.* = .{ .dtype = .f32, .dims = b.dims, .data = .{ .gpu = storage } };
         }
 
@@ -2408,10 +2731,31 @@ const SessionState = struct {
     }
 
     fn layerNorm(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
-        const x = try self.input(arena, values, node.inputs[0]);
-        const scale = try self.input(arena, values, node.inputs[1]);
-        const bias = if (node.inputs.len > 2 and node.inputs[2].len != 0) try self.input(arena, values, node.inputs[2]) else null;
-        const axis = normalizeAxis(node.int("axis", -1), x.dims.len);
+        const axis = normalizeAxis(node.int("axis", -1), (try self.input(arena, values, node.inputs[0])).dims.len);
+        const bias = if (node.inputs.len > 2 and node.inputs[2].len != 0) node.inputs[2] else null;
+        return self.layerNormOf(arena, values, node.inputs[0], node.inputs[1], bias, node.float("epsilon", 1e-5), node.outputs[0], axis);
+    }
+
+    /// The normalization over the last `axis` dimensions of `x_name` by the
+    /// one kernel, shared by the `LayerNormalization` operator and the fused
+    /// nine-operator spelling. A null bias adds nothing.
+    fn layerNormOf(
+        self: *SessionState,
+        arena: std.mem.Allocator,
+        values: *std.StringHashMapUnmanaged(*Tensor),
+        x_name: []const u8,
+        scale_name: []const u8,
+        bias_name: ?[]const u8,
+        epsilon: f32,
+        out_name: []const u8,
+        axis_hint: ?usize,
+    ) !void {
+        const x = try self.input(arena, values, x_name);
+        const scale = try self.input(arena, values, scale_name);
+        const bias = if (bias_name) |name| try self.input(arena, values, name) else null;
+        // The fused pattern always reduces the last axis; the operator passes
+        // the axis it computed.
+        const axis = axis_hint orelse (x.dims.len - 1);
         var cols: usize = 1;
         for (x.dims[axis..]) |dim| cols *= @intCast(dim);
         const count = try x.count();
@@ -2428,10 +2772,10 @@ const SessionState = struct {
         var block: u32 = 32;
         while (block < cols and block < 256) block *= 2;
         try self.env.gpu.layer_norm.launch(.{ .x = @intCast(rows) }, .{ .x = block }, .{
-            xb.ptr, sb.ptr, bb.ptr, storage.buffer.ptr, @as(u32, @intCast(cols)), node.float("epsilon", 1e-5), @as(u32, if (bias != null) 1 else 0),
+            xb.ptr, sb.ptr, bb.ptr, storage.buffer.ptr, @as(u32, @intCast(cols)), epsilon, @as(u32, if (bias != null) 1 else 0),
         });
         const dims = try arena.dupe(i64, x.dims);
-        try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
+        try self.put(arena, values, out_name, .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
     }
 
     /// out[i...] = data[indices[i..., :]], the read that ScatterND writes.
@@ -2997,14 +3341,14 @@ const SessionState = struct {
             const a_count = try a.count();
             const a_storage = try self.newStorage(a_count);
             errdefer self.releaseStorage(a_storage);
-            try uploadFloats(arena, a_storage.buffer, @alignCast(std.mem.bytesAsSlice(f32, a.data.host)));
+            try stageFloats(arena, a_storage.buffer, @alignCast(std.mem.bytesAsSlice(f32, a.data.host)));
             a.* = .{ .dtype = .f32, .dims = a.dims, .data = .{ .gpu = a_storage } };
         }
         if (b.onHost() and b.dtype == .f32) {
             const b_count = try b.count();
             const b_storage = try self.newStorage(b_count);
             errdefer self.releaseStorage(b_storage);
-            try uploadFloats(arena, b_storage.buffer, @alignCast(std.mem.bytesAsSlice(f32, b.data.host)));
+            try stageFloats(arena, b_storage.buffer, @alignCast(std.mem.bytesAsSlice(f32, b.data.host)));
             b.* = .{ .dtype = .f32, .dims = b.dims, .data = .{ .gpu = b_storage } };
         }
 
@@ -3046,7 +3390,12 @@ const SessionState = struct {
         for (host, 0..) |*value, i| value.* = @floatFromInt(try tensor.element(i));
         const storage = try self.newStorage(count);
         errdefer self.releaseStorage(storage);
-        try storage.buffer.upload(host);
+        // Arena memory, so the queue may read it as late as it likes.
+        if (@hasDecl(driver, "is_opencl") or @hasDecl(driver, "is_metal")) {
+            try storage.buffer.uploadAsync(host);
+        } else {
+            try storage.buffer.upload(host);
+        }
         return storage;
     }
 
@@ -3073,7 +3422,7 @@ const SessionState = struct {
             }
             const storage = try self.newStorage(count);
             errdefer self.releaseStorage(storage);
-            try uploadFloats(arena, storage.buffer, out);
+            try stageFloats(arena, storage.buffer, out);
             return self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
         }
 
@@ -3522,6 +3871,14 @@ const SessionState = struct {
         }
     }
 
+    /// The integer integer runs on the host: the quantized graphs that spell
+    /// it hand it the u8 activations a DynamicQuantizeLinear just brought
+    /// down, and a u8 weight straight off the file. Σ(a-za)(b-zb) is taken as
+    /// Σab - za·Σb - zb·Σa + K·za·zb, so the inner loop is a plain unsigned
+    /// integer, which widens to u16 without overflow and accumulates in u32.
+    /// The column sums of a constant weight are kept for the life of the
+    /// session. The weight is streamed once per block of activation rows,
+    /// and its columns are split across the cores.
     fn matmulInteger(
         self: *SessionState,
         arena: std.mem.Allocator,
@@ -3530,31 +3887,13 @@ const SessionState = struct {
     ) !void {
         const a = try self.input(arena, values, node.inputs[0]);
         const b = try self.input(arena, values, node.inputs[1]);
+        if (a.dtype != .u8 or b.dtype != .u8 or !a.onHost() or !b.onHost()) return Error.UnsupportedDataType;
 
-        var a_zp: i32 = 0;
-        if (node.inputs.len > 2 and node.inputs[2].len != 0) {
-            const a_zp_tensor = try self.input(arena, values, node.inputs[2]);
-            if (a_zp_tensor.data.host.len > 0) {
-                a_zp = switch (a_zp_tensor.dtype) {
-                    .u8 => a_zp_tensor.data.host[0],
-                    .i8 => @as(i8, @bitCast(a_zp_tensor.data.host[0])),
-                    .i32 => @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, a_zp_tensor.data.host)))[0],
-                    else => 0,
-                };
-            }
-        }
-
-        var b_zp: i32 = 0;
-        if (node.inputs.len > 3 and node.inputs[3].len != 0) {
-            const b_zp_tensor = try self.input(arena, values, node.inputs[3]);
-            if (b_zp_tensor.data.host.len > 0) {
-                b_zp = switch (b_zp_tensor.dtype) {
-                    .u8 => b_zp_tensor.data.host[0],
-                    .i8 => @as(i8, @bitCast(b_zp_tensor.data.host[0])),
-                    .i32 => @as([]const i32, @alignCast(std.mem.bytesAsSlice(i32, b_zp_tensor.data.host)))[0],
-                    else => 0,
-                };
-            }
+        var zero_points: [2]i32 = .{ 0, 0 };
+        for (&zero_points, 2..) |*zero_point, index| {
+            if (node.inputs.len <= index or node.inputs[index].len == 0) continue;
+            const tensor = try self.input(arena, values, node.inputs[index]);
+            if (tensor.data.host.len > 0) zero_point.* = @intCast(try tensor.element(0));
         }
 
         const rank_a = a.dims.len;
@@ -3563,9 +3902,8 @@ const SessionState = struct {
 
         const m = a.dims[rank_a - 2];
         const k = a.dims[rank_a - 1];
-        const bk = b.dims[rank_b - 2];
         const n = b.dims[rank_b - 1];
-        if (k != bk) return Error.InvalidShape;
+        if (k != b.dims[rank_b - 2]) return Error.InvalidShape;
 
         const batch_dims = try broadcastShape(arena, a.dims[0 .. rank_a - 2], b.dims[0 .. rank_b - 2]);
         const dims = try arena.alloc(i64, batch_dims.len + 2);
@@ -3573,49 +3911,68 @@ const SessionState = struct {
         dims[dims.len - 2] = m;
         dims[dims.len - 1] = n;
 
-        const batches = try elementCount(batch_dims);
-        const a_batches = try elementCount(a.dims[0 .. rank_a - 2]);
-        const b_batches = try elementCount(b.dims[0 .. rank_b - 2]);
+        const integer: IntegerProduct = .{
+            .a = a.data.host,
+            .b = b.data.host,
+            .b_sums = try self.columnSums(arena, node.inputs[1], b),
+            .out = try arena.alloc(i32, try elementCount(dims)),
+            .m = @intCast(m),
+            .n = @intCast(n),
+            .k = @intCast(k),
+            .batches = try elementCount(batch_dims),
+            .a_batches = try elementCount(a.dims[0 .. rank_a - 2]),
+            .b_batches = try elementCount(b.dims[0 .. rank_b - 2]),
+            .a_zero = zero_points[0],
+            .b_zero = zero_points[1],
+        };
 
-        const out_count = try elementCount(dims);
-        const out = try arena.alloc(i32, out_count);
-
-        const a_bytes = a.data.host;
-        const b_bytes = b.data.host;
-
-        const m_usize: usize = @intCast(m);
-        const n_usize: usize = @intCast(n);
-        const k_usize: usize = @intCast(k);
-
-        for (0..batches) |batch_idx| {
-            const a_batch_idx = if (a_batches == 1) 0 else batch_idx;
-            const b_batch_idx = if (b_batches == 1) 0 else batch_idx;
-
-            const a_slice = a_bytes[a_batch_idx * m_usize * k_usize .. (a_batch_idx + 1) * m_usize * k_usize];
-            const b_slice = b_bytes[b_batch_idx * k_usize * n_usize .. (b_batch_idx + 1) * k_usize * n_usize];
-            const c_slice = out[batch_idx * m_usize * n_usize .. (batch_idx + 1) * m_usize * n_usize];
-
-            for (0..m_usize) |row| {
-                const a_row = a_slice[row * k_usize .. (row + 1) * k_usize];
-                const c_row = c_slice[row * n_usize .. (row + 1) * n_usize];
-
-                for (0..n_usize) |col| {
-                    var sum: i32 = 0;
-                    for (0..k_usize) |depth| {
-                        const a_val: i32 = @as(i32, a_row[depth]) - a_zp;
-                        const b_val: i32 = @as(i32, b_slice[depth * n_usize + col]) - b_zp;
-                        sum += a_val * b_val;
-                    }
-                    c_row[col] = sum;
-                }
+        // Each worker takes a run of whole vector lanes; whatever does not
+        // divide evenly goes to the last one.
+        const lanes = IntegerProduct.lanes;
+        const workers = @min(self.env.cores, integer.n / lanes);
+        if (workers <= 1) {
+            integer.columns(0, integer.n);
+        } else {
+            const width = (integer.n / workers) / lanes * lanes;
+            var group: std.Io.Group = .init;
+            defer group.await(self.env.io) catch {};
+            for (0..workers) |worker| {
+                const first = worker * width;
+                const last = if (worker + 1 == workers) integer.n else first + width;
+                group.concurrent(self.env.io, IntegerProduct.columns, .{ &integer, first, last }) catch integer.columns(first, last);
             }
         }
 
         try self.put(arena, values, node.outputs[0], .{
             .dtype = .i32,
             .dims = dims,
-            .data = .{ .host = std.mem.sliceAsBytes(out) },
+            .data = .{ .host = std.mem.sliceAsBytes(integer.out) },
         });
+    }
+
+    /// Σ_k b[k][n] for every column of every batch of `b`, computed once per
+    /// session for a constant weight.
+    fn columnSums(self: *SessionState, arena: std.mem.Allocator, name: []const u8, b: *const Tensor) ![]const i32 {
+        const is_constant = self.graph.constant(name) != null;
+        if (is_constant) if (self.column_sums.get(name)) |sums| return sums;
+
+        const rank = b.dims.len;
+        const k: usize = @intCast(b.dims[rank - 2]);
+        const n: usize = @intCast(b.dims[rank - 1]);
+        const batches = try elementCount(b.dims[0 .. rank - 2]);
+        const allocator = if (is_constant) self.env.allocator else arena;
+        const sums = try allocator.alloc(i32, batches * n);
+        errdefer if (is_constant) allocator.free(sums);
+        @memset(sums, 0);
+        for (0..batches) |batch| {
+            const batch_sums = sums[batch * n ..][0..n];
+            for (0..k) |depth| {
+                const row = b.data.host[(batch * k + depth) * n ..][0..n];
+                for (batch_sums, row) |*sum, value| sum.* += value;
+            }
+        }
+        if (is_constant) try self.column_sums.put(self.env.allocator, name, sums);
+        return sums;
     }
 
     fn dequantizeLinear(
@@ -3659,7 +4016,7 @@ const SessionState = struct {
 
         const storage = try self.newStorage(count);
         errdefer self.releaseStorage(storage);
-        try uploadFloats(arena, storage.buffer, out);
+        try stageFloats(arena, storage.buffer, out);
         try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
     }
 
@@ -3788,10 +4145,7 @@ const SessionState = struct {
             @as(u32, @intCast(count)),
         });
 
-        const inv_swept: f32 = 1.0 / @as(f32, @floatFromInt(swept));
-        const factor_storage = try self.newStorage(1);
-        defer self.releaseStorage(factor_storage);
-        try uploadFloats(arena, factor_storage.buffer, &.{inv_swept});
+        const factor = try self.scalar(1.0 / @as(f32, @floatFromInt(swept)));
 
         var mul_meta: [3 * max_rank]u32 = @splat(0);
         for (kept, 0..) |dim, i| mul_meta[i] = @intCast(dim);
@@ -3802,7 +4156,7 @@ const SessionState = struct {
 
         try self.env.gpu.binary.launch(.{ .x = @intCast((count + block - 1) / block) }, .{ .x = block }, .{
             storage.buffer.ptr,
-            factor_storage.buffer.ptr,
+            factor.ptr,
             storage.buffer.ptr,
             self.env.metadata.ptr,
             @as(u32, @intCast(rank)),
@@ -3898,7 +4252,7 @@ const SessionState = struct {
 
             const storage = try self.newStorage(out_count);
             errdefer self.releaseStorage(storage);
-            try uploadFloats(arena, storage.buffer, out);
+            try stageFloats(arena, storage.buffer, out);
             try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = dims, .data = .{ .gpu = storage } });
         } else if (x.dtype == .i64 or x.dtype == .i32) {
             const out = try arena.alloc(i64, out_count);
@@ -3964,6 +4318,17 @@ const SessionState = struct {
         }
     }
 
+    /// A float tensor as the host can read it: the file's copy for a graph
+    /// constant, a download for anything computed.
+    fn hostFloats(self: *SessionState, arena: std.mem.Allocator, name: []const u8, tensor: *const Tensor) ![]const f32 {
+        if (tensor.dtype != .f32) return Error.UnsupportedDataType;
+        if (self.graph.constant(name)) |source| if (source.dtype == .f32) return source.f32s();
+        if (tensor.onHost()) return @alignCast(std.mem.bytesAsSlice(f32, tensor.data.host));
+        const data = try arena.alloc(f32, try tensor.count());
+        try downloadFloats(arena, try tensor.gpuBuffer(), data);
+        return data;
+    }
+
     fn lstm(self: *SessionState, arena: std.mem.Allocator, values: *std.StringHashMapUnmanaged(*Tensor), node: onnx.Node) !void {
         const x = try self.input(arena, values, node.inputs[0]);
         const w = try self.input(arena, values, node.inputs[1]);
@@ -3992,32 +4357,16 @@ const SessionState = struct {
         else
             null;
 
-        const x_data = try arena.alloc(f32, try x.count());
-        try downloadFloats(arena, try x.gpuBuffer(), x_data);
-
-        const w_data = try arena.alloc(f32, try w.count());
-        try downloadFloats(arena, try w.gpuBuffer(), w_data);
-
-        const r_data = try arena.alloc(f32, try r.count());
-        try downloadFloats(arena, try r.gpuBuffer(), r_data);
-
-        const b_data = if (bias) |b| blk: {
-            const buf = try arena.alloc(f32, try b.count());
-            try downloadFloats(arena, try b.gpuBuffer(), buf);
-            break :blk buf;
-        } else null;
-
-        const h_init_data = if (initial_h) |h0| blk: {
-            const buf = try arena.alloc(f32, try h0.count());
-            try downloadFloats(arena, try h0.gpuBuffer(), buf);
-            break :blk buf;
-        } else null;
-
-        const c_init_data = if (initial_c) |c0| blk: {
-            const buf = try arena.alloc(f32, try c0.count());
-            try downloadFloats(arena, try c0.gpuBuffer(), buf);
-            break :blk buf;
-        } else null;
+        // The recurrence runs on the host. Its weights are usually graph
+        // constants, which are still on the host as the file has them, so
+        // only what the graph computed is brought down -- each download waits
+        // for the queue, and a recurrent model is run once per window.
+        const x_data = try self.hostFloats(arena, node.inputs[0], x);
+        const w_data = try self.hostFloats(arena, node.inputs[1], w);
+        const r_data = try self.hostFloats(arena, node.inputs[2], r);
+        const b_data = if (bias) |b| try self.hostFloats(arena, node.inputs[3], b) else null;
+        const h_init_data = if (initial_h) |h0| try self.hostFloats(arena, node.inputs[5], h0) else null;
+        const c_init_data = if (initial_c) |c0| try self.hostFloats(arena, node.inputs[6], c0) else null;
 
         const y_count = seq_len * num_directions * batch_size * hidden_size;
         const y_data = try arena.alloc(f32, y_count);
@@ -4099,7 +4448,7 @@ const SessionState = struct {
             const y_dims = try arena.dupe(i64, &.{ @intCast(seq_len), @intCast(num_directions), @intCast(batch_size), @intCast(hidden_size) });
             const y_storage = try self.newStorage(y_count);
             errdefer self.releaseStorage(y_storage);
-            try uploadFloats(arena, y_storage.buffer, y_data);
+            try stageFloats(arena, y_storage.buffer, y_data);
             try self.put(arena, values, node.outputs[0], .{ .dtype = .f32, .dims = y_dims, .data = .{ .gpu = y_storage } });
         }
 
@@ -4107,7 +4456,7 @@ const SessionState = struct {
             const yh_dims = try arena.dupe(i64, &.{ @intCast(num_directions), @intCast(batch_size), @intCast(hidden_size) });
             const yh_storage = try self.newStorage(yh_count);
             errdefer self.releaseStorage(yh_storage);
-            try uploadFloats(arena, yh_storage.buffer, yh_data);
+            try stageFloats(arena, yh_storage.buffer, yh_data);
             try self.put(arena, values, node.outputs[1], .{ .dtype = .f32, .dims = yh_dims, .data = .{ .gpu = yh_storage } });
         }
 
@@ -4115,7 +4464,7 @@ const SessionState = struct {
             const yc_dims = try arena.dupe(i64, &.{ @intCast(num_directions), @intCast(batch_size), @intCast(hidden_size) });
             const yc_storage = try self.newStorage(yc_count);
             errdefer self.releaseStorage(yc_storage);
-            try uploadFloats(arena, yc_storage.buffer, yc_data);
+            try stageFloats(arena, yc_storage.buffer, yc_data);
             try self.put(arena, values, node.outputs[2], .{ .dtype = .f32, .dims = yc_dims, .data = .{ .gpu = yc_storage } });
         }
     }
@@ -4124,6 +4473,82 @@ const SessionState = struct {
 /// Compares a string attribute against what a kernel actually implements,
 /// standing ONNX's own default in when the attribute is absent. Several of
 /// those defaults are not what is implemented here, so they have to be named.
+/// One MatMulInteger, shaped for the host: a block of activation rows against
+/// a range of weight columns at a time, so the block's accumulators stay in
+/// the first-level cache while the weight streams through once per block.
+const IntegerProduct = struct {
+    a: []const u8,
+    b: []const u8,
+    /// Σ_k b[k][n], per batch of `b`.
+    b_sums: []const i32,
+    out: []i32,
+    m: usize,
+    n: usize,
+    k: usize,
+    batches: usize,
+    a_batches: usize,
+    b_batches: usize,
+    a_zero: i32,
+    b_zero: i32,
+
+    const lanes = 16;
+    const block = 4;
+    /// Columns per pass: the block's accumulators at this width are 16 KiB.
+    const chunk = 1024;
+
+    /// The product for columns `first` to `last` of every batch and row.
+    fn columns(self: *const IntegerProduct, first: usize, last: usize) void {
+        var start = first;
+        while (start < last) : (start += chunk) {
+            const width = @min(chunk, last - start);
+            for (0..self.batches) |batch| {
+                const a_batch = self.a[(if (self.a_batches == 1) 0 else batch) * self.m * self.k ..];
+                const b_batch = self.b[(if (self.b_batches == 1) 0 else batch) * self.k * self.n ..];
+                const b_sums = self.b_sums[(if (self.b_batches == 1) 0 else batch) * self.n ..][start..][0..width];
+                const out_batch = self.out[batch * self.m * self.n ..];
+                var row: usize = 0;
+                while (row < self.m) : (row += block) {
+                    const rows = @min(block, self.m - row);
+                    var acc: [block][chunk]u32 = undefined;
+                    for (acc[0..rows]) |*acc_row| @memset(acc_row[0..width], 0);
+                    var a_sums: [block]i32 = @splat(0);
+
+                    for (0..self.k) |depth| {
+                        const b_row = b_batch[depth * self.n + start ..][0..width];
+                        var a_values: [block]@Vector(lanes, u16) = undefined;
+                        for (0..rows) |r| {
+                            const value = a_batch[(row + r) * self.k + depth];
+                            a_sums[r] += value;
+                            a_values[r] = @splat(value);
+                        }
+                        var col: usize = 0;
+                        while (col + lanes <= width) : (col += lanes) {
+                            const b_values: @Vector(lanes, u16) = @intCast(@as(@Vector(lanes, u8), b_row[col..][0..lanes].*));
+                            inline for (0..block) |r| if (r < rows) {
+                                const sum: @Vector(lanes, u32) = acc[r][col..][0..lanes].*;
+                                const term: @Vector(lanes, u32) = @intCast(a_values[r] * b_values);
+                                acc[r][col..][0..lanes].* = sum + term;
+                            };
+                        }
+                        while (col < width) : (col += 1) {
+                            for (0..rows) |r| acc[r][col] += @as(u32, a_values[r][0]) * b_row[col];
+                        }
+                    }
+
+                    const constant = @as(i32, @intCast(self.k)) *% self.a_zero *% self.b_zero;
+                    for (0..rows) |r| {
+                        const out_row = out_batch[(row + r) * self.n + start ..][0..width];
+                        const a_term = self.b_zero *% a_sums[r] -% constant;
+                        for (out_row, acc[r][0..width], b_sums) |*out, sum, b_sum| {
+                            out.* = @as(i32, @bitCast(sum)) -% self.a_zero *% b_sum -% a_term;
+                        }
+                    }
+                }
+            }
+        }
+    }
+};
+
 fn attributeIs(node: onnx.Node, name: []const u8, default: []const u8, expected: []const u8) bool {
     const attribute = node.attribute(name) orelse return std.mem.eql(u8, default, expected);
     return std.mem.eql(u8, if (attribute.s.len == 0) default else attribute.s, expected);
@@ -4276,6 +4701,19 @@ fn uploadFloats(allocator: std.mem.Allocator, buffer: driver.Buffer(Element), so
 /// the weight it is feeding.
 const narrowing_window = 2 * 1024 * 1024;
 
+/// The same for the small tensors an operator makes on the host mid-run,
+/// without waiting for the queue: a blocking write to an in-order queue
+/// drains everything ahead of it, and a graph that does this a few hundred
+/// times a run spends most of the run waiting. The copy is taken in the run's
+/// arena, which the driver may read from until `run` drains the queue at the
+/// end. CUDA's copies wait regardless.
+fn stageFloats(arena: std.mem.Allocator, buffer: driver.Buffer(Element), source: []const f32) !void {
+    if (!@hasDecl(driver, "is_opencl") and !@hasDecl(driver, "is_metal")) return uploadFloats(arena, buffer, source);
+    const staged = try arena.alloc(Element, source.len);
+    for (staged, source) |*element, value| element.* = @floatCast(value);
+    try buffer.uploadAsync(staged);
+}
+
 /// The same in reverse, for the graph outputs and the handful of operators
 /// that finish their work on the host.
 fn downloadFloats(allocator: std.mem.Allocator, buffer: driver.Buffer(Element), out: []f32) !void {
@@ -4364,6 +4802,10 @@ pub const Value = struct {
         return .{ .dtype = .i64, .bytes = std.mem.sliceAsBytes(data), .dims = dims };
     }
 
+    pub fn borrowI32(data: []const i32, dims: []const i64) !Value {
+        return .{ .dtype = .i32, .bytes = std.mem.sliceAsBytes(data), .dims = dims };
+    }
+
     pub fn dataF32(self: Value) ![]const f32 {
         if (self.dtype != .f32) return Error.NativeRuntime;
         return @alignCast(std.mem.bytesAsSlice(f32, self.bytes));
@@ -4439,4 +4881,54 @@ test "INT8 DynamicQuantizeLinear and MatMulInteger math" {
     try testing.expectEqual(@as(i32, 22), c[1]);
     try testing.expectEqual(@as(i32, 43), c[2]);
     try testing.expectEqual(@as(i32, 50), c[3]);
+}
+
+test "IntegerProduct matches the definition" {
+    const testing = std.testing;
+    var prng = std.Random.DefaultPrng.init(7);
+    const random = prng.random();
+
+    // Odd sizes: a width that is not a multiple of the lanes, rows that do not
+    // fill the last block, and a batch dimension the weight broadcasts over.
+    const batches = 2;
+    const m = 5;
+    const k = 37;
+    const n = 41;
+    var a: [batches * m * k]u8 = undefined;
+    var b: [k * n]u8 = undefined;
+    for (&a) |*value| value.* = random.int(u8);
+    for (&b) |*value| value.* = random.int(u8);
+
+    var b_sums: [n]i32 = @splat(0);
+    for (0..k) |depth| for (0..n) |col| {
+        b_sums[col] += b[depth * n + col];
+    };
+
+    var out: [batches * m * n]i32 = undefined;
+    const integer: IntegerProduct = .{
+        .a = &a,
+        .b = &b,
+        .b_sums = &b_sums,
+        .out = &out,
+        .m = m,
+        .n = n,
+        .k = k,
+        .batches = batches,
+        .a_batches = batches,
+        .b_batches = 1,
+        .a_zero = 131,
+        .b_zero = 128,
+    };
+    integer.columns(0, 17);
+    integer.columns(17, n);
+
+    for (0..batches) |batch| for (0..m) |row| for (0..n) |col| {
+        var expected: i32 = 0;
+        for (0..k) |depth| {
+            const a_value = @as(i32, a[(batch * m + row) * k + depth]) - integer.a_zero;
+            const b_value = @as(i32, b[depth * n + col]) - integer.b_zero;
+            expected += a_value * b_value;
+        }
+        try testing.expectEqual(expected, out[(batch * m + row) * n + col]);
+    };
 }
