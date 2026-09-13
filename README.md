@@ -13,7 +13,7 @@ backends. Model graphs execute through the repository's Zig ONNX runtime.
 ## Run the web UI
 
 ```sh
-zig build run --release=fast -Ddevice=cuda
+zig build run --release=fast -Dbackend=cuda
 ```
 
 Then open <http://127.0.0.1:3000/>.

@@ -1,21 +1,18 @@
 const std = @import("std");
 const onnx_build = @import("onnx");
 
-/// Where the model runs on the native graph runtime.
-const Device = enum { cuda, opencl, metal };
-
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const default_device: Device = if (target.result.os.tag.isDarwin()) .metal else .opencl;
-    const device = b.option(
-        Device,
-        "device",
-        "Which device to run the model on: native Intel opencl, Apple metal, or nvidia cuda",
-    ) orelse default_device;
+    const default_backend: onnx_build.Backend = if (target.result.os.tag.isDarwin()) .metal else .opencl;
+    const backend = b.option(
+        onnx_build.Backend,
+        "backend",
+        "ONNX execution backend: native OpenCL, Metal, or CUDA",
+    ) orelse default_backend;
 
-    if (device == .metal and !target.result.os.tag.isDarwin()) {
+    if (backend == .metal and !target.result.os.tag.isDarwin()) {
         std.log.err("the Metal backend requires an Apple target", .{});
         std.process.exit(1);
     }
@@ -26,14 +23,14 @@ pub fn build(b: *std.Build) void {
         "Compute capability the CUDA kernels are built for (default: " ++ onnx_build.default_cuda_arch ++ ")",
     ) orelse onnx_build.default_cuda_arch;
 
-    // What the in-tree runtime stores a float tensor as. Half is the default
+    // What the runtime stores a float tensor as. Half is the default
     // on OpenCL and Metal, where nearly every operator is bound by how many
     // bytes it moves, and is the precision GPU execution providers use anyway.
     const half = b.option(
         bool,
         "half",
-        "Store float tensors on the device as halves (default: true with -Ddevice=opencl or metal)",
-    ) orelse (device != .cuda);
+        "Store float tensors on the device as halves (default: true with -Dbackend=opencl or metal)",
+    ) orelse (backend != .cuda);
 
     const host = b.option(
         []const u8,
@@ -70,7 +67,7 @@ pub fn build(b: *std.Build) void {
     const onnx = b.dependency("onnx", .{
         .target = target,
         .optimize = optimize,
-        .backend = device,
+        .backend = backend,
         .sm = cuda_arch,
         .half = half,
     });
