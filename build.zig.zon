@@ -8,15 +8,17 @@
     .minimum_zig_version = "0.16.0",
 
     .dependencies = .{
-        .engine = .{ .path = "engine" },
         .zigimg = .{
             .url = "git+https://github.com/nothke/zigimg#581795265e1caee099baae32883c0f9d4f28f81a",
             .hash = "zigimg-0.1.0-8_eo2jPCFwDJF89NMU5gJjpTRoFdda26viRcdxyJP0Ks",
         },
+        .onnx = .{
+            .url = "git+https://github.com/kirillrdy/onnx#03ed14ff60f68703c633140565da2656400ed6d7",
+            .hash = "onnx-0.0.0-S9CpBZMwCABtwLrWCRiA4qMVN9hSdahKlFRZBGRQUoHI",
+        },
     },
     .paths = .{
         "build.zig",
-        "engine",
         "build.zig.zon",
         "main.zig",
         "src",
