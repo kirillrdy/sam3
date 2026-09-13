@@ -1,5 +1,5 @@
 const std = @import("std");
-const engine_build = @import("engine");
+const onnx_build = @import("onnx");
 
 /// Where the model runs on the native graph runtime.
 const Device = enum { cuda, opencl, metal };
@@ -23,8 +23,8 @@ pub fn build(b: *std.Build) void {
     const cuda_arch = b.option(
         []const u8,
         "sm",
-        "Compute capability the CUDA kernels are built for (default: " ++ engine_build.default_cuda_arch ++ ")",
-    ) orelse engine_build.default_cuda_arch;
+        "Compute capability the CUDA kernels are built for (default: " ++ onnx_build.default_cuda_arch ++ ")",
+    ) orelse onnx_build.default_cuda_arch;
 
     // What the in-tree runtime stores a float tensor as. Half is the default
     // on OpenCL and Metal, where nearly every operator is bound by how many
@@ -67,14 +67,14 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const engine = b.dependency("engine", .{
+    const onnx = b.dependency("onnx", .{
         .target = target,
         .optimize = optimize,
         .backend = device,
         .sm = cuda_arch,
         .half = half,
     });
-    mod.addImport("runtime", engine.module("engine"));
+    mod.addImport("onnx", onnx.module("onnx"));
 
     const server_options = b.addOptions();
     server_options.addOption([]const u8, "host", host);
