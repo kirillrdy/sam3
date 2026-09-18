@@ -23,7 +23,7 @@ const assets = [_]Asset{
     .{ .name = "text_encoder_int4.onnx.data", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/text_encoder_int4.onnx.data", .sha256 = "fcf5adcd6ad7b5155409367efde4ee981a5482fd5700191499a666ba4b637db5" },
     .{ .name = "decoder_int4.onnx", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/decoder_int4.onnx", .sha256 = "2354b510382d025ab897fa158abe7da94d065c8f880d60aed35b01820361b06d" },
     .{ .name = "tokenizer.json", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/tokenizer.json", .sha256 = "6d9109cc838977f3ca94a379eec36aecc7c807e1785cd729660ca2fc0171fb35" },
-    .{ .name = "cat.png", .url = "https://images.unsplash.com/photo-1514888286974-6c03e2ca1dba?w=800&fm=png", .sha256 = "073adcb0112290e6928d6978789a6fa8266d2fa30a3d7c4330591d0b8c59d6a3" },
+    .{ .name = "cat.png", .url = "https://images.unsplash.com/photo-1514888286974-6c03e2ca1dba?w=800&fm=png", .sha256 = "dc6a561fc58bf60caff7a62cdd7593f5b517e43e4a75e9b220a80c3f1229ba3c" },
 };
 
 const CachedAssets = struct {
