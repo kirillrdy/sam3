@@ -187,29 +187,29 @@ pub const Model = struct {
         return ConceptEmbedding.init(self.allocator, data);
     }
 
+    pub fn encodeText(self: *Model, phrase: []const u8) !TextEmbedding {
+        active_model = self;
+        defer active_model = null;
+
+        const data = try here.call(.encodeConceptText, .{ self.allocator, self.paths.concept_text_encoder, phrase });
+        return TextEmbedding.init(self.allocator, data);
+    }
+
     pub fn lookup(self: *Model, embedding: ConceptEmbedding, phrase: []const u8, threshold: f32) !Masks {
+        var text_embedding = try self.encodeText(phrase);
+        defer text_embedding.deinit();
+
         const encoding = try self.concept_tokenizer.encode(phrase);
         const token_shape = [_]i64{ 1, tokenizer.max_tokens };
-        const ids = try onnx.Value.borrowI64(&encoding.ids, &token_shape);
-        defer ids.deinit();
         const attention = try onnx.Value.borrowI64(&encoding.attention, &token_shape);
         defer attention.deinit();
-
-        var text_features: [1]onnx.Value = undefined;
-        try self.concept_text.run(
-            &.{ "input_ids", "attention_mask" },
-            &.{ ids, attention },
-            &.{"text_features"},
-            &text_features,
-        );
-        defer text_features[0].deinit();
 
         const inputs = [_]onnx.Value{
             embedding.levels[0],
             embedding.levels[1],
             embedding.levels[2],
             embedding.levels[6],
-            text_features[0],
+            text_embedding.value,
             attention,
         };
         var results: [concept_decoder_outputs.len]onnx.Value = undefined;
@@ -295,6 +295,25 @@ pub const ConceptEmbedding = struct {
     }
 
     pub fn deinit(self: *ConceptEmbedding) void {
+        self.allocator.free(self.data);
+        self.* = undefined;
+    }
+};
+
+pub const TextEmbedding = struct {
+    allocator: std.mem.Allocator,
+    data: []f32,
+    value: onnx.Value,
+
+    pub fn init(allocator: std.mem.Allocator, data: []f32) !TextEmbedding {
+        return .{
+            .allocator = allocator,
+            .data = data,
+            .value = try onnx.Value.borrowF32(data, &.{ 1, tokenizer.max_tokens, 256 }),
+        };
+    }
+
+    pub fn deinit(self: *TextEmbedding) void {
         self.allocator.free(self.data);
         self.* = undefined;
     }
@@ -391,6 +410,35 @@ pub fn encodeConceptVision(
         offset += len;
     }
 
+    return out;
+}
+
+pub fn encodeConceptText(
+    allocator: std.mem.Allocator,
+    model_id: []const u8,
+    phrase: []const u8,
+) ![]f32 {
+    _ = model_id;
+    const model = active_model orelse return error.NoActiveModel;
+    const encoding = try model.concept_tokenizer.encode(phrase);
+    const token_shape = [_]i64{ 1, tokenizer.max_tokens };
+    const ids = try onnx.Value.borrowI64(&encoding.ids, &token_shape);
+    defer ids.deinit();
+    const attention = try onnx.Value.borrowI64(&encoding.attention, &token_shape);
+    defer attention.deinit();
+
+    var text_features: [1]onnx.Value = undefined;
+    try model.concept_text.run(
+        &.{ "input_ids", "attention_mask" },
+        &.{ ids, attention },
+        &.{"text_features"},
+        &text_features,
+    );
+    defer text_features[0].deinit();
+
+    const data = try text_features[0].dataF32();
+    const out = try allocator.alloc(f32, data.len);
+    @memcpy(out, data);
     return out;
 }
 
@@ -584,4 +632,13 @@ test "zimo embedding caching" {
 
     try std.testing.expectEqual(emb1.data.len, emb2.data.len);
     try std.testing.expectEqualSlices(f32, emb1.data[0..100], emb2.data[0..100]);
+
+    var text1 = try loaded.model.encodeText("cat");
+    defer text1.deinit();
+
+    var text2 = try loaded.model.encodeText("cat");
+    defer text2.deinit();
+
+    try std.testing.expectEqual(text1.data.len, text2.data.len);
+    try std.testing.expectEqualSlices(f32, text1.data, text2.data);
 }
