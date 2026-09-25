@@ -1,8 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
-const native_os = builtin.os.tag;
-
-var shm_counter: u32 = 0;
 
 pub const WaylandEvent = union(enum) {
     pointer_motion: struct { x: f32, y: f32 },
@@ -51,40 +47,25 @@ pub const WaylandClient = struct {
     }
 
     pub fn connect(allocator: std.mem.Allocator, initial_width: u32, initial_height: u32) !WaylandClient {
+        const runtime_dir = if (std.c.getenv("XDG_RUNTIME_DIR")) |val| std.mem.span(val) else return error.NoXdgRuntimeDir;
         const display = if (std.c.getenv("WAYLAND_DISPLAY")) |val| std.mem.span(val) else "wayland-0";
+
         var path_buf: [std.posix.PATH_MAX]u8 = undefined;
         const socket_path = if (std.fs.path.isAbsolute(display))
             display
-        else blk: {
-            const runtime_dir = if (std.c.getenv("XDG_RUNTIME_DIR")) |val|
-                std.mem.span(val)
-            else if (std.c.getenv("TMPDIR")) |val|
-                std.mem.span(val)
-            else
-                "/tmp";
-            break :blk std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ std.mem.trimEnd(u8, runtime_dir, "/"), display }) catch return error.PathTooLong;
-        };
-
-        const sock_type = if (comptime native_os == .linux)
-            std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC
         else
-            std.posix.SOCK.STREAM;
-        const fd = std.c.socket(std.posix.AF.UNIX, sock_type, 0);
+            std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ runtime_dir, display }) catch return error.PathTooLong;
+
+        const fd = std.c.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
         if (fd < 0) return error.SocketCreationFailed;
         errdefer _ = std.c.close(fd);
-        if (comptime native_os != .linux) {
-            _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
-        }
 
-        var addr: std.c.sockaddr.un = undefined;
-        @memset(std.mem.asBytes(&addr), 0);
+        var addr: std.os.linux.sockaddr.un = .{ .family = std.posix.AF.UNIX, .path = undefined };
+        @memset(&addr.path, 0);
         if (socket_path.len >= addr.path.len) return error.PathTooLong;
-        addr.family = std.posix.AF.UNIX;
         @memcpy(addr.path[0..socket_path.len], socket_path);
-        const addr_len: std.posix.socklen_t = if (comptime native_os.isDarwin()) blk: {
-            addr.len = @intCast(@sizeOf(u8) * 2 + socket_path.len + 1);
-            break :blk addr.len;
-        } else @intCast(@sizeOf(std.posix.sa_family_t) + socket_path.len + 1);
+
+        const addr_len: std.posix.socklen_t = @intCast(@sizeOf(std.posix.sa_family_t) + socket_path.len + 1);
         if (std.c.connect(fd, @ptrCast(&addr), addr_len) != 0) {
             return error.ConnectionFailed;
         }
@@ -158,34 +139,6 @@ pub const WaylandClient = struct {
         _ = std.c.close(self.socket_fd);
     }
 
-    fn createShmFd(size: usize) !std.posix.fd_t {
-        if (comptime native_os == .linux) {
-            const name = "sam3-wl-shm";
-            const res = std.os.linux.syscall2(.memfd_create, @intFromPtr(name), 0);
-            const fd: std.posix.fd_t = @intCast(res);
-            if (fd < 0) return error.MemfdFailed;
-            if (std.c.ftruncate(fd, @intCast(size)) != 0) {
-                _ = std.c.close(fd);
-                return error.FtruncateFailed;
-            }
-            return fd;
-        } else {
-            // Darwin / BSD fallback: open unlinked temporary file
-            var path_buf: [128]u8 = undefined;
-            const pid = std.c.getpid();
-            const count = @atomicRmw(u32, &shm_counter, .Add, 1, .monotonic);
-            const path = std.fmt.bufPrintZ(&path_buf, "/tmp/sam3-wl-{d}-{d}", .{ pid, count }) catch return error.PathTooLong;
-            const fd = std.c.open(path, std.c.O{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o600));
-            if (fd < 0) return error.ShmCreateFailed;
-            _ = std.c.unlink(path);
-            if (std.c.ftruncate(fd, @intCast(size)) != 0) {
-                _ = std.c.close(fd);
-                return error.FtruncateFailed;
-            }
-            return fd;
-        }
-    }
-
     pub fn resizeShmBuffer(self: *WaylandClient, w: u32, h: u32) !void {
         self.width = w;
         self.height = h;
@@ -203,8 +156,13 @@ pub const WaylandClient = struct {
         const size = stride * h;
         self.shm_size = size;
 
-        const fd = try createShmFd(size);
+        const name = "sam3-wl-shm";
+        const res = std.os.linux.syscall2(.memfd_create, @intFromPtr(name), 0);
+        const fd: std.posix.fd_t = @intCast(res);
+        if (fd < 0) return error.MemfdFailed;
         self.shm_fd = fd;
+
+        if (std.c.ftruncate(fd, @intCast(size)) != 0) return error.FtruncateFailed;
 
         const mmap_ptr = try std.posix.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
         self.pixels = @alignCast(std.mem.bytesAsSlice(u32, mmap_ptr));
