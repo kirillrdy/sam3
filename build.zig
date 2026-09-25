@@ -167,8 +167,8 @@ pub fn build(b: *std.Build) void {
         run_macos_cmd.setCwd(b.path("."));
     }
 
-    if (target.result.os.tag == .linux or target.result.os.tag.isDarwin()) {
-        const wayland_mod = b.createModule(.{
+    if (target.result.os.tag == .linux) {
+        const linux_mod = b.createModule(.{
             .root_source_file = b.path("linux/main.zig"),
             .target = target,
             .optimize = optimize,
@@ -178,24 +178,21 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zigimg", .module = zigimg.module("zigimg") },
             },
         });
-        wayland_mod.link_libc = true;
+        linux_mod.link_libc = true;
 
-        const wayland_exe_name = if (target.result.os.tag == .linux) "sam3-linux" else "sam3-wayland";
-        const wayland_exe = b.addExecutable(.{
-            .name = wayland_exe_name,
-            .root_module = wayland_mod,
+        const linux_exe = b.addExecutable(.{
+            .name = "sam3-linux",
+            .root_module = linux_mod,
         });
-        b.installArtifact(wayland_exe);
+        b.installArtifact(linux_exe);
 
-        const run_wayland_step = b.step("run-wayland", "Run the native Wayland UI");
-        const run_wayland_cmd = b.addRunArtifact(wayland_exe);
-        run_wayland_step.dependOn(&run_wayland_cmd.step);
-        run_wayland_cmd.setCwd(b.path("."));
+        const run_linux_step = b.step("run-linux", "Run the native Linux Wayland UI");
+        const run_linux_cmd = b.addRunArtifact(linux_exe);
+        run_linux_step.dependOn(&run_linux_cmd.step);
+        run_linux_cmd.setCwd(b.path("."));
 
-        if (target.result.os.tag == .linux) {
-            const run_linux_step = b.step("run-linux", "Run the native Linux Wayland UI");
-            run_linux_step.dependOn(&run_wayland_cmd.step);
-        }
+        const run_wayland_step = b.step("run-wayland", "Run the native Linux Wayland UI (alias for run-linux)");
+        run_wayland_step.dependOn(&run_linux_cmd.step);
     }
 
     const test_step = b.step("test", "Run tests");
