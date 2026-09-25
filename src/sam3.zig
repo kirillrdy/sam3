@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 pub const onnx = @import("onnx");
 pub const tokenizer = @import("tokenizer.zig");
+pub const assets = @import("assets.zig");
 pub const zigimg = @import("zigimg");
 pub const Image = zigimg.Image;
 

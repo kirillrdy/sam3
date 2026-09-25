@@ -1,18 +1,14 @@
 const std = @import("std");
 const sam3 = @import("sam3");
-const web = @import("web/server.zig");
-const build_options = @import("build_options");
-
-const index_html = @embedFile("web/index.html");
-const client_wasm = @embedFile("client_wasm");
+const app_mod = @import("app.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
-    std.debug.print("\n=== SAM 3 Web UI ===\n\n", .{});
+    std.debug.print("\n=== SAM 3 macOS App ===\n\n", .{});
     std.debug.print("  Model runtime: {s}\n", .{sam3.onnx.version()});
 
-    var cached = try sam3.assets.cacheAssets(allocator, init.io, init.environ_map, build_options.zig_http);
+    var cached = try sam3.assets.cacheAssets(allocator, init.io, init.environ_map, false);
     defer cached.deinit();
 
     const tokenizer_json = try std.Io.Dir.cwd().readFileAlloc(
@@ -37,18 +33,11 @@ pub fn main(init: std.process.Init) !void {
     };
     defer model.deinit();
 
-    std.debug.print("  Loaded segmentation and text lookup graphs\n\n", .{});
+    std.debug.print("  Loaded segmentation and text lookup graphs\n", .{});
+    std.debug.print("  Launching native macOS interface…\n\n", .{});
 
-    try web.run(
-        allocator,
-        init.io,
-        &model,
-        .{ .index_html = index_html, .client_wasm = client_wasm },
-        .{
-            .host = build_options.host,
-            .port = build_options.port,
-            .example_path = cached.paths[10],
-        },
-    );
+    var app = app_mod.App.init(allocator, init.io, &model, cached.paths[10]);
+    defer app.deinit();
+
+    try app.start();
 }
-
