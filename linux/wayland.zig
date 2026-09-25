@@ -78,23 +78,15 @@ pub const WaylandClient = struct {
 
         var addr: std.c.sockaddr.un = undefined;
         @memset(std.mem.asBytes(&addr), 0);
-        if (comptime native_os == .macos or native_os.isDarwin()) {
-            if (socket_path.len >= addr.path.len) return error.PathTooLong;
-            addr.len = @intCast(@sizeOf(u8) + @sizeOf(u8) + socket_path.len + 1);
-            addr.family = std.posix.AF.UNIX;
-            @memcpy(addr.path[0..socket_path.len], socket_path);
-            const addr_len: std.posix.socklen_t = addr.len;
-            if (std.c.connect(fd, @ptrCast(&addr), addr_len) != 0) {
-                return error.ConnectionFailed;
-            }
-        } else {
-            if (socket_path.len >= addr.path.len) return error.PathTooLong;
-            addr.family = std.posix.AF.UNIX;
-            @memcpy(addr.path[0..socket_path.len], socket_path);
-            const addr_len: std.posix.socklen_t = @intCast(@sizeOf(std.posix.sa_family_t) + socket_path.len + 1);
-            if (std.c.connect(fd, @ptrCast(&addr), addr_len) != 0) {
-                return error.ConnectionFailed;
-            }
+        if (socket_path.len >= addr.path.len) return error.PathTooLong;
+        addr.family = std.posix.AF.UNIX;
+        @memcpy(addr.path[0..socket_path.len], socket_path);
+        const addr_len: std.posix.socklen_t = if (comptime native_os.isDarwin()) blk: {
+            addr.len = @intCast(@sizeOf(u8) * 2 + socket_path.len + 1);
+            break :blk addr.len;
+        } else @intCast(@sizeOf(std.posix.sa_family_t) + socket_path.len + 1);
+        if (std.c.connect(fd, @ptrCast(&addr), addr_len) != 0) {
+            return error.ConnectionFailed;
         }
 
         var client: WaylandClient = .{
@@ -106,11 +98,11 @@ pub const WaylandClient = struct {
 
         // 1. Get registry
         const registry_id = client.allocId();
-        try client.sendDisplayGetRegistry(registry_id);
+        try client.sendMsg(1, 1, .{registry_id});
 
         // 2. Sync callback to wait for registry events
         const sync_cb_id = client.allocId();
-        try client.sendDisplaySync(sync_cb_id);
+        try client.sendMsg(1, 0, .{sync_cb_id});
 
         // 3. Process events until sync callback fires
         var synced = false;
@@ -130,27 +122,27 @@ pub const WaylandClient = struct {
 
         // 4. Create surface & XDG toplevel
         client.surface_id = client.allocId();
-        try client.sendCompositorCreateSurface(client.compositor_id, client.surface_id);
+        try client.sendMsg(client.compositor_id, 0, .{client.surface_id});
 
         client.xdg_surface_id = client.allocId();
-        try client.sendXdgWmBaseGetXdgSurface(client.xdg_wm_base_id, client.xdg_surface_id, client.surface_id);
+        try client.sendMsg(client.xdg_wm_base_id, 2, .{ client.xdg_surface_id, client.surface_id });
 
         client.xdg_toplevel_id = client.allocId();
-        try client.sendXdgSurfaceGetToplevel(client.xdg_surface_id, client.xdg_toplevel_id);
+        try client.sendMsg(client.xdg_surface_id, 1, .{client.xdg_toplevel_id});
 
-        try client.sendToplevelSetTitle(client.xdg_toplevel_id, "SAM 3");
-        try client.sendToplevelSetAppId(client.xdg_toplevel_id, "sam3");
+        try client.sendToplevelString(client.xdg_toplevel_id, 2, "SAM 3");
+        try client.sendToplevelString(client.xdg_toplevel_id, 3, "sam3");
 
         // 5. Setup pointer & keyboard if seat is available
         if (client.seat_id != 0) {
             client.pointer_id = client.allocId();
-            try client.sendSeatGetPointer(client.seat_id, client.pointer_id);
+            try client.sendMsg(client.seat_id, 0, .{client.pointer_id});
             client.keyboard_id = client.allocId();
-            try client.sendSeatGetKeyboard(client.seat_id, client.keyboard_id);
+            try client.sendMsg(client.seat_id, 1, .{client.keyboard_id});
         }
 
         // Initial commit to request configure
-        try client.sendSurfaceCommit(client.surface_id);
+        try client.sendMsg(client.surface_id, 6, .{});
 
         // 6. Create initial SHM buffer
         try client.resizeShmBuffer(initial_width, initial_height);
@@ -223,13 +215,13 @@ pub const WaylandClient = struct {
 
         self.buffer_id = self.allocId();
         // format 1 = WL_SHM_FORMAT_XRGB8888
-        try self.sendCreateBuffer(self.shm_pool_id, self.buffer_id, 0, @intCast(w), @intCast(h), @intCast(stride), 1);
+        try self.sendMsg(self.shm_pool_id, 0, .{ self.buffer_id, @as(i32, 0), @as(i32, @intCast(w)), @as(i32, @intCast(h)), @as(i32, @intCast(stride)), @as(u32, 1) });
     }
 
     pub fn commitFrame(self: *WaylandClient) !void {
-        try self.sendSurfaceAttach(self.surface_id, self.buffer_id, 0, 0);
-        try self.sendSurfaceDamage(self.surface_id, 0, 0, @intCast(self.width), @intCast(self.height));
-        try self.sendSurfaceCommit(self.surface_id);
+        try self.sendMsg(self.surface_id, 1, .{ self.buffer_id, @as(i32, 0), @as(i32, 0) });
+        try self.sendMsg(self.surface_id, 2, .{ @as(i32, 0), @as(i32, 0), @as(i32, @intCast(self.width)), @as(i32, @intCast(self.height)) });
+        try self.sendMsg(self.surface_id, 6, .{});
     }
 
     pub fn pollEvent(self: *WaylandClient, timeout_ms: i32) !?WaylandEvent {
@@ -338,14 +330,14 @@ pub const WaylandClient = struct {
             // xdg_wm_base ping -> send pong
             if (id == self.xdg_wm_base_id and opcode == 0 and size >= 12) {
                 const serial = std.mem.readInt(u32, msg_bytes[8..12], .little);
-                self.sendXdgWmBasePong(serial) catch {};
+                self.sendMsg(self.xdg_wm_base_id, 3, .{serial}) catch {};
                 continue;
             }
 
             // xdg_surface configure -> send ack_configure
             if (id == self.xdg_surface_id and opcode == 0 and size >= 12) {
                 const serial = std.mem.readInt(u32, msg_bytes[8..12], .little);
-                self.sendXdgSurfaceAckConfigure(serial) catch {};
+                self.sendMsg(self.xdg_surface_id, 4, .{serial}) catch {};
                 continue;
             }
 
@@ -396,20 +388,27 @@ pub const WaylandClient = struct {
     }
 
     // Wire sender helpers
-    fn sendDisplayGetRegistry(self: *WaylandClient, registry_id: u32) !void {
-        var buf: [12]u8 = undefined;
-        std.mem.writeInt(u32, buf[0..4], 1, .little); // wl_display id
-        std.mem.writeInt(u32, buf[4..8], (12 << 16) | 1, .little); // size=12, opcode=1
-        std.mem.writeInt(u32, buf[8..12], registry_id, .little);
-        _ = std.posix.system.send(self.socket_fd, &buf, 12, 0);
+    fn sendMsg(self: *WaylandClient, id: u32, opcode: u16, args: anytype) !void {
+        const fields = @typeInfo(@TypeOf(args)).@"struct".fields;
+        var words: [2 + fields.len]u32 = undefined;
+        words[0] = id;
+        words[1] = (@as(u32, words.len * 4) << 16) | opcode;
+        inline for (fields, 0..) |f, i| {
+            words[2 + i] = @as(u32, @bitCast(@field(args, f.name)));
+        }
+        _ = std.posix.system.send(self.socket_fd, @ptrCast(&words), words.len * 4, 0);
     }
 
-    fn sendDisplaySync(self: *WaylandClient, cb_id: u32) !void {
-        var buf: [12]u8 = undefined;
-        std.mem.writeInt(u32, buf[0..4], 1, .little);
-        std.mem.writeInt(u32, buf[4..8], (12 << 16) | 0, .little); // opcode=0 (sync)
-        std.mem.writeInt(u32, buf[8..12], cb_id, .little);
-        _ = std.posix.system.send(self.socket_fd, &buf, 12, 0);
+    fn sendToplevelString(self: *WaylandClient, toplevel_id: u32, opcode: u16, str: []const u8) !void {
+        const str_padded = ((str.len + 1 + 3) / 4) * 4;
+        const total = 8 + 4 + str_padded;
+        var buf: [64]u8 = undefined;
+        std.mem.writeInt(u32, buf[0..4], toplevel_id, .little);
+        std.mem.writeInt(u32, buf[4..8], (@as(u32, @intCast(total)) << 16) | opcode, .little);
+        std.mem.writeInt(u32, buf[8..12], @intCast(str.len + 1), .little);
+        @memset(buf[12 .. 12 + str_padded], 0);
+        @memcpy(buf[12 .. 12 + str.len], str);
+        _ = std.posix.system.send(self.socket_fd, buf[0..total].ptr, total, 0);
     }
 
     fn sendRegistryBind(self: *WaylandClient, name: u32, iface: []const u8, version: u32, new_id: u32) !void {
@@ -433,71 +432,6 @@ pub const WaylandClient = struct {
         _ = std.posix.system.send(self.socket_fd, buf[0..total_size].ptr, total_size, 0);
     }
 
-    fn sendCompositorCreateSurface(self: *WaylandClient, comp_id: u32, surf_id: u32) !void {
-        var buf: [12]u8 = undefined;
-        std.mem.writeInt(u32, buf[0..4], comp_id, .little);
-        std.mem.writeInt(u32, buf[4..8], (12 << 16) | 0, .little); // create_surface
-        std.mem.writeInt(u32, buf[8..12], surf_id, .little);
-        _ = std.posix.system.send(self.socket_fd, &buf, 12, 0);
-    }
-
-    fn sendXdgWmBaseGetXdgSurface(self: *WaylandClient, wm_id: u32, xdg_surf_id: u32, surf_id: u32) !void {
-        var buf: [16]u8 = undefined;
-        std.mem.writeInt(u32, buf[0..4], wm_id, .little);
-        std.mem.writeInt(u32, buf[4..8], (16 << 16) | 2, .little); // get_xdg_surface
-        std.mem.writeInt(u32, buf[8..12], xdg_surf_id, .little);
-        std.mem.writeInt(u32, buf[12..16], surf_id, .little);
-        _ = std.posix.system.send(self.socket_fd, &buf, 16, 0);
-    }
-
-    fn sendXdgSurfaceGetToplevel(self: *WaylandClient, xdg_surf_id: u32, toplevel_id: u32) !void {
-        var buf: [12]u8 = undefined;
-        std.mem.writeInt(u32, buf[0..4], xdg_surf_id, .little);
-        std.mem.writeInt(u32, buf[4..8], (12 << 16) | 1, .little); // get_toplevel
-        std.mem.writeInt(u32, buf[8..12], toplevel_id, .little);
-        _ = std.posix.system.send(self.socket_fd, &buf, 12, 0);
-    }
-
-    fn sendToplevelSetTitle(self: *WaylandClient, toplevel_id: u32, title: []const u8) !void {
-        const str_padded = ((title.len + 1 + 3) / 4) * 4;
-        const total = 8 + 4 + str_padded;
-        var buf: [64]u8 = undefined;
-        std.mem.writeInt(u32, buf[0..4], toplevel_id, .little);
-        std.mem.writeInt(u32, buf[4..8], (@as(u32, @intCast(total)) << 16) | 2, .little); // set_title
-        std.mem.writeInt(u32, buf[8..12], @intCast(title.len + 1), .little);
-        @memset(buf[12 .. 12 + str_padded], 0);
-        @memcpy(buf[12 .. 12 + title.len], title);
-        _ = std.posix.system.send(self.socket_fd, buf[0..total].ptr, total, 0);
-    }
-
-    fn sendToplevelSetAppId(self: *WaylandClient, toplevel_id: u32, app_id: []const u8) !void {
-        const str_padded = ((app_id.len + 1 + 3) / 4) * 4;
-        const total = 8 + 4 + str_padded;
-        var buf: [64]u8 = undefined;
-        std.mem.writeInt(u32, buf[0..4], toplevel_id, .little);
-        std.mem.writeInt(u32, buf[4..8], (@as(u32, @intCast(total)) << 16) | 3, .little); // set_app_id
-        std.mem.writeInt(u32, buf[8..12], @intCast(app_id.len + 1), .little);
-        @memset(buf[12 .. 12 + str_padded], 0);
-        @memcpy(buf[12 .. 12 + app_id.len], app_id);
-        _ = std.posix.system.send(self.socket_fd, buf[0..total].ptr, total, 0);
-    }
-
-    fn sendSeatGetPointer(self: *WaylandClient, seat_id: u32, pointer_id: u32) !void {
-        var buf: [12]u8 = undefined;
-        std.mem.writeInt(u32, buf[0..4], seat_id, .little);
-        std.mem.writeInt(u32, buf[4..8], (12 << 16) | 0, .little); // get_pointer
-        std.mem.writeInt(u32, buf[8..12], pointer_id, .little);
-        _ = std.posix.system.send(self.socket_fd, &buf, 12, 0);
-    }
-
-    fn sendSeatGetKeyboard(self: *WaylandClient, seat_id: u32, keyboard_id: u32) !void {
-        var buf: [12]u8 = undefined;
-        std.mem.writeInt(u32, buf[0..4], seat_id, .little);
-        std.mem.writeInt(u32, buf[4..8], (12 << 16) | 1, .little); // get_keyboard
-        std.mem.writeInt(u32, buf[8..12], keyboard_id, .little);
-        _ = std.posix.system.send(self.socket_fd, &buf, 12, 0);
-    }
-
     fn sendCreatePool(self: *WaylandClient, shm_id: u32, pool_id: u32, fd: std.posix.fd_t, size: i32) !void {
         const Cmsg = extern struct {
             hdr: std.posix.system.cmsghdr,
@@ -505,7 +439,7 @@ pub const WaylandClient = struct {
         };
         var cmsg: Cmsg = .{
             .hdr = .{
-                .len = @sizeOf(Cmsg),
+                .len = @sizeOf(std.posix.system.cmsghdr) + @sizeOf(i32),
                 .level = std.posix.SOL.SOCKET,
                 .type = std.posix.SCM.RIGHTS,
             },
@@ -530,62 +464,5 @@ pub const WaylandClient = struct {
         };
         const sent = std.posix.system.sendmsg(self.socket_fd, &msg, 0);
         if (sent < 0) return error.SendFailed;
-    }
-
-    fn sendCreateBuffer(self: *WaylandClient, pool_id: u32, buf_id: u32, offset: i32, w: i32, h: i32, stride: i32, fmt: u32) !void {
-        var buf: [32]u8 = undefined;
-        std.mem.writeInt(u32, buf[0..4], pool_id, .little);
-        std.mem.writeInt(u32, buf[4..8], (32 << 16) | 0, .little); // create_buffer
-        std.mem.writeInt(u32, buf[8..12], buf_id, .little);
-        std.mem.writeInt(i32, buf[12..16], offset, .little);
-        std.mem.writeInt(i32, buf[16..20], w, .little);
-        std.mem.writeInt(i32, buf[20..24], h, .little);
-        std.mem.writeInt(i32, buf[24..28], stride, .little);
-        std.mem.writeInt(u32, buf[28..32], fmt, .little);
-        _ = std.posix.system.send(self.socket_fd, &buf, 32, 0);
-    }
-
-    fn sendSurfaceAttach(self: *WaylandClient, surf_id: u32, buf_id: u32, x: i32, y: i32) !void {
-        var buf: [20]u8 = undefined;
-        std.mem.writeInt(u32, buf[0..4], surf_id, .little);
-        std.mem.writeInt(u32, buf[4..8], (20 << 16) | 1, .little); // attach
-        std.mem.writeInt(u32, buf[8..12], buf_id, .little);
-        std.mem.writeInt(i32, buf[12..16], x, .little);
-        std.mem.writeInt(i32, buf[16..20], y, .little);
-        _ = std.posix.system.send(self.socket_fd, &buf, 20, 0);
-    }
-
-    fn sendSurfaceDamage(self: *WaylandClient, surf_id: u32, x: i32, y: i32, w: i32, h: i32) !void {
-        var buf: [24]u8 = undefined;
-        std.mem.writeInt(u32, buf[0..4], surf_id, .little);
-        std.mem.writeInt(u32, buf[4..8], (24 << 16) | 2, .little); // damage
-        std.mem.writeInt(i32, buf[8..12], x, .little);
-        std.mem.writeInt(i32, buf[12..16], y, .little);
-        std.mem.writeInt(i32, buf[16..20], w, .little);
-        std.mem.writeInt(i32, buf[20..24], h, .little);
-        _ = std.posix.system.send(self.socket_fd, &buf, 24, 0);
-    }
-
-    fn sendSurfaceCommit(self: *WaylandClient, surf_id: u32) !void {
-        var buf: [8]u8 = undefined;
-        std.mem.writeInt(u32, buf[0..4], surf_id, .little);
-        std.mem.writeInt(u32, buf[4..8], (8 << 16) | 6, .little); // commit
-        _ = std.posix.system.send(self.socket_fd, &buf, 8, 0);
-    }
-
-    fn sendXdgWmBasePong(self: *WaylandClient, serial: u32) !void {
-        var buf: [12]u8 = undefined;
-        std.mem.writeInt(u32, buf[0..4], self.xdg_wm_base_id, .little);
-        std.mem.writeInt(u32, buf[4..8], (12 << 16) | 3, .little); // pong
-        std.mem.writeInt(u32, buf[8..12], serial, .little);
-        _ = std.posix.system.send(self.socket_fd, &buf, 12, 0);
-    }
-
-    fn sendXdgSurfaceAckConfigure(self: *WaylandClient, serial: u32) !void {
-        var buf: [12]u8 = undefined;
-        std.mem.writeInt(u32, buf[0..4], self.xdg_surface_id, .little);
-        std.mem.writeInt(u32, buf[4..8], (12 << 16) | 4, .little); // ack_configure
-        std.mem.writeInt(u32, buf[8..12], serial, .little);
-        _ = std.posix.system.send(self.socket_fd, &buf, 12, 0);
     }
 };

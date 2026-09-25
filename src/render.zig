@@ -103,6 +103,57 @@ pub fn drawPointMarker(img: *zigimg.Image, point: Point, radius: usize) void {
     }
 }
 
+pub fn scoreMasks(logits: []const f32, scores: []const f32, count: usize, width: usize, height: usize, coverages_out: []f32) usize {
+    const stride = width * height;
+    var best_idx: usize = 0;
+    for (0..count) |i| {
+        const plane = logits[i * stride ..][0..stride];
+        var covered: usize = 0;
+        for (plane) |logit| {
+            if (logit > 0.0) covered += 1;
+        }
+        if (coverages_out.len > i) {
+            coverages_out[i] = @as(f32, @floatFromInt(covered)) / @as(f32, @floatFromInt(stride));
+        }
+        if (scores[i] > scores[best_idx]) {
+            best_idx = i;
+        }
+    }
+    return best_idx;
+}
+
+pub fn compositeRgba(
+    allocator: std.mem.Allocator,
+    img: zigimg.Image,
+    frame_rgba: []u8,
+    mask_plane: ?[]const f32,
+    mask_width: usize,
+    mask_height: usize,
+    points: []const Point,
+) void {
+    var canvas = zigimg.Image.create(allocator, img.width, img.height, .rgb24) catch return;
+    defer canvas.deinit(allocator);
+    @memcpy(canvas.pixels.rgb24, img.pixels.rgb24);
+
+    if (mask_plane) |plane| {
+        if (bilinear(allocator, plane, mask_width, mask_height, img.width, img.height)) |resampled| {
+            defer allocator.free(resampled);
+            overlayMask(&canvas, resampled, mask_color, mask_alpha);
+        } else |_| {}
+    }
+
+    for (points) |p| {
+        drawPointMarker(&canvas, p, marker_radius);
+    }
+
+    for (canvas.pixels.rgb24, 0..) |px, i| {
+        frame_rgba[i * 4 + 0] = px.r;
+        frame_rgba[i * 4 + 1] = px.g;
+        frame_rgba[i * 4 + 2] = px.b;
+        frame_rgba[i * 4 + 3] = 255;
+    }
+}
+
 test "bilinear resample identity" {
     const allocator = std.testing.allocator;
     const src = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
@@ -149,4 +200,17 @@ test "drawPointMarker draws positive green and negative red markers" {
     try std.testing.expectEqual(@as(u8, 255), img.pixels.rgb24[neg_idx].r);
     try std.testing.expectEqual(@as(u8, 0), img.pixels.rgb24[neg_idx].g);
     try std.testing.expectEqual(@as(u8, 0), img.pixels.rgb24[neg_idx].b);
+}
+
+test "scoreMasks selects highest score and calculates coverage" {
+    const logits = [_]f32{
+        1.0, 1.0, -1.0, -1.0, // mask 0: 50%
+        1.0, 1.0,  1.0, -1.0, // mask 1: 75%
+    };
+    const scores = [_]f32{ 0.7, 0.9 };
+    var coverages: [2]f32 = undefined;
+    const best = scoreMasks(&logits, &scores, 2, 2, 2, &coverages);
+    try std.testing.expectEqual(@as(usize, 1), best);
+    try std.testing.expectEqual(@as(f32, 0.5), coverages[0]);
+    try std.testing.expectEqual(@as(f32, 0.75), coverages[1]);
 }
