@@ -1,6 +1,10 @@
 const std = @import("std");
 const zigimg = @import("zigimg");
-const sam3 = @import("sam3");
+pub const Point = struct {
+    x: f32,
+    y: f32,
+    label: i64 = 1,
+};
 
 pub const Rgb24 = zigimg.color.Rgb24;
 
@@ -75,7 +79,7 @@ pub fn overlayMask(img: *zigimg.Image, mask: []const f32, color: Rgb24, alpha: f
     }
 }
 
-pub fn drawPointMarker(img: *zigimg.Image, point: sam3.Point, radius: usize) void {
+pub fn drawPointMarker(img: *zigimg.Image, point: Point, radius: usize) void {
     const cx: isize = @intFromFloat(point.x * @as(f32, @floatFromInt(img.width)));
     const cy: isize = @intFromFloat(point.y * @as(f32, @floatFromInt(img.height)));
     const color: Rgb24 = if (point.label == 1)
@@ -115,15 +119,13 @@ test "overlayMask tints positive logit pixels" {
     img.pixels.rgb24[0] = .{ .r = 100, .g = 100, .b = 100 };
     img.pixels.rgb24[1] = .{ .r = 100, .g = 100, .b = 100 };
 
-    const mask = [_]f32{ 1.0, -1.0 }; // First pixel inside mask, second outside
+    const mask = [_]f32{ 1.0, -1.0 };
     overlayMask(&img, &mask, .{ .r = 0, .g = 200, .b = 100 }, 0.5);
 
-    // Pixel 0 is tinted: 100 * 0.5 + 0 * 0.5 = 50, 100 * 0.5 + 200 * 0.5 = 150, 100 * 0.5 + 100 * 0.5 = 100
     try std.testing.expectEqual(@as(u8, 50), img.pixels.rgb24[0].r);
     try std.testing.expectEqual(@as(u8, 150), img.pixels.rgb24[0].g);
     try std.testing.expectEqual(@as(u8, 100), img.pixels.rgb24[0].b);
 
-    // Pixel 1 is untouched
     try std.testing.expectEqual(@as(u8, 100), img.pixels.rgb24[1].r);
     try std.testing.expectEqual(@as(u8, 100), img.pixels.rgb24[1].g);
     try std.testing.expectEqual(@as(u8, 100), img.pixels.rgb24[1].b);
@@ -137,7 +139,6 @@ test "drawPointMarker draws positive green and negative red markers" {
     @memset(img.pixels.rgb24, .{ .r = 0, .g = 0, .b = 0 });
 
     drawPointMarker(&img, .{ .x = 0.5, .y = 0.5, .label = 1 }, 2);
-    // Center pixel (5, 5) should be green
     const center_idx = 5 * 10 + 5;
     try std.testing.expectEqual(@as(u8, 0), img.pixels.rgb24[center_idx].r);
     try std.testing.expectEqual(@as(u8, 255), img.pixels.rgb24[center_idx].g);

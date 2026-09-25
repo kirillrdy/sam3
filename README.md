@@ -34,6 +34,23 @@ The native macOS app provides the same capabilities as the web UI without needin
 - Candidate mask selection with score and frame coverage statistics
 - In-process Metal GPU inference with asynchronous background execution
 
+## Run the native Linux UI (Wayland)
+
+On Linux under Wayland, run the native desktop UI directly:
+
+```sh
+zig build run-linux --release=fast -Dbackend=cuda
+```
+
+Features:
+- Pure Zig implementation of the Wayland wire protocol (`wl_shm`, `xdg_wm_base`, `wl_seat`, `wl_pointer`, `wl_keyboard`) over UNIX domain sockets with zero external C library dependencies (no `libwayland-client`).
+- Embedded bitmap font and software rasterizer for fast, lightweight rendering.
+- Interactive point segmentation: left click to add positive points, right click to cut (negative points).
+- Concept text search ("Find by word") with direct keyboard typing.
+- Candidate mask selection with score and coverage statistics.
+- Asynchronous background inference with thread-safe UI updates.
+
+
 Model downloads use `curl` by default. If `curl` is not available, build with
 `-Dzig-http=true` to use Zig's built-in HTTP client instead.
 

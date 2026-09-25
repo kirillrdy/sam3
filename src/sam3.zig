@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 pub const onnx = @import("onnx");
 pub const tokenizer = @import("tokenizer.zig");
 pub const assets = @import("assets.zig");
+pub const render = @import("render.zig");
 pub const zigimg = @import("zigimg");
 pub const Image = zigimg.Image;
 
@@ -15,11 +16,7 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Image {
 
 pub const image_size: usize = 1008;
 
-pub const Point = struct {
-    x: f32,
-    y: f32,
-    label: i64 = 1,
-};
+pub const Point = render.Point;
 
 pub const Paths = struct {
     vision_encoder: []const u8,

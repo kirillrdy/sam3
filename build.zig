@@ -162,6 +162,30 @@ pub fn build(b: *std.Build) void {
         run_macos_step.dependOn(&run_macos_cmd.step);
         run_macos_cmd.step.dependOn(b.getInstallStep());
         run_macos_cmd.setCwd(b.path("."));
+    } else if (target.result.os.tag == .linux) {
+        const linux_mod = b.createModule(.{
+            .root_source_file = b.path("linux/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = if (optimize == .ReleaseFast) true else null,
+            .imports = &.{
+                .{ .name = "sam3", .module = mod },
+                .{ .name = "zigimg", .module = zigimg.module("zigimg") },
+            },
+        });
+        linux_mod.link_libc = true;
+
+        const linux_exe = b.addExecutable(.{
+            .name = "sam3-linux",
+            .root_module = linux_mod,
+        });
+        b.installArtifact(linux_exe);
+
+        const run_linux_step = b.step("run-linux", "Run the native Linux Wayland UI");
+        const run_linux_cmd = b.addRunArtifact(linux_exe);
+        run_linux_step.dependOn(&run_linux_cmd.step);
+        run_linux_cmd.step.dependOn(b.getInstallStep());
+        run_linux_cmd.setCwd(b.path("."));
     }
 
     const test_step = b.step("test", "Run tests");
@@ -182,17 +206,19 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zigimg", .module = zigimg.module("zigimg") },
         },
     }));
-    if (target.result.os.tag.isDarwin()) {
-        addTest(b, test_step, b.createModule(.{
-            .root_source_file = b.path("macos/render.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "sam3", .module = mod },
-                .{ .name = "zigimg", .module = zigimg.module("zigimg") },
-            },
-        }));
-    }
+    addTest(b, test_step, b.createModule(.{
+        .root_source_file = b.path("src/render.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zigimg", .module = zigimg.module("zigimg") },
+        },
+    }));
+    addTest(b, test_step, b.createModule(.{
+        .root_source_file = b.path("linux/font.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
 }
 
 fn addTest(b: *std.Build, step: *std.Build.Step, module: *std.Build.Module) void {
