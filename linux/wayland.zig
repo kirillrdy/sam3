@@ -8,6 +8,8 @@ pub const WaylandEvent = union(enum) {
     close,
 };
 
+pub const Cursor = enum { arrow, text, crosshair };
+
 pub const WaylandClient = struct {
     const ShmBuffer = struct {
         id: u32,
@@ -34,6 +36,11 @@ pub const WaylandClient = struct {
     xdg_toplevel_id: u32 = 0,
     pointer_id: u32 = 0,
     keyboard_id: u32 = 0,
+    cursor_surface_id: u32 = 0,
+    cursor_buffers: [3]ShmBuffer = undefined,
+    cursor_buffer_count: usize = 0,
+    pointer_enter_serial: ?u32 = null,
+    current_cursor: ?Cursor = null,
 
     buffers: std.ArrayList(ShmBuffer) = .empty,
     frame_index: ?usize = null,
@@ -128,6 +135,7 @@ pub const WaylandClient = struct {
             try client.sendMsg(client.seat_id, 0, .{client.pointer_id});
             client.keyboard_id = client.allocId();
             try client.sendMsg(client.seat_id, 1, .{client.keyboard_id});
+            try client.setupCursor();
         }
 
         // Initial commit to request configure
@@ -140,6 +148,8 @@ pub const WaylandClient = struct {
     }
 
     pub fn deinit(self: *WaylandClient) void {
+        for (self.cursor_buffers[0..self.cursor_buffer_count]) |buffer| self.destroyBuffer(buffer);
+        if (self.cursor_surface_id != 0) self.sendMsg(self.cursor_surface_id, 0, .{}) catch {};
         for (self.buffers.items) |buffer| self.destroyBuffer(buffer);
         self.buffers.deinit(self.allocator);
         _ = std.c.close(self.socket_fd);
@@ -155,6 +165,11 @@ pub const WaylandClient = struct {
     }
 
     fn createBuffer(self: *WaylandClient, w: u32, h: u32) !void {
+        const buffer = try self.createShmBuffer(w, h, 1); // XRGB8888
+        try self.buffers.append(self.allocator, buffer);
+    }
+
+    fn createShmBuffer(self: *WaylandClient, w: u32, h: u32, format: u32) !ShmBuffer {
         const stride = w * 4;
         const size = stride * h;
 
@@ -175,9 +190,8 @@ pub const WaylandClient = struct {
         try self.sendCreatePool(self.shm_id, pool_id, fd, @intCast(size));
 
         const buffer_id = self.allocId();
-        // format 1 = WL_SHM_FORMAT_XRGB8888
-        try self.sendMsg(pool_id, 0, .{ buffer_id, @as(i32, 0), @as(i32, @intCast(w)), @as(i32, @intCast(h)), @as(i32, @intCast(stride)), @as(u32, 1) });
-        try self.buffers.append(self.allocator, .{ .id = buffer_id, .pool_id = pool_id, .fd = fd, .pixels = pixels, .width = w, .height = h });
+        try self.sendMsg(pool_id, 0, .{ buffer_id, @as(i32, 0), @as(i32, @intCast(w)), @as(i32, @intCast(h)), @as(i32, @intCast(stride)), format });
+        return .{ .id = buffer_id, .pool_id = pool_id, .fd = fd, .pixels = pixels, .width = w, .height = h };
     }
 
     fn destroyBuffer(self: *WaylandClient, buffer: ShmBuffer) void {
@@ -185,6 +199,74 @@ pub const WaylandClient = struct {
         self.sendMsg(buffer.pool_id, 1, .{}) catch {}; // wl_shm_pool.destroy
         std.posix.munmap(@alignCast(std.mem.sliceAsBytes(buffer.pixels)));
         _ = std.c.close(buffer.fd);
+    }
+
+    fn cursorPixel(pixels: []u32, x: usize, y: usize, color: u32) void {
+        if (x < 24 and y < 24) pixels[y * 24 + x] = color;
+    }
+
+    fn drawCursor(pixels: []u32, kind: Cursor) void {
+        @memset(pixels, 0);
+        const dark: u32 = 0xff111318;
+        const light: u32 = 0xfff5f7f9;
+        switch (kind) {
+            .arrow => {
+                for (0..18) |y| {
+                    const end = y / 2 + 1;
+                    for (0..end + 1) |x| {
+                        cursorPixel(pixels, x, y, if (x == 0 or x == end or y == 0 or y == 17) dark else light);
+                    }
+                }
+                for (0..8) |y| {
+                    for (0..4) |x| cursorPixel(pixels, x + 4, y + 14, if (x == 0 or x == 3) dark else light);
+                }
+            },
+            .text => {
+                for (4..20) |y| {
+                    for (10..14) |x| cursorPixel(pixels, x, y, if (x == 10 or x == 13) dark else light);
+                }
+                for (8..16) |x| {
+                    for (2..5) |y| cursorPixel(pixels, x, y, if (y == 2) dark else light);
+                    for (19..22) |y| cursorPixel(pixels, x, y, if (y == 21) dark else light);
+                }
+            },
+            .crosshair => {
+                for (1..23) |p| {
+                    if (p < 9 or p > 15) {
+                        cursorPixel(pixels, 11, p, dark);
+                        cursorPixel(pixels, 12, p, light);
+                        cursorPixel(pixels, 13, p, dark);
+                        cursorPixel(pixels, p, 11, dark);
+                        cursorPixel(pixels, p, 12, light);
+                        cursorPixel(pixels, p, 13, dark);
+                    }
+                }
+                cursorPixel(pixels, 12, 12, 0xff00dc64);
+            },
+        }
+    }
+
+    fn setupCursor(self: *WaylandClient) !void {
+        self.cursor_surface_id = self.allocId();
+        try self.sendMsg(self.compositor_id, 0, .{self.cursor_surface_id});
+        inline for (std.meta.tags(Cursor)) |kind| {
+            const buffer = try self.createShmBuffer(24, 24, 0); // ARGB8888
+            drawCursor(buffer.pixels, kind);
+            self.cursor_buffers[self.cursor_buffer_count] = buffer;
+            self.cursor_buffer_count += 1;
+        }
+    }
+
+    pub fn setCursor(self: *WaylandClient, kind: Cursor) !void {
+        const serial = self.pointer_enter_serial orelse return;
+        if (self.current_cursor == kind) return;
+        const buffer = self.cursor_buffers[@intFromEnum(kind)];
+        const hotspot: i32 = if (kind == .arrow) 0 else 12;
+        try self.sendMsg(self.cursor_surface_id, 1, .{ buffer.id, @as(i32, 0), @as(i32, 0) });
+        try self.sendMsg(self.cursor_surface_id, 2, .{ @as(i32, 0), @as(i32, 0), @as(i32, 24), @as(i32, 24) });
+        try self.sendMsg(self.cursor_surface_id, 6, .{});
+        try self.sendMsg(self.pointer_id, 0, .{ serial, self.cursor_surface_id, hotspot, hotspot });
+        self.current_cursor = kind;
     }
 
     fn discardUnusedBuffers(self: *WaylandClient) void {
@@ -375,10 +457,18 @@ pub const WaylandClient = struct {
             // Pointer enter supplies the coordinates of the first click, even if
             // there has not yet been a motion event.
             if (id == self.pointer_id and opcode == 0 and size >= 24) {
+                self.pointer_enter_serial = std.mem.readInt(u32, msg_bytes[8..12], .little);
+                self.current_cursor = null;
                 const raw_x = std.mem.readInt(i32, msg_bytes[16..20], .little);
                 const raw_y = std.mem.readInt(i32, msg_bytes[20..24], .little);
                 self.pointer_x = @as(f32, @floatFromInt(raw_x)) / 256.0;
                 self.pointer_y = @as(f32, @floatFromInt(raw_y)) / 256.0;
+                return .{ .pointer_motion = .{ .x = self.pointer_x, .y = self.pointer_y } };
+            }
+
+            if (id == self.pointer_id and opcode == 1 and size >= 20) {
+                self.pointer_enter_serial = null;
+                self.current_cursor = null;
                 continue;
             }
 
@@ -512,7 +602,9 @@ test "pointer coordinates use Wayland fixed-point fields and track enter before 
     std.mem.writeInt(i32, enter[20..24], 80 * 256, .little);
     @memcpy(client.recv_buf[0..enter.len], &enter);
     client.recv_len = enter.len;
-    try std.testing.expect(client.parseNextEvent() == null);
+    const enter_event = client.parseNextEvent().?;
+    try std.testing.expectEqual(@as(f32, 120), enter_event.pointer_motion.x);
+    try std.testing.expectEqual(@as(f32, 80), enter_event.pointer_motion.y);
     try std.testing.expectEqual(@as(f32, 120), client.pointer_x);
     try std.testing.expectEqual(@as(f32, 80), client.pointer_y);
 

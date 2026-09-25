@@ -35,6 +35,13 @@ pub const App = struct {
 
     search_text: [160]u8 = undefined,
     search_len: usize = 0,
+    search_focused: bool = true,
+    search_caret: usize = 0,
+    search_scroll: usize = 0,
+    search_anchor: ?usize = null,
+    shift_down: bool = false,
+    ctrl_down: bool = false,
+    caps_lock: bool = false,
 
     // Layout geometry
     canvas_x: usize = 16,
@@ -121,11 +128,9 @@ pub const App = struct {
                         }
                     },
                     .keyboard_key => |k| {
-                        if (k.state == 1) { // Key down
-                            self.handleKey(k.key);
-                        }
+                        self.handleKey(k.key, k.state);
                     },
-                    .pointer_motion => {},
+                    .pointer_motion => |motion| try self.updateCursor(motion.x, motion.y),
                 }
             }
         }
@@ -186,9 +191,20 @@ pub const App = struct {
     }
 
     fn handlePointerClick(self: *App, px: f32, py: f32, button: u32) void {
-        if (self.is_busy) return;
         const x: usize = @intFromFloat(@max(0, px));
         const y: usize = @intFromFloat(@max(0, py));
+
+        if (x >= 16 and x < 376 and y >= 48 and y < 76 and button == 0x110) {
+            self.search_focused = true;
+            const visible = (x -| 24) / font.font_width;
+            self.search_caret = @min(self.search_len, self.search_scroll + visible);
+            self.search_anchor = null;
+            self.adjustSearchScroll();
+            return;
+        }
+        self.search_focused = false;
+        self.search_anchor = null;
+        if (self.is_busy) return;
 
         // Top row buttons:
         // [Sample Image] (16, 12, 130, 28)
@@ -247,28 +263,112 @@ pub const App = struct {
         }
     }
 
-    fn handleKey(self: *App, key: u32) void {
-        // Evdev keys
+    fn updateCursor(self: *App, px: f32, py: f32) !void {
+        const x: usize = @intFromFloat(@max(0, px));
+        const y: usize = @intFromFloat(@max(0, py));
+        const kind: wayland.Cursor = if (x >= 16 and x < 376 and y >= 48 and y < 76)
+            .text
+        else if (self.image != null and x >= self.img_rect_x and x < self.img_rect_x + self.img_rect_w and
+            y >= self.img_rect_y and y < self.img_rect_y + self.img_rect_h)
+            .crosshair
+        else
+            .arrow;
+        try self.client.setCursor(kind);
+    }
+
+    fn adjustSearchScroll(self: *App) void {
+        const visible_chars: usize = 37;
+        if (self.search_caret < self.search_scroll) self.search_scroll = self.search_caret;
+        if (self.search_caret > self.search_scroll + visible_chars) {
+            self.search_scroll = self.search_caret - visible_chars;
+        }
+    }
+
+    fn selection(self: *App) ?struct { start: usize, end: usize } {
+        const anchor = self.search_anchor orelse return null;
+        if (anchor == self.search_caret) return null;
+        return .{ .start = @min(anchor, self.search_caret), .end = @max(anchor, self.search_caret) };
+    }
+
+    fn deleteSelection(self: *App) bool {
+        const selected = self.selection() orelse return false;
+        std.mem.copyForwards(u8, self.search_text[selected.start..], self.search_text[selected.end..self.search_len]);
+        self.search_len -= selected.end - selected.start;
+        self.search_caret = selected.start;
+        self.search_anchor = null;
+        self.adjustSearchScroll();
+        return true;
+    }
+
+    fn moveSearchCaret(self: *App, pos: usize) void {
+        if (self.shift_down) {
+            if (self.search_anchor == null) self.search_anchor = self.search_caret;
+        } else {
+            self.search_anchor = null;
+        }
+        self.search_caret = @min(pos, self.search_len);
+        self.adjustSearchScroll();
+    }
+
+    fn handleKey(self: *App, key: u32, state: u32) void {
+        if (key == 42 or key == 54) {
+            self.shift_down = state == 1;
+            return;
+        }
+        if (key == 29 or key == 97) {
+            self.ctrl_down = state == 1;
+            return;
+        }
+        if (state != 1) return;
+        if (key == 58) {
+            self.caps_lock = !self.caps_lock;
+            return;
+        }
+        if (!self.search_focused) return;
+
+        if (self.ctrl_down) {
+            if (key == 30) { // Ctrl+A
+                self.search_anchor = 0;
+                self.search_caret = self.search_len;
+                self.adjustSearchScroll();
+            }
+            return;
+        }
+
         switch (key) {
-            28 => self.triggerFind(), // KEY_ENTER
-            14 => { // KEY_BACKSPACE
-                if (self.search_len > 0) self.search_len -= 1;
+            28 => self.triggerFind(), // Enter
+            1 => self.search_focused = false, // Escape
+            105 => self.moveSearchCaret(self.search_caret -| 1), // Left
+            106 => self.moveSearchCaret(self.search_caret + 1), // Right
+            102 => self.moveSearchCaret(0), // Home
+            107 => self.moveSearchCaret(self.search_len), // End
+            14 => { // Backspace
+                if (!self.deleteSelection() and self.search_caret > 0) {
+                    const pos = self.search_caret - 1;
+                    std.mem.copyForwards(u8, self.search_text[pos..], self.search_text[self.search_caret..self.search_len]);
+                    self.search_len -= 1;
+                    self.search_caret = pos;
+                }
             },
-            57 => { // KEY_SPACE
-                if (self.search_len < self.search_text.len) {
-                    self.search_text[self.search_len] = ' ';
-                    self.search_len += 1;
+            111 => { // Delete
+                if (!self.deleteSelection() and self.search_caret < self.search_len) {
+                    std.mem.copyForwards(u8, self.search_text[self.search_caret..], self.search_text[self.search_caret + 1 .. self.search_len]);
+                    self.search_len -= 1;
                 }
             },
             else => {
-                if (evdevToChar(key)) |ch| {
+                if (evdevToChar(key, self.shift_down, self.caps_lock)) |ch| {
+                    _ = self.deleteSelection();
                     if (self.search_len < self.search_text.len) {
-                        self.search_text[self.search_len] = ch;
+                        std.mem.copyBackwards(u8, self.search_text[self.search_caret + 1 .. self.search_len + 1], self.search_text[self.search_caret..self.search_len]);
+                        self.search_text[self.search_caret] = ch;
                         self.search_len += 1;
+                        self.search_caret += 1;
                     }
                 }
             },
         }
+        self.adjustSearchScroll();
     }
 
     fn triggerFind(self: *App) void {
@@ -517,12 +617,25 @@ pub const App = struct {
         font.drawButton(pixels, stride, 386, 12, 130, 28, "Clear Points", false, false, 0x0000dc64);
 
         // Row 2: Search field + Find button
-        font.fillRect(pixels, stride, 16, 48, 360, 28, 0x001c1f25);
-        font.strokeRect(pixels, stride, 16, 48, 360, 28, 0x002c3038);
+        font.fillRect(pixels, stride, 16, 48, 360, 28, if (self.search_focused) 0x0023272e else 0x001c1f25);
+        font.strokeRect(pixels, stride, 16, 48, 360, 28, if (self.search_focused) 0x0000dc64 else 0x00383d45);
         if (self.search_len > 0) {
-            font.drawText(pixels, stride, self.search_text[0..self.search_len], 24, 54, 0x00e6e8ec);
+            const end = @min(self.search_len, self.search_scroll + 37);
+            if (self.selection()) |selected| {
+                const start = @max(selected.start, self.search_scroll);
+                const stop = @min(selected.end, end);
+                if (start < stop) {
+                    font.fillRect(pixels, stride, 24 + (start - self.search_scroll) * font.font_width, 51,
+                        (stop - start) * font.font_width, 22, 0x00335d50);
+                }
+            }
+            font.drawText(pixels, stride, self.search_text[self.search_scroll..end], 24, 53, 0x00f2f4f6);
         } else {
-            font.drawText(pixels, stride, "Find objects, e.g. cat or red car", 24, 54, 0x00969ba5);
+            font.drawText(pixels, stride, "Find objects, e.g. cat or red car", 24, 53, 0x008e949e);
+        }
+        if (self.search_focused) {
+            const caret_x = 24 + (self.search_caret - self.search_scroll) * font.font_width;
+            font.fillRect(pixels, stride, caret_x, 52, 1, 20, 0x0000dc64);
         }
 
         font.drawButton(pixels, stride, 386, 48, 130, 28, "Find by Word", false, false, 0x0000dc64);
@@ -591,8 +704,8 @@ pub const App = struct {
     }
 };
 
-fn evdevToChar(key: u32) ?u8 {
-    return switch (key) {
+fn evdevToChar(key: u32, shift: bool, caps: bool) ?u8 {
+    const ch: u8 = switch (key) {
         16 => 'q',
         17 => 'w',
         18 => 'e',
@@ -629,7 +742,28 @@ fn evdevToChar(key: u32) ?u8 {
         9 => '8',
         10 => '9',
         11 => '0',
-        else => null,
+        12 => '-',
+        13 => '=',
+        26 => '[',
+        27 => ']',
+        39 => ';',
+        40 => '\'',
+        41 => '`',
+        43 => '\\',
+        51 => ',',
+        52 => '.',
+        53 => '/',
+        57 => ' ',
+        else => return null,
+    };
+    if (ch >= 'a' and ch <= 'z') return if (shift != caps) ch - 32 else ch;
+    if (!shift) return ch;
+    return switch (ch) {
+        '1' => '!', '2' => '@', '3' => '#', '4' => '$', '5' => '%',
+        '6' => '^', '7' => '&', '8' => '*', '9' => '(', '0' => ')',
+        '-' => '_', '=' => '+', '[' => '{', ']' => '}', ';' => ':',
+        '\'' => '"', '`' => '~', '\\' => '|', ',' => '<', '.' => '>', '/' => '?',
+        else => ch,
     };
 }
 
