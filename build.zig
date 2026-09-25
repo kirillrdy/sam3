@@ -128,6 +128,42 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.setCwd(b.path("."));
 
+    if (target.result.os.tag.isDarwin()) {
+        const macos_mod = b.createModule(.{
+            .root_source_file = b.path("macos/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = if (optimize == .ReleaseFast) true else null,
+            .imports = &.{
+                .{ .name = "sam3", .module = mod },
+                .{ .name = "zigimg", .module = zigimg.module("zigimg") },
+            },
+        });
+        macos_mod.addIncludePath(b.path("macos"));
+        macos_mod.addCSourceFile(.{
+            .file = b.path("macos/bridge.m"),
+            .flags = &.{"-fobjc-arc"},
+        });
+        macos_mod.link_libc = true;
+        macos_mod.linkSystemLibrary("objc", .{});
+        macos_mod.linkFramework("Foundation", .{});
+        macos_mod.linkFramework("AppKit", .{});
+        macos_mod.linkFramework("QuartzCore", .{});
+        macos_mod.linkFramework("UniformTypeIdentifiers", .{});
+
+        const macos_exe = b.addExecutable(.{
+            .name = "sam3-macos",
+            .root_module = macos_mod,
+        });
+        b.installArtifact(macos_exe);
+
+        const run_macos_step = b.step("run-macos", "Run the native macOS UI");
+        const run_macos_cmd = b.addRunArtifact(macos_exe);
+        run_macos_step.dependOn(&run_macos_cmd.step);
+        run_macos_cmd.step.dependOn(b.getInstallStep());
+        run_macos_cmd.setCwd(b.path("."));
+    }
+
     const test_step = b.step("test", "Run tests");
     addTest(b, test_step, mod);
     addTest(b, test_step, b.createModule(.{
@@ -146,6 +182,17 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zigimg", .module = zigimg.module("zigimg") },
         },
     }));
+    if (target.result.os.tag.isDarwin()) {
+        addTest(b, test_step, b.createModule(.{
+            .root_source_file = b.path("macos/render.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "sam3", .module = mod },
+                .{ .name = "zigimg", .module = zigimg.module("zigimg") },
+            },
+        }));
+    }
 }
 
 fn addTest(b: *std.Build, step: *std.Build.Step, module: *std.Build.Module) void {
