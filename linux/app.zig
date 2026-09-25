@@ -43,11 +43,19 @@ pub const App = struct {
     ctrl_down: bool = false,
     caps_lock: bool = false,
 
+    // Window state
+    is_maximized: bool = false,
+    unmaximized_width: u32 = 1000,
+    unmaximized_height: u32 = 720,
+    pending_width: u32 = 1000,
+    pending_height: u32 = 720,
+    last_titlebar_click_time: ?std.Io.Timestamp = null,
+
     // Layout geometry
     canvas_x: usize = 16,
-    canvas_y: usize = 110,
+    canvas_y: usize = 140,
     canvas_w: usize = 968,
-    canvas_h: usize = 540,
+    canvas_h: usize = 510,
 
     img_rect_x: usize = 0,
     img_rect_y: usize = 0,
@@ -70,6 +78,10 @@ pub const App = struct {
             .model = model,
             .example_path = example_path,
             .client = client,
+            .pending_width = width,
+            .pending_height = height,
+            .unmaximized_width = width,
+            .unmaximized_height = height,
         };
 
         app.setStatus("Initializing SAM 3…");
@@ -97,11 +109,11 @@ pub const App = struct {
         // Open sample image by default
         self.openImageFromPath(self.example_path);
 
-        var pending_width = self.client.width;
-        var pending_height = self.client.height;
+        self.pending_width = self.client.width;
+        self.pending_height = self.client.height;
         while (true) {
-            if (pending_width != self.client.width or pending_height != self.client.height) {
-                try self.client.resizeShmBuffer(pending_width, pending_height);
+            if (self.pending_width != self.client.width or self.pending_height != self.client.height) {
+                try self.client.resizeShmBuffer(self.pending_width, self.pending_height);
             }
             // Draw only into a buffer released by the compositor.
             if (try self.client.beginFrame()) {
@@ -117,14 +129,24 @@ pub const App = struct {
                 switch (ev) {
                     .close => break,
                     .configure => |cfg| {
+                        self.is_maximized = cfg.maximized;
                         if (cfg.width > 0 and cfg.height > 0) {
-                            pending_width = cfg.width;
-                            pending_height = cfg.height;
+                            if (!cfg.maximized) {
+                                self.unmaximized_width = cfg.width;
+                                self.unmaximized_height = cfg.height;
+                            }
+                            self.pending_width = cfg.width;
+                            self.pending_height = cfg.height;
+                        } else if (!cfg.maximized) {
+                            self.pending_width = self.unmaximized_width;
+                            self.pending_height = self.unmaximized_height;
                         }
                     },
                     .pointer_button => |btn| {
                         if (btn.state == 1) { // Pressed
-                            self.handlePointerClick(btn.x, btn.y, btn.button);
+                            if (try self.handlePointerClick(btn.x, btn.y, btn.button, btn.serial)) {
+                                break;
+                            }
                         }
                     },
                     .keyboard_key => |k| {
@@ -190,46 +212,134 @@ pub const App = struct {
         self.setStatus(msg);
     }
 
-    fn handlePointerClick(self: *App, px: f32, py: f32, button: u32) void {
+    fn getResizeEdge(self: *App, x: usize, y: usize) u32 {
+        if (self.is_maximized) return 0;
+        const margin: usize = 8;
+        const w = self.client.width;
+        const h = self.client.height;
+        if (w >= 110 and x >= w - 105 and y < 32) return 0;
+        var edges: u32 = 0;
+        if (y < margin) edges |= 1;
+        if (y + margin >= h) edges |= 2;
+        if (x < margin) edges |= 4;
+        if (x + margin >= w) edges |= 8;
+        return edges;
+    }
+
+    fn getResizeCursor(edges: u32) ?wayland.Cursor {
+        return switch (edges) {
+            1, 2 => .resize_ns,
+            4, 8 => .resize_ew,
+            5, 10 => .resize_nwse,
+            6, 9 => .resize_nesw,
+            else => null,
+        };
+    }
+
+    fn handlePointerClick(self: *App, px: f32, py: f32, button: u32, serial: u32) !bool {
         const x: usize = @intFromFloat(@max(0, px));
         const y: usize = @intFromFloat(@max(0, py));
+        const stride = self.client.width;
 
-        if (x >= 16 and x < 376 and y >= 48 and y < 76 and button == 0x110) {
+        // Interactive window resize from borders
+        if (button == 0x110) {
+            const edges = self.getResizeEdge(x, y);
+            if (edges != 0) {
+                try self.client.startInteractiveResize(serial, edges);
+                return false;
+            }
+        }
+
+        // Header bar / Window controls
+        if (y < 32 and button == 0x110) {
+            if (stride >= 110) {
+                // Close button [x]
+                if (x >= stride - 36 and x < stride - 10 and y >= 5 and y < 27) {
+                    return true;
+                }
+                // Maximize / restore button [+] / [=]
+                if (x >= stride - 68 and x < stride - 42 and y >= 5 and y < 27) {
+                    if (self.is_maximized) {
+                        try self.client.unsetMaximized();
+                        self.is_maximized = false;
+                        self.pending_width = self.unmaximized_width;
+                        self.pending_height = self.unmaximized_height;
+                    } else {
+                        self.unmaximized_width = self.client.width;
+                        self.unmaximized_height = self.client.height;
+                        try self.client.setMaximized();
+                        self.is_maximized = true;
+                    }
+                    return false;
+                }
+                // Minimize button [-]
+                if (x >= stride - 100 and x < stride - 74 and y >= 5 and y < 27) {
+                    try self.client.setMinimized();
+                    return false;
+                }
+            }
+
+            // Drag title bar to move, or double-click to toggle maximize
+            const now = std.Io.Timestamp.now(self.io, .awake);
+            if (self.last_titlebar_click_time) |prev| {
+                const dt = prev.durationTo(now).nanoseconds;
+                if (dt < 400_000_000) {
+                    self.last_titlebar_click_time = null;
+                    if (self.is_maximized) {
+                        try self.client.unsetMaximized();
+                        self.is_maximized = false;
+                        self.pending_width = self.unmaximized_width;
+                        self.pending_height = self.unmaximized_height;
+                    } else {
+                        self.unmaximized_width = self.client.width;
+                        self.unmaximized_height = self.client.height;
+                        try self.client.setMaximized();
+                        self.is_maximized = true;
+                    }
+                    return false;
+                }
+            }
+            self.last_titlebar_click_time = now;
+            try self.client.startInteractiveMove(serial);
+            return false;
+        }
+
+        if (x >= 16 and x < 376 and y >= 78 and y < 106 and button == 0x110) {
             self.search_focused = true;
             const visible = (x -| 24) / font.font_width;
             self.search_caret = @min(self.search_len, self.search_scroll + visible);
             self.search_anchor = null;
             self.adjustSearchScroll();
-            return;
+            return false;
         }
         self.search_focused = false;
         self.search_anchor = null;
-        if (self.is_busy) return;
+        if (self.is_busy) return false;
 
         // Top row buttons:
-        // [Sample Image] (16, 12, 130, 28)
-        if (x >= 16 and x <= 146 and y >= 12 and y <= 40) {
+        // [Sample Image] (16, 42, 130, 28)
+        if (x >= 16 and x <= 146 and y >= 42 and y <= 70) {
             self.openImageFromPath(self.example_path);
-            return;
+            return false;
         }
 
-        // [Mode toggle] (156, 12, 220, 28)
-        if (x >= 156 and x <= 376 and y >= 12 and y <= 40) {
+        // [Mode toggle] (156, 42, 220, 28)
+        if (x >= 156 and x <= 376 and y >= 42 and y <= 70) {
             self.click_mode_add = !self.click_mode_add;
-            return;
+            return false;
         }
 
-        // [Clear Points] (386, 12, 130, 28)
-        if (x >= 386 and x <= 516 and y >= 12 and y <= 40) {
+        // [Clear Points] (386, 42, 130, 28)
+        if (x >= 386 and x <= 516 and y >= 42 and y <= 70) {
             self.handleClearPoints();
-            return;
+            return false;
         }
 
         // Row 2:
-        // [Find by Word button] (386, 48, 130, 28)
-        if (x >= 386 and x <= 516 and y >= 48 and y <= 76) {
+        // [Find by Word button] (386, 78, 130, 28)
+        if (x >= 386 and x <= 516 and y >= 78 and y <= 106) {
             self.triggerFind();
-            return;
+            return false;
         }
 
         // Bottom row: mask candidate buttons
@@ -241,7 +351,7 @@ pub const App = struct {
                     if (x >= cur_btn_x and x <= cur_btn_x + 160) {
                         self.selected_mask = @intCast(i);
                         self.renderComposite(self.selected_mask);
-                        return;
+                        return false;
                     }
                     cur_btn_x += 168;
                 }
@@ -261,12 +371,16 @@ pub const App = struct {
                 self.handleCanvasClick(norm_x, norm_y, is_pos);
             }
         }
+        return false;
     }
 
     fn updateCursor(self: *App, px: f32, py: f32) !void {
         const x: usize = @intFromFloat(@max(0, px));
         const y: usize = @intFromFloat(@max(0, py));
-        const kind: wayland.Cursor = if (x >= 16 and x < 376 and y >= 48 and y < 76)
+        const edges = self.getResizeEdge(x, y);
+        const kind: wayland.Cursor = if (getResizeCursor(edges)) |c|
+            c
+        else if (x >= 16 and x < 376 and y >= 78 and y < 106)
             .text
         else if (self.image != null and x >= self.img_rect_x and x < self.img_rect_x + self.img_rect_w and
             y >= self.img_rect_y and y < self.img_rect_y + self.img_rect_h)
@@ -605,49 +719,70 @@ pub const App = struct {
         // Background: #14161a
         @memset(pixels, 0x0014161a);
 
+        // Window border (1px) when not maximized
+        if (!self.is_maximized and stride > 2 and h > 2) {
+            font.strokeRect(pixels, stride, 0, 0, stride, h, 0x00323742);
+        }
+
+        // Header / Title bar (y: 0..32)
+        font.fillRect(pixels, stride, 0, 0, stride, 32, 0x0017191e);
+        font.fillRect(pixels, stride, 0, 31, stride, 1, 0x002c3038);
+        font.drawText(pixels, stride, "SAM 3", 16, 7, 0x00d0d4dc);
+
+        if (stride >= 110) {
+            // Minimize [-]
+            font.drawButton(pixels, stride, stride - 100, 5, 26, 22, "-", false, false, 0x0000dc64);
+            // Maximize [+] / [=]
+            font.drawButton(pixels, stride, stride - 68, 5, 26, 22, if (self.is_maximized) "=" else "+", false, false, 0x0000dc64);
+            // Close [x]
+            font.drawButton(pixels, stride, stride - 36, 5, 26, 22, "x", false, false, 0x00e05555);
+        }
+
         // Row 1 Buttons:
         // [Sample Image]
-        font.drawButton(pixels, stride, 16, 12, 130, 28, "Sample Image", false, false, 0x0000dc64);
+        font.drawButton(pixels, stride, 16, 42, 130, 28, "Sample Image", false, false, 0x0000dc64);
 
         // [Clicks add / cut]
         const mode_text = if (self.click_mode_add) "Clicks add to mask" else "Clicks cut from mask";
-        font.drawButton(pixels, stride, 156, 12, 220, 28, mode_text, false, !self.click_mode_add, 0x0000dc64);
+        font.drawButton(pixels, stride, 156, 42, 220, 28, mode_text, false, !self.click_mode_add, 0x0000dc64);
 
         // [Clear Points]
-        font.drawButton(pixels, stride, 386, 12, 130, 28, "Clear Points", false, false, 0x0000dc64);
+        font.drawButton(pixels, stride, 386, 42, 130, 28, "Clear Points", false, false, 0x0000dc64);
 
         // Row 2: Search field + Find button
-        font.fillRect(pixels, stride, 16, 48, 360, 28, if (self.search_focused) 0x0023272e else 0x001c1f25);
-        font.strokeRect(pixels, stride, 16, 48, 360, 28, if (self.search_focused) 0x0000dc64 else 0x00383d45);
+        font.fillRect(pixels, stride, 16, 78, 360, 28, if (self.search_focused) 0x0023272e else 0x001c1f25);
+        font.strokeRect(pixels, stride, 16, 78, 360, 28, if (self.search_focused) 0x0000dc64 else 0x00383d45);
         if (self.search_len > 0) {
             const end = @min(self.search_len, self.search_scroll + 37);
             if (self.selection()) |selected| {
                 const start = @max(selected.start, self.search_scroll);
                 const stop = @min(selected.end, end);
                 if (start < stop) {
-                    font.fillRect(pixels, stride, 24 + (start - self.search_scroll) * font.font_width, 51,
+                    font.fillRect(pixels, stride, 24 + (start - self.search_scroll) * font.font_width, 81,
                         (stop - start) * font.font_width, 22, 0x00335d50);
                 }
             }
-            font.drawText(pixels, stride, self.search_text[self.search_scroll..end], 24, 53, 0x00f2f4f6);
+            font.drawText(pixels, stride, self.search_text[self.search_scroll..end], 24, 83, 0x00f2f4f6);
         } else {
-            font.drawText(pixels, stride, "Find objects, e.g. cat or red car", 24, 53, 0x008e949e);
+            font.drawText(pixels, stride, "Find objects, e.g. cat or red car", 24, 83, 0x008e949e);
         }
         if (self.search_focused) {
             const caret_x = 24 + (self.search_caret - self.search_scroll) * font.font_width;
-            font.fillRect(pixels, stride, caret_x, 52, 1, 20, 0x0000dc64);
+            font.fillRect(pixels, stride, caret_x, 82, 1, 20, 0x0000dc64);
         }
 
-        font.drawButton(pixels, stride, 386, 48, 130, 28, "Find by Word", false, false, 0x0000dc64);
+        font.drawButton(pixels, stride, 386, 78, 130, 28, "Find by Word", false, false, 0x0000dc64);
 
         // Status text
-        font.drawText(pixels, stride, self.status_text[0..self.status_len], 16, 86, 0x00969ba5);
+        font.drawText(pixels, stride, self.status_text[0..self.status_len], 16, 116, 0x00969ba5);
 
         // Canvas Area
         const cx = self.canvas_x;
         const cy = self.canvas_y;
         const cw = if (stride > 32) stride - 32 else 100;
-        const ch = if (h > 170) h - 170 else 100;
+        const ch = if (h > 200) h - 200 else 100;
+        self.canvas_w = cw;
+        self.canvas_h = ch;
 
         font.fillRect(pixels, stride, cx, cy, cw, ch, 0x001c1f25);
         font.strokeRect(pixels, stride, cx, cy, cw, ch, 0x002c3038);

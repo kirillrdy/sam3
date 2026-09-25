@@ -84,15 +84,19 @@ pub fn main() !void {
     const arrow = try loadCursor(&.{ "default", "left_ptr" });
     const text = try loadCursor(&.{ "text", "xterm" });
     const crosshair = try loadCursor(&.{ "crosshair", "cross" });
+    const resize_ns = try loadCursor(&.{ "ns-resize", "n-resize", "s-resize" });
+    const resize_ew = try loadCursor(&.{ "ew-resize", "e-resize", "w-resize" });
+    const resize_nwse = try loadCursor(&.{ "nwse-resize", "nw-resize", "se-resize" });
+    const resize_nesw = try loadCursor(&.{ "nesw-resize", "ne-resize", "sw-resize" });
 
     const out_file = std.c.fopen("linux/adwaita_cursors.bin", "wb") orelse return error.CantCreateOut;
     defer _ = std.c.fclose(out_file);
 
-    const cursors = [_]CursorDef{ arrow, text, crosshair };
+    const cursors = [_]CursorDef{ arrow, text, crosshair, resize_ns, resize_ew, resize_nwse, resize_nesw };
     for (cursors) |c| {
         const header: [4]u32 = .{ c.width, c.height, @bitCast(c.hotspot_x), @bitCast(c.hotspot_y) };
         _ = std.c.fwrite(@ptrCast(&header), 4, 4, out_file);
         _ = std.c.fwrite(@ptrCast(&c.pixels), 4, c.pixels.len, out_file);
     }
-    std.debug.print("Successfully updated linux/adwaita_cursors.bin\n", .{});
+    std.debug.print("Successfully updated linux/adwaita_cursors.bin with 7 cursors!\n", .{});
 }
