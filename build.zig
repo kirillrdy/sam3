@@ -64,6 +64,12 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const zimo = b.dependency("zimo", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.addImport("zimo", zimo.module("zimo"));
+
     const onnx = b.dependency("onnx", .{
         .target = target,
         .optimize = optimize,

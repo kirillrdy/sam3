@@ -1,6 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 pub const onnx = @import("onnx");
+pub const zimo = @import("zimo");
+const here = zimo.bind(@This(), @embedFile("sam3.zig"));
+threadlocal var active_model: ?*Model = null;
 pub const tokenizer = @import("tokenizer.zig");
 pub const assets = @import("assets.zig");
 pub const render = @import("render.zig");
@@ -71,6 +74,7 @@ const concept_decoder_outputs = [_][*:0]const u8{
 pub const Model = struct {
     allocator: std.mem.Allocator,
     env: onnx.Env,
+    paths: Paths,
     vision: onnx.Session,
     decoder: onnx.Session,
     concept_vision: onnx.Session,
@@ -102,6 +106,7 @@ pub const Model = struct {
         return .{
             .allocator = allocator,
             .env = env,
+            .paths = paths,
             .vision = vision,
             .decoder = decoder,
             .concept_vision = concept_vision,
@@ -122,21 +127,12 @@ pub const Model = struct {
     }
 
     pub fn encode(self: *Model, img: Image) !Embedding {
-        const pixels = try preprocessCpu(self.allocator, img, @splat(0.5), @splat(0.5));
-        defer self.allocator.free(pixels);
+        active_model = self;
+        defer active_model = null;
 
-        const pixel_shape = [_]i64{ 1, 3, image_size, image_size };
-        const pixel_values = try onnx.Value.borrowF32(pixels, &pixel_shape);
-        defer pixel_values.deinit();
-
-        var embedding: Embedding = undefined;
-        try self.vision.run(
-            &.{vision_input},
-            &.{pixel_values},
-            &embedding_names,
-            &embedding.levels,
-        );
-        return embedding;
+        const raw = img.rawBytes();
+        const data = try here.call(.encodeVision, .{ self.allocator, self.paths.vision_encoder, raw, img.width, img.height });
+        return Embedding.init(self.allocator, data);
     }
 
     pub fn decode(self: *Model, embedding: Embedding, points: []const Point) !Masks {
@@ -183,26 +179,12 @@ pub const Model = struct {
     }
 
     pub fn encodeConcept(self: *Model, img: Image) !ConceptEmbedding {
-        const pixels = try preprocessCpu(
-            self.allocator,
-            img,
-            .{ 0.485, 0.456, 0.406 },
-            .{ 0.229, 0.224, 0.225 },
-        );
-        defer self.allocator.free(pixels);
+        active_model = self;
+        defer active_model = null;
 
-        const pixel_shape = [_]i64{ 1, 3, image_size, image_size };
-        const pixel_values = try onnx.Value.borrowF32(pixels, &pixel_shape);
-        defer pixel_values.deinit();
-
-        var embedding: ConceptEmbedding = undefined;
-        try self.concept_vision.run(
-            &.{vision_input},
-            &.{pixel_values},
-            &concept_embedding_names,
-            &embedding.levels,
-        );
-        return embedding;
+        const raw = img.rawBytes();
+        const data = try here.call(.encodeConceptVision, .{ self.allocator, self.paths.concept_vision_encoder, raw, img.width, img.height });
+        return ConceptEmbedding.init(self.allocator, data);
     }
 
     pub fn lookup(self: *Model, embedding: ConceptEmbedding, phrase: []const u8, threshold: f32) !Masks {
@@ -242,18 +224,174 @@ pub const Model = struct {
     }
 };
 
-pub const Embedding = EmbeddingOf(embedding_names.len);
-pub const ConceptEmbedding = EmbeddingOf(concept_embedding_names.len);
+pub const Embedding = struct {
+    allocator: std.mem.Allocator,
+    data: []f32,
+    levels: [embedding_names.len]onnx.Value,
 
-fn EmbeddingOf(comptime levels: usize) type {
-    return struct {
-        levels: [levels]onnx.Value,
+    pub fn init(allocator: std.mem.Allocator, data: []f32) !Embedding {
+        return .{
+            .allocator = allocator,
+            .data = data,
+            .levels = .{
+                try onnx.Value.borrowF32(data[0..2654208], &.{ 1, 32, 288, 288 }),
+                try onnx.Value.borrowF32(data[2654208..][0..1327104], &.{ 1, 64, 144, 144 }),
+                try onnx.Value.borrowF32(data[3981312..][0..1327104], &.{ 1, 256, 72, 72 }),
+            },
+        };
+    }
 
-        pub fn deinit(self: *@This()) void {
-            for (self.levels) |level| level.deinit();
-            self.* = undefined;
+    pub fn deinit(self: *Embedding) void {
+        self.allocator.free(self.data);
+        self.* = undefined;
+    }
+};
+
+pub const ConceptEmbedding = struct {
+    allocator: std.mem.Allocator,
+    data: []f32,
+    levels: [concept_embedding_names.len]onnx.Value,
+
+    pub fn init(allocator: std.mem.Allocator, data: []f32) !ConceptEmbedding {
+        const offsets = [_]usize{
+            0,
+            21233664,
+            26542080,
+            27869184,
+            28200960,
+            49434624,
+            54743040,
+            56070144,
+        };
+        const lens = [_]usize{
+            21233664,
+            5308416,
+            1327104,
+            331776,
+            21233664,
+            5308416,
+            1327104,
+            331776,
+        };
+        const shapes = [_][4]i64{
+            .{ 1, 256, 288, 288 },
+            .{ 1, 256, 144, 144 },
+            .{ 1, 256, 72, 72 },
+            .{ 1, 256, 36, 36 },
+            .{ 1, 256, 288, 288 },
+            .{ 1, 256, 144, 144 },
+            .{ 1, 256, 72, 72 },
+            .{ 1, 256, 36, 36 },
+        };
+        var levels: [concept_embedding_names.len]onnx.Value = undefined;
+        inline for (0..8) |i| {
+            levels[i] = try onnx.Value.borrowF32(data[offsets[i]..][0..lens[i]], &shapes[i]);
         }
+        return .{
+            .allocator = allocator,
+            .data = data,
+            .levels = levels,
+        };
+    }
+
+    pub fn deinit(self: *ConceptEmbedding) void {
+        self.allocator.free(self.data);
+        self.* = undefined;
+    }
+};
+
+pub fn encodeVision(
+    allocator: std.mem.Allocator,
+    model_id: []const u8,
+    raw_pixels: []const u8,
+    width: usize,
+    height: usize,
+) ![]f32 {
+    _ = model_id;
+    const model = active_model orelse return error.NoActiveModel;
+    const img: Image = .{
+        .width = width,
+        .height = height,
+        .pixels = .{ .rgb24 = @constCast(@alignCast(std.mem.bytesAsSlice(zigimg.color.Rgb24, raw_pixels))) },
     };
+    const pixels = try preprocessCpu(allocator, img, @splat(0.5), @splat(0.5));
+    defer allocator.free(pixels);
+
+    const pixel_shape = [_]i64{ 1, 3, image_size, image_size };
+    const pixel_values = try onnx.Value.borrowF32(pixels, &pixel_shape);
+    defer pixel_values.deinit();
+
+    var levels: [embedding_names.len]onnx.Value = undefined;
+    try model.vision.run(
+        &.{vision_input},
+        &.{pixel_values},
+        &embedding_names,
+        &levels,
+    );
+    defer for (levels) |level| level.deinit();
+
+    const total_floats = 2654208 + 1327104 + 1327104;
+    const out = try allocator.alloc(f32, total_floats);
+    errdefer allocator.free(out);
+
+    const l0 = try levels[0].dataF32();
+    const l1 = try levels[1].dataF32();
+    const l2 = try levels[2].dataF32();
+    @memcpy(out[0..2654208], l0);
+    @memcpy(out[2654208..][0..1327104], l1);
+    @memcpy(out[3981312..][0..1327104], l2);
+
+    return out;
+}
+
+pub fn encodeConceptVision(
+    allocator: std.mem.Allocator,
+    model_id: []const u8,
+    raw_pixels: []const u8,
+    width: usize,
+    height: usize,
+) ![]f32 {
+    _ = model_id;
+    const model = active_model orelse return error.NoActiveModel;
+    const img: Image = .{
+        .width = width,
+        .height = height,
+        .pixels = .{ .rgb24 = @constCast(@alignCast(std.mem.bytesAsSlice(zigimg.color.Rgb24, raw_pixels))) },
+    };
+    const pixels = try preprocessCpu(
+        allocator,
+        img,
+        .{ 0.485, 0.456, 0.406 },
+        .{ 0.229, 0.224, 0.225 },
+    );
+    defer allocator.free(pixels);
+
+    const pixel_shape = [_]i64{ 1, 3, image_size, image_size };
+    const pixel_values = try onnx.Value.borrowF32(pixels, &pixel_shape);
+    defer pixel_values.deinit();
+
+    var levels: [concept_embedding_names.len]onnx.Value = undefined;
+    try model.concept_vision.run(
+        &.{vision_input},
+        &.{pixel_values},
+        &concept_embedding_names,
+        &levels,
+    );
+    defer for (levels) |level| level.deinit();
+
+    const lens = [_]usize{ 21233664, 5308416, 1327104, 331776, 21233664, 5308416, 1327104, 331776 };
+    const total_floats = 56401920;
+    const out = try allocator.alloc(f32, total_floats);
+    errdefer allocator.free(out);
+
+    var offset: usize = 0;
+    for (levels, lens) |level, len| {
+        const data = try level.dataF32();
+        @memcpy(out[offset..][0..len], data);
+        offset += len;
+    }
+
+    return out;
 }
 
 pub const Masks = struct {
@@ -417,4 +555,33 @@ fn clampPixelIndex(coordinate: f32, limit: usize) usize {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "zimo embedding caching" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    const home_c = std.c.getenv("HOME") orelse return;
+    try environ.put("HOME", std.mem.span(home_c));
+
+    var loaded = try assets.loadDefaultModel(allocator, io, &environ, false);
+    defer loaded.deinit();
+
+    const image_path = loaded.cached.paths[10];
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, image_path, allocator, .limited(10 * 1024 * 1024));
+    defer allocator.free(bytes);
+
+    var img = try decode(allocator, bytes);
+    defer img.deinit(allocator);
+
+    var emb1 = try loaded.model.encode(img);
+    defer emb1.deinit();
+
+    var emb2 = try loaded.model.encode(img);
+    defer emb2.deinit();
+
+    try std.testing.expectEqual(emb1.data.len, emb2.data.len);
+    try std.testing.expectEqualSlices(f32, emb1.data[0..100], emb2.data[0..100]);
 }
