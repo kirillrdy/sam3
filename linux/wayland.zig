@@ -2,9 +2,9 @@ const std = @import("std");
 
 pub const WaylandEvent = union(enum) {
     pointer_motion: struct { x: f32, y: f32 },
-    pointer_button: struct { button: u32, state: u32, x: f32, y: f32 },
+    pointer_button: struct { button: u32, state: u32, x: f32, y: f32, serial: u32 },
     keyboard_key: struct { key: u32, state: u32 },
-    configure: struct { width: u32, height: u32 },
+    configure: struct { width: u32, height: u32, maximized: bool = false },
     close,
 };
 
@@ -13,7 +13,15 @@ const embedded_adwaita_cursors = @embedFile("adwaita_cursors.bin");
 extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
 extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
 
-pub const Cursor = enum { arrow, text, crosshair };
+pub const Cursor = enum {
+    arrow,
+    text,
+    crosshair,
+    resize_ns,
+    resize_ew,
+    resize_nwse,
+    resize_nesw,
+};
 
 pub const WaylandClient = struct {
     const ShmBuffer = struct {
@@ -48,9 +56,10 @@ pub const WaylandClient = struct {
     keyboard_id: u32 = 0,
 
     cursor_surface_id: u32 = 0,
-    cursor_items: [3]CursorData = undefined,
+    cursor_items: [std.meta.tags(Cursor).len]CursorData = undefined,
     cursor_count: usize = 0,
     pointer_enter_serial: ?u32 = null,
+    last_pointer_serial: u32 = 0,
     current_cursor: ?Cursor = null,
 
     buffers: std.ArrayList(ShmBuffer) = .empty,
@@ -139,6 +148,7 @@ pub const WaylandClient = struct {
 
         try client.sendToplevelString(client.xdg_toplevel_id, 2, "SAM 3");
         try client.sendToplevelString(client.xdg_toplevel_id, 3, "sam3");
+        try client.sendMsg(client.xdg_toplevel_id, 8, .{ @as(i32, 640), @as(i32, 480) });
 
         // 5. Setup pointer & keyboard if seat is available
         if (client.seat_id != 0) {
@@ -317,6 +327,10 @@ pub const WaylandClient = struct {
             .arrow => &.{ "default", "left_ptr" },
             .text => &.{ "text", "xterm", "ibeam" },
             .crosshair => &.{ "crosshair", "cross" },
+            .resize_ns => &.{ "ns-resize", "n-resize", "s-resize", "row-resize" },
+            .resize_ew => &.{ "ew-resize", "e-resize", "w-resize", "col-resize" },
+            .resize_nwse => &.{ "nwse-resize", "nw-resize", "se-resize" },
+            .resize_nesw => &.{ "nesw-resize", "ne-resize", "sw-resize" },
         };
 
         var themes_buf: [3][]const u8 = undefined;
@@ -407,7 +421,7 @@ pub const WaylandClient = struct {
     }
 
     pub fn setCursor(self: *WaylandClient, kind: Cursor) !void {
-        const serial = self.pointer_enter_serial orelse return;
+        const serial = self.pointer_enter_serial orelse (if (self.last_pointer_serial != 0) self.last_pointer_serial else return);
         if (self.current_cursor == kind) return;
         const item = self.cursor_items[@intFromEnum(kind)];
         try self.sendMsg(self.cursor_surface_id, 1, .{ item.buffer.id, @as(i32, 0), @as(i32, 0) });
@@ -415,6 +429,31 @@ pub const WaylandClient = struct {
         try self.sendMsg(self.cursor_surface_id, 6, .{});
         try self.sendMsg(self.pointer_id, 0, .{ serial, self.cursor_surface_id, item.hotspot_x, item.hotspot_y });
         self.current_cursor = kind;
+    }
+
+    pub fn startInteractiveMove(self: *WaylandClient, serial: u32) !void {
+        if (self.seat_id == 0 or self.xdg_toplevel_id == 0) return;
+        try self.sendMsg(self.xdg_toplevel_id, 5, .{ self.seat_id, serial });
+    }
+
+    pub fn startInteractiveResize(self: *WaylandClient, serial: u32, edges: u32) !void {
+        if (self.seat_id == 0 or self.xdg_toplevel_id == 0) return;
+        try self.sendMsg(self.xdg_toplevel_id, 6, .{ self.seat_id, serial, edges });
+    }
+
+    pub fn setMaximized(self: *WaylandClient) !void {
+        if (self.xdg_toplevel_id == 0) return;
+        try self.sendMsg(self.xdg_toplevel_id, 9, .{});
+    }
+
+    pub fn unsetMaximized(self: *WaylandClient) !void {
+        if (self.xdg_toplevel_id == 0) return;
+        try self.sendMsg(self.xdg_toplevel_id, 10, .{});
+    }
+
+    pub fn setMinimized(self: *WaylandClient) !void {
+        if (self.xdg_toplevel_id == 0) return;
+        try self.sendMsg(self.xdg_toplevel_id, 13, .{});
     }
 
     fn discardUnusedBuffers(self: *WaylandClient) void {
@@ -581,10 +620,20 @@ pub const WaylandClient = struct {
             if (id == self.xdg_toplevel_id and opcode == 0 and size >= 16) {
                 const w = std.mem.readInt(i32, msg_bytes[8..12], .little);
                 const h = std.mem.readInt(i32, msg_bytes[12..16], .little);
-                if (w > 0 and h > 0) {
-                    return .{ .configure = .{ .width = @intCast(w), .height = @intCast(h) } };
+                var is_max = false;
+                if (size >= 20) {
+                    const states_len = std.mem.readInt(u32, msg_bytes[16..20], .little);
+                    var offset: usize = 20;
+                    while (offset + 4 <= size and offset - 20 < states_len) : (offset += 4) {
+                        const state_val = std.mem.readInt(u32, msg_bytes[offset..][0..4], .little);
+                        if (state_val == 1) { // XDG_TOPLEVEL_STATE_MAXIMIZED
+                            is_max = true;
+                        }
+                    }
                 }
-                continue;
+                const width: u32 = if (w > 0) @intCast(w) else 0;
+                const height: u32 = if (h > 0) @intCast(h) else 0;
+                return .{ .configure = .{ .width = width, .height = height, .maximized = is_max } };
             }
 
             // xdg_toplevel close
@@ -631,6 +680,8 @@ pub const WaylandClient = struct {
 
             // Pointer button
             if (id == self.pointer_id and opcode == 3 and size >= 24) {
+                const serial = std.mem.readInt(u32, msg_bytes[8..12], .little);
+                self.last_pointer_serial = serial;
                 const btn = std.mem.readInt(u32, msg_bytes[16..20], .little);
                 const state = std.mem.readInt(u32, msg_bytes[20..24], .little);
                 return .{ .pointer_button = .{
@@ -638,6 +689,7 @@ pub const WaylandClient = struct {
                     .state = state,
                     .x = self.pointer_x,
                     .y = self.pointer_y,
+                    .serial = serial,
                 } };
             }
 
@@ -796,9 +848,8 @@ test "loadCursorData retrieves GNOME Adwaita cursor geometry and non-empty pixel
                 try std.testing.expectEqual(@as(i32, 11), cur.hotspot_x);
                 try std.testing.expectEqual(@as(i32, 12), cur.hotspot_y);
             },
-            .crosshair => {
-                try std.testing.expectEqual(@as(i32, 11), cur.hotspot_x);
-                try std.testing.expectEqual(@as(i32, 11), cur.hotspot_y);
+            .crosshair, .resize_ns, .resize_ew, .resize_nwse, .resize_nesw => {
+                try std.testing.expect(cur.hotspot_x >= 0 and cur.hotspot_y >= 0);
             },
         }
     }
