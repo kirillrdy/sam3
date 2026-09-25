@@ -28,10 +28,6 @@ pub extern fn sam_macos_dispatch_main(func: *const fn (?*anyopaque) callconv(.c)
 
 const max_points = 32;
 
-fn Cache(comptime EmbeddingType: type) type {
-    return struct { embedding: EmbeddingType };
-}
-
 pub const App = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -47,9 +43,6 @@ pub const App = struct {
     points: [max_points]sam3.Point = undefined,
     points_len: usize = 0,
     click_mode_add: bool = true,
-
-    cache: ?Cache(sam3.Embedding) = null,
-    concept_cache: ?Cache(sam3.ConceptEmbedding) = null,
 
     masks: ?sam3.Masks = null,
     coverages: []f32 = &.{},
@@ -69,8 +62,6 @@ pub const App = struct {
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
 
-        if (self.cache) |*c| c.embedding.deinit();
-        if (self.concept_cache) |*c| c.embedding.deinit();
         if (self.masks) |*m| m.deinit();
         if (self.image) |*img| img.deinit(self.allocator);
         self.allocator.free(self.frame);
@@ -128,10 +119,6 @@ pub const App = struct {
 
         if (self.image) |*old| old.deinit(self.allocator);
         self.allocator.free(self.frame);
-        if (self.cache) |*c| c.embedding.deinit();
-        self.cache = null;
-        if (self.concept_cache) |*c| c.embedding.deinit();
-        self.concept_cache = null;
         if (self.masks) |*m| m.deinit();
         self.masks = null;
 
@@ -190,13 +177,14 @@ pub const App = struct {
     fn runSegmentWorker(self: *App) void {
         const started = std.Io.Timestamp.now(self.io, .awake);
 
-        const embedding = self.ensureEmbedding(false) catch |err| {
+        var embedding = self.ensureEmbedding(false) catch |err| {
             std.debug.print("Vision encoder failed: {t}: {s}\n", .{ err, sam3.onnx.lastError() });
             sam_macos_set_status("Vision encoder failed");
             self.is_busy = false;
             sam_macos_set_busy(0);
             return;
         };
+        defer embedding.deinit();
 
         const decode_started = std.Io.Timestamp.now(self.io, .awake);
         const masks = self.model.decode(embedding, self.points[0..self.points_len]) catch |err| {
@@ -300,13 +288,14 @@ pub const App = struct {
         const phrase = ctx.phrase;
         const started = std.Io.Timestamp.now(self.io, .awake);
 
-        const concept_embedding = self.ensureEmbedding(true) catch |err| {
+        var concept_embedding = self.ensureEmbedding(true) catch |err| {
             std.debug.print("Concept vision encoder failed: {t}: {s}\n", .{ err, sam3.onnx.lastError() });
             sam_macos_set_status("Concept vision encoder failed");
             self.is_busy = false;
             sam_macos_set_busy(0);
             return;
         };
+        defer concept_embedding.deinit();
 
         const lookup_started = std.Io.Timestamp.now(self.io, .awake);
         const masks = self.model.lookup(concept_embedding, phrase, 0.5) catch |err| {
@@ -403,17 +392,6 @@ pub const App = struct {
     }
 
     fn ensureEmbedding(self: *App, comptime concept: bool) !if (concept) sam3.ConceptEmbedding else sam3.Embedding {
-        const cache = if (concept) &self.concept_cache else &self.cache;
-        if (cache.*) |cached| return cached.embedding;
-
-        if (concept) {
-            if (self.cache) |*c| c.embedding.deinit();
-            self.cache = null;
-        } else {
-            if (self.concept_cache) |*c| c.embedding.deinit();
-            self.concept_cache = null;
-        }
-
         const img = self.image orelse return error.NoImageLoaded;
         const started = std.Io.Timestamp.now(self.io, .awake);
         const embedding = if (concept) try self.model.encodeConcept(img) else try self.model.encode(img);
@@ -423,7 +401,6 @@ pub const App = struct {
             img.height,
             secondsSince(self.io, started),
         });
-        cache.* = .{ .embedding = embedding };
         return embedding;
     }
 
