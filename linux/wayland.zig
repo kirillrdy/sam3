@@ -8,6 +8,11 @@ pub const WaylandEvent = union(enum) {
     close,
 };
 
+const embedded_adwaita_cursors = @embedFile("adwaita_cursors.bin");
+
+extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
+extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
+
 pub const Cursor = enum { arrow, text, crosshair };
 
 pub const WaylandClient = struct {
@@ -19,6 +24,11 @@ pub const WaylandClient = struct {
         width: u32,
         height: u32,
         busy: bool = false,
+    };
+    const CursorData = struct {
+        buffer: ShmBuffer,
+        hotspot_x: i32,
+        hotspot_y: i32,
     };
 
     allocator: std.mem.Allocator,
@@ -36,9 +46,10 @@ pub const WaylandClient = struct {
     xdg_toplevel_id: u32 = 0,
     pointer_id: u32 = 0,
     keyboard_id: u32 = 0,
+
     cursor_surface_id: u32 = 0,
-    cursor_buffers: [3]ShmBuffer = undefined,
-    cursor_buffer_count: usize = 0,
+    cursor_items: [3]CursorData = undefined,
+    cursor_count: usize = 0,
     pointer_enter_serial: ?u32 = null,
     current_cursor: ?Cursor = null,
 
@@ -148,7 +159,7 @@ pub const WaylandClient = struct {
     }
 
     pub fn deinit(self: *WaylandClient) void {
-        for (self.cursor_buffers[0..self.cursor_buffer_count]) |buffer| self.destroyBuffer(buffer);
+        for (self.cursor_items[0..self.cursor_count]) |item| self.destroyBuffer(item.buffer);
         if (self.cursor_surface_id != 0) self.sendMsg(self.cursor_surface_id, 0, .{}) catch {};
         for (self.buffers.items) |buffer| self.destroyBuffer(buffer);
         self.buffers.deinit(self.allocator);
@@ -201,71 +212,208 @@ pub const WaylandClient = struct {
         _ = std.c.close(buffer.fd);
     }
 
-    fn cursorPixel(pixels: []u32, x: usize, y: usize, color: u32) void {
-        if (x < 24 and y < 24) pixels[y * 24 + x] = color;
+    const ParsedCursor = struct {
+        width: u32,
+        height: u32,
+        hotspot_x: i32,
+        hotspot_y: i32,
+        pixels: [64 * 64]u32,
+    };
+
+    fn parseXcursor(data: []const u8, target_size: u32) ?ParsedCursor {
+        if (data.len < 16 or !std.mem.startsWith(u8, data, "Xcur")) return null;
+        const ntoc = std.mem.readInt(u32, data[12..16], .little);
+        if (data.len < 16 + ntoc * 12) return null;
+
+        var best_pos: ?usize = null;
+        var best_diff: u32 = std.math.maxInt(u32);
+
+        for (0..ntoc) |i| {
+            const offset = 16 + i * 12;
+            const c_type = std.mem.readInt(u32, data[offset..][0..4], .little);
+            const c_size = std.mem.readInt(u32, data[offset + 4 ..][0..4], .little);
+            const c_pos = std.mem.readInt(u32, data[offset + 8 ..][0..4], .little);
+            if (c_type == 0xfffd0002) {
+                const diff = if (c_size >= target_size) c_size - target_size else target_size - c_size;
+                if (diff < best_diff) {
+                    best_diff = diff;
+                    best_pos = c_pos;
+                }
+            }
+        }
+
+        const pos = best_pos orelse return null;
+        if (data.len < pos + 36) return null;
+        const chunk = data[pos..];
+        const w = std.mem.readInt(u32, chunk[16..20], .little);
+        const h = std.mem.readInt(u32, chunk[20..24], .little);
+        const xhot = std.mem.readInt(u32, chunk[24..28], .little);
+        const yhot = std.mem.readInt(u32, chunk[28..32], .little);
+        if (w > 64 or h > 64 or w == 0 or h == 0) return null;
+        const pixel_bytes_len = @as(usize, w) * h * 4;
+        if (chunk.len < 36 + pixel_bytes_len) return null;
+
+        var cur = ParsedCursor{
+            .width = w,
+            .height = h,
+            .hotspot_x = @intCast(xhot),
+            .hotspot_y = @intCast(yhot),
+            .pixels = undefined,
+        };
+        const pixel_bytes = chunk[36 .. 36 + pixel_bytes_len];
+        for (0..w * h) |i| {
+            cur.pixels[i] = std.mem.readInt(u32, pixel_bytes[i * 4 ..][0..4], .little);
+        }
+        return cur;
     }
 
-    fn drawCursor(pixels: []u32, kind: Cursor) void {
-        @memset(pixels, 0);
-        const dark: u32 = 0xff111318;
-        const light: u32 = 0xfff5f7f9;
-        switch (kind) {
-            .arrow => {
-                for (0..18) |y| {
-                    const end = y / 2 + 1;
-                    for (0..end + 1) |x| {
-                        cursorPixel(pixels, x, y, if (x == 0 or x == end or y == 0 or y == 17) dark else light);
-                    }
-                }
-                for (0..8) |y| {
-                    for (0..4) |x| cursorPixel(pixels, x + 4, y + 14, if (x == 0 or x == 3) dark else light);
-                }
-            },
-            .text => {
-                for (4..20) |y| {
-                    for (10..14) |x| cursorPixel(pixels, x, y, if (x == 10 or x == 13) dark else light);
-                }
-                for (8..16) |x| {
-                    for (2..5) |y| cursorPixel(pixels, x, y, if (y == 2) dark else light);
-                    for (19..22) |y| cursorPixel(pixels, x, y, if (y == 21) dark else light);
-                }
-            },
-            .crosshair => {
-                for (1..23) |p| {
-                    if (p < 9 or p > 15) {
-                        cursorPixel(pixels, 11, p, dark);
-                        cursorPixel(pixels, 12, p, light);
-                        cursorPixel(pixels, 13, p, dark);
-                        cursorPixel(pixels, p, 11, dark);
-                        cursorPixel(pixels, p, 12, light);
-                        cursorPixel(pixels, p, 13, dark);
-                    }
-                }
-                cursorPixel(pixels, 12, 12, 0xff00dc64);
-            },
+    fn loadEmbeddedCursor(kind: Cursor) ParsedCursor {
+        const entry_size = 16 + 24 * 24 * 4;
+        const offset = @as(usize, @intFromEnum(kind)) * entry_size;
+        const chunk = embedded_adwaita_cursors[offset .. offset + entry_size];
+        const w = std.mem.readInt(u32, chunk[0..4], .little);
+        const h = std.mem.readInt(u32, chunk[4..8], .little);
+        const xhot = std.mem.readInt(i32, chunk[8..12], .little);
+        const yhot = std.mem.readInt(i32, chunk[12..16], .little);
+        var cur = ParsedCursor{
+            .width = w,
+            .height = h,
+            .hotspot_x = xhot,
+            .hotspot_y = yhot,
+            .pixels = undefined,
+        };
+        const pixel_bytes = chunk[16..];
+        for (0..w * h) |i| {
+            cur.pixels[i] = std.mem.readInt(u32, pixel_bytes[i * 4 ..][0..4], .little);
         }
+        return cur;
+    }
+
+    fn readCursorFile(path: [*:0]const u8, target_size: u32) ?ParsedCursor {
+        const fd = open(path, 0);
+        if (fd < 0) return null;
+        defer _ = std.c.close(fd);
+
+        var buf: [128 * 1024]u8 = undefined;
+        var total: usize = 0;
+        while (total < buf.len) {
+            const rc = read(fd, buf[total..].ptr, buf.len - total);
+            if (rc <= 0) break;
+            total += @intCast(rc);
+        }
+        return parseXcursor(buf[0..total], target_size);
+    }
+
+    fn loadCursorData(kind: Cursor) ParsedCursor {
+        const target_size: u32 = blk: {
+            if (std.c.getenv("XCURSOR_SIZE")) |val| {
+                const span = std.mem.span(val);
+                if (std.fmt.parseInt(u32, span, 10)) |s| break :blk s else |_| {}
+            }
+            break :blk 24;
+        };
+
+        const names: []const []const u8 = switch (kind) {
+            .arrow => &.{ "default", "left_ptr" },
+            .text => &.{ "text", "xterm", "ibeam" },
+            .crosshair => &.{ "crosshair", "cross" },
+        };
+
+        var themes_buf: [3][]const u8 = undefined;
+        var theme_count: usize = 0;
+        if (std.c.getenv("XCURSOR_THEME")) |val| {
+            const span = std.mem.span(val);
+            if (span.len > 0) {
+                themes_buf[theme_count] = span;
+                theme_count += 1;
+            }
+        }
+        themes_buf[theme_count] = "Adwaita";
+        theme_count += 1;
+        themes_buf[theme_count] = "default";
+        theme_count += 1;
+        const themes = themes_buf[0..theme_count];
+
+        var path_buf: [512]u8 = undefined;
+
+        if (std.c.getenv("XCURSOR_PATH")) |env_path| {
+            var it = std.mem.splitScalar(u8, std.mem.span(env_path), ':');
+            while (it.next()) |dir| {
+                if (dir.len == 0) continue;
+                for (themes) |theme| {
+                    for (names) |name| {
+                        const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}/cursors/{s}", .{ dir, theme, name }) catch continue;
+                        if (readCursorFile(path, target_size)) |cur| return cur;
+                    }
+                }
+            }
+        }
+
+        const static_dirs = [_][]const u8{
+            "/run/current-system/sw/share/icons",
+            "/usr/share/icons",
+            "/usr/local/share/icons",
+        };
+
+        for (themes) |theme| {
+            if (std.c.getenv("HOME")) |home_ptr| {
+                const home = std.mem.span(home_ptr);
+                const user_dirs = [_][]const u8{ ".icons", ".local/share/icons" };
+                for (user_dirs) |sub| {
+                    for (names) |name| {
+                        const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}/{s}/cursors/{s}", .{ home, sub, theme, name }) catch continue;
+                        if (readCursorFile(path, target_size)) |cur| return cur;
+                    }
+                }
+            }
+
+            for (static_dirs) |dir| {
+                for (names) |name| {
+                    const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}/cursors/{s}", .{ dir, theme, name }) catch continue;
+                    if (readCursorFile(path, target_size)) |cur| return cur;
+                }
+            }
+
+            if (std.c.getenv("XDG_DATA_DIRS")) |xdg_dirs| {
+                var it = std.mem.splitScalar(u8, std.mem.span(xdg_dirs), ':');
+                while (it.next()) |data_dir| {
+                    if (data_dir.len == 0) continue;
+                    for (names) |name| {
+                        const path = std.fmt.bufPrintZ(&path_buf, "{s}/icons/{s}/cursors/{s}", .{ data_dir, theme, name }) catch continue;
+                        if (readCursorFile(path, target_size)) |cur| return cur;
+                    }
+                }
+            }
+        }
+
+        return loadEmbeddedCursor(kind);
     }
 
     fn setupCursor(self: *WaylandClient) !void {
         self.cursor_surface_id = self.allocId();
         try self.sendMsg(self.compositor_id, 0, .{self.cursor_surface_id});
         inline for (std.meta.tags(Cursor)) |kind| {
-            const buffer = try self.createShmBuffer(24, 24, 0); // ARGB8888
-            drawCursor(buffer.pixels, kind);
-            self.cursor_buffers[self.cursor_buffer_count] = buffer;
-            self.cursor_buffer_count += 1;
+            const parsed = loadCursorData(kind);
+            const buffer = try self.createShmBuffer(parsed.width, parsed.height, 0); // ARGB8888
+            const len = @as(usize, parsed.width) * parsed.height;
+            @memcpy(buffer.pixels[0..len], parsed.pixels[0..len]);
+            self.cursor_items[self.cursor_count] = .{
+                .buffer = buffer,
+                .hotspot_x = parsed.hotspot_x,
+                .hotspot_y = parsed.hotspot_y,
+            };
+            self.cursor_count += 1;
         }
     }
 
     pub fn setCursor(self: *WaylandClient, kind: Cursor) !void {
         const serial = self.pointer_enter_serial orelse return;
         if (self.current_cursor == kind) return;
-        const buffer = self.cursor_buffers[@intFromEnum(kind)];
-        const hotspot: i32 = if (kind == .arrow) 0 else 12;
-        try self.sendMsg(self.cursor_surface_id, 1, .{ buffer.id, @as(i32, 0), @as(i32, 0) });
-        try self.sendMsg(self.cursor_surface_id, 2, .{ @as(i32, 0), @as(i32, 0), @as(i32, 24), @as(i32, 24) });
+        const item = self.cursor_items[@intFromEnum(kind)];
+        try self.sendMsg(self.cursor_surface_id, 1, .{ item.buffer.id, @as(i32, 0), @as(i32, 0) });
+        try self.sendMsg(self.cursor_surface_id, 2, .{ @as(i32, 0), @as(i32, 0), @as(i32, @intCast(item.buffer.width)), @as(i32, @intCast(item.buffer.height)) });
         try self.sendMsg(self.cursor_surface_id, 6, .{});
-        try self.sendMsg(self.pointer_id, 0, .{ serial, self.cursor_surface_id, hotspot, hotspot });
+        try self.sendMsg(self.pointer_id, 0, .{ serial, self.cursor_surface_id, item.hotspot_x, item.hotspot_y });
         self.current_cursor = kind;
     }
 
@@ -628,4 +776,30 @@ test "pointer coordinates use Wayland fixed-point fields and track enter before 
     client.recv_len = release.len;
     try std.testing.expect(client.parseNextEvent() == null);
     try std.testing.expect(!client.buffers.items[0].busy);
+}
+
+test "loadCursorData retrieves GNOME Adwaita cursor geometry and non-empty pixels" {
+    inline for (std.meta.tags(Cursor)) |kind| {
+        const cur = WaylandClient.loadCursorData(kind);
+        try std.testing.expect(cur.width >= 24 and cur.height >= 24);
+        var non_zero: usize = 0;
+        for (cur.pixels[0 .. cur.width * cur.height]) |p| {
+            if (p != 0) non_zero += 1;
+        }
+        try std.testing.expect(non_zero > 0);
+        switch (kind) {
+            .arrow => {
+                try std.testing.expectEqual(@as(i32, 3), cur.hotspot_x);
+                try std.testing.expectEqual(@as(i32, 1), cur.hotspot_y);
+            },
+            .text => {
+                try std.testing.expectEqual(@as(i32, 11), cur.hotspot_x);
+                try std.testing.expectEqual(@as(i32, 12), cur.hotspot_y);
+            },
+            .crosshair => {
+                try std.testing.expectEqual(@as(i32, 11), cur.hotspot_x);
+                try std.testing.expectEqual(@as(i32, 11), cur.hotspot_y);
+            },
+        }
+    }
 }
