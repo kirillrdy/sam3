@@ -1,4 +1,5 @@
 const std = @import("std");
+const sam3 = @import("sam3.zig");
 
 pub const Asset = struct {
     name: []const u8,
@@ -29,6 +30,52 @@ pub const CachedAssets = struct {
         self.* = undefined;
     }
 };
+
+pub const LoadedModel = struct {
+    model: sam3.Model,
+    cached: CachedAssets,
+
+    pub fn deinit(self: *LoadedModel) void {
+        self.model.deinit();
+        self.cached.deinit();
+    }
+};
+
+pub fn loadDefaultModel(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    use_zig_http: bool,
+) !LoadedModel {
+    var cached = try cacheAssets(allocator, io, environ, use_zig_http);
+    errdefer cached.deinit();
+
+    const tokenizer_json = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        cached.paths[9],
+        allocator,
+        .limited(8 * 1024 * 1024),
+    );
+    defer allocator.free(tokenizer_json);
+
+    const model = sam3.Model.open(allocator, io, .{
+        .vision_encoder = cached.paths[0],
+        .decoder = cached.paths[2],
+        .concept_vision_encoder = cached.paths[4],
+        .concept_text_encoder = cached.paths[6],
+        .concept_decoder = cached.paths[8],
+        .concept_tokenizer_json = tokenizer_json,
+    }) catch |err| {
+        const last = sam3.onnx.lastError();
+        std.debug.print("Failed to initialize model: {t}{s}{s}\n", .{ err, if (last.len > 0) ": " else "", last });
+        return err;
+    };
+
+    return .{
+        .model = model,
+        .cached = cached,
+    };
+}
 
 pub fn cacheAssets(
     allocator: std.mem.Allocator,

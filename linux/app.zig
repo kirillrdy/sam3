@@ -315,12 +315,19 @@ pub const App = struct {
             return;
         };
 
-        var masks = self.model.decode(embedding, self.points[0..self.points_len]) catch |err| {
+        const decode_started = std.Io.Timestamp.now(self.io, .awake);
+        const masks = self.model.decode(embedding, self.points[0..self.points_len]) catch |err| {
             std.debug.print("Decoder failed: {t}\n", .{err});
             self.setStatus("Segmentation failed");
             self.is_busy = false;
             return;
         };
+        const decode_elapsed = secondsSince(self.io, decode_started);
+        std.debug.print("  {d} point(s) -> {d} masks in {d:.2} s\n", .{
+            self.points_len,
+            masks.count,
+            decode_elapsed,
+        });
 
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
@@ -332,23 +339,7 @@ pub const App = struct {
             self.allocator.free(self.coverages);
             self.coverages = self.allocator.alloc(f32, masks.count) catch &.{};
         }
-
-        const stride = masks.width * masks.height;
-        var best_idx: usize = 0;
-        for (0..masks.count) |i| {
-            const plane = masks.logits[i * stride ..][0..stride];
-            var covered: usize = 0;
-            for (plane) |logit| {
-                if (logit > 0.0) covered += 1;
-            }
-            if (self.coverages.len > i) {
-                self.coverages[i] = @as(f32, @floatFromInt(covered)) / @as(f32, @floatFromInt(stride));
-            }
-            if (masks.scores[i] > masks.scores[best_idx]) {
-                best_idx = i;
-            }
-        }
-        self.best_mask_idx = @intCast(best_idx);
+        self.best_mask_idx = @intCast(render.scoreMasks(masks.logits, masks.scores, masks.count, masks.width, masks.height, self.coverages));
         self.selected_mask = self.best_mask_idx;
 
         self.renderComposite(self.selected_mask);
@@ -412,12 +403,19 @@ pub const App = struct {
             return;
         };
 
-        var masks = self.model.lookup(concept_embedding, phrase, 0.5) catch |err| {
+        const lookup_started = std.Io.Timestamp.now(self.io, .awake);
+        const masks = self.model.lookup(concept_embedding, phrase, 0.5) catch |err| {
             std.debug.print("Lookup failed: {t}\n", .{err});
             self.setStatus("Lookup failed");
             self.is_busy = false;
             return;
         };
+        const lookup_elapsed = secondsSince(self.io, lookup_started);
+        std.debug.print("  \"{s}\" -> {d} object(s) in {d:.2} s\n", .{
+            phrase,
+            masks.count,
+            lookup_elapsed,
+        });
 
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
@@ -438,22 +436,7 @@ pub const App = struct {
                 self.allocator.free(self.coverages);
                 self.coverages = self.allocator.alloc(f32, masks.count) catch &.{};
             }
-            const stride = masks.width * masks.height;
-            var best_idx: usize = 0;
-            for (0..masks.count) |i| {
-                const plane = masks.logits[i * stride ..][0..stride];
-                var covered: usize = 0;
-                for (plane) |logit| {
-                    if (logit > 0.0) covered += 1;
-                }
-                if (self.coverages.len > i) {
-                    self.coverages[i] = @as(f32, @floatFromInt(covered)) / @as(f32, @floatFromInt(stride));
-                }
-                if (masks.scores[i] > masks.scores[best_idx]) {
-                    best_idx = i;
-                }
-            }
-            self.best_mask_idx = @intCast(best_idx);
+            self.best_mask_idx = @intCast(render.scoreMasks(masks.logits, masks.scores, masks.count, masks.width, masks.height, self.coverages));
             self.selected_mask = self.best_mask_idx;
             self.renderComposite(self.selected_mask);
 
@@ -498,47 +481,34 @@ pub const App = struct {
         }
 
         const img = self.image orelse return error.NoImageLoaded;
+        const started = std.Io.Timestamp.now(self.io, .awake);
         const embedding = if (concept) try self.model.encodeConcept(img) else try self.model.encode(img);
+        std.debug.print("  {s}encoded {d}x{d} in {d:.2} s\n", .{
+            if (concept) "concept-" else "",
+            img.width,
+            img.height,
+            secondsSince(self.io, started),
+        });
         cache.* = .{ .embedding = embedding };
         return embedding;
     }
 
     fn renderComposite(self: *App, mask_index: i32) void {
         const img = self.image orelse return;
-        var canvas = zigimg.Image.create(self.allocator, img.width, img.height, .rgb24) catch return;
-        defer canvas.deinit(self.allocator);
-        @memcpy(canvas.pixels.rgb24, img.pixels.rgb24);
-
+        var plane: ?[]const f32 = null;
+        var mw: usize = 0;
+        var mh: usize = 0;
         if (mask_index >= 0 and self.masks != null) {
             const masks = self.masks.?;
             const u_index: usize = @intCast(mask_index);
             if (u_index < masks.count) {
                 const stride = masks.width * masks.height;
-                const plane = masks.logits[u_index * stride ..][0..stride];
-                if (render.bilinear(
-                    self.allocator,
-                    plane,
-                    masks.width,
-                    masks.height,
-                    img.width,
-                    img.height,
-                )) |resampled| {
-                    defer self.allocator.free(resampled);
-                    render.overlayMask(&canvas, resampled, render.mask_color, render.mask_alpha);
-                } else |_| {}
+                plane = masks.logits[u_index * stride ..][0..stride];
+                mw = masks.width;
+                mh = masks.height;
             }
         }
-
-        for (self.points[0..self.points_len]) |p| {
-            render.drawPointMarker(&canvas, p, render.marker_radius);
-        }
-
-        for (canvas.pixels.rgb24, 0..) |px, i| {
-            self.frame[i * 4 + 0] = px.r;
-            self.frame[i * 4 + 1] = px.g;
-            self.frame[i * 4 + 2] = px.b;
-            self.frame[i * 4 + 3] = 255;
-        }
+        render.compositeRgba(self.allocator, img, self.frame, plane, mw, mh, self.points[0..self.points_len]);
     }
 
     fn redraw(self: *App) void {
