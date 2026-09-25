@@ -1,6 +1,6 @@
 const std = @import("std");
 const sam3 = @import("sam3");
-const render = @import("render.zig");
+const render = sam3.render;
 const zigimg = @import("zigimg");
 
 pub const SamCallbacks = extern struct {
