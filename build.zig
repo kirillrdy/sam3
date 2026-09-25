@@ -130,8 +130,6 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", b.fmt("Run the web UI on http://{s}:{d}/", .{ host, port }));
     const run_cmd = b.addRunArtifact(web_exe);
     run_step.dependOn(&run_cmd.step);
-
-    run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.setCwd(b.path("."));
 
     if (target.result.os.tag.isDarwin()) {
@@ -166,7 +164,6 @@ pub fn build(b: *std.Build) void {
         const run_macos_step = b.step("run-macos", "Run the native macOS UI");
         const run_macos_cmd = b.addRunArtifact(macos_exe);
         run_macos_step.dependOn(&run_macos_cmd.step);
-        run_macos_cmd.step.dependOn(b.getInstallStep());
         run_macos_cmd.setCwd(b.path("."));
     }
 
@@ -193,7 +190,6 @@ pub fn build(b: *std.Build) void {
         const run_wayland_step = b.step("run-wayland", "Run the native Wayland UI");
         const run_wayland_cmd = b.addRunArtifact(wayland_exe);
         run_wayland_step.dependOn(&run_wayland_cmd.step);
-        run_wayland_cmd.step.dependOn(b.getInstallStep());
         run_wayland_cmd.setCwd(b.path("."));
 
         if (target.result.os.tag == .linux) {
