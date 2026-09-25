@@ -9,6 +9,16 @@ pub const WaylandEvent = union(enum) {
 };
 
 pub const WaylandClient = struct {
+    const ShmBuffer = struct {
+        id: u32,
+        pool_id: u32,
+        fd: std.posix.fd_t,
+        pixels: []u32,
+        width: u32,
+        height: u32,
+        busy: bool = false,
+    };
+
     allocator: std.mem.Allocator,
     socket_fd: std.posix.fd_t,
 
@@ -22,13 +32,11 @@ pub const WaylandClient = struct {
     surface_id: u32 = 0,
     xdg_surface_id: u32 = 0,
     xdg_toplevel_id: u32 = 0,
-    shm_pool_id: u32 = 0,
-    buffer_id: u32 = 0,
     pointer_id: u32 = 0,
     keyboard_id: u32 = 0,
 
-    shm_fd: std.posix.fd_t = -1,
-    shm_size: usize = 0,
+    buffers: std.ArrayList(ShmBuffer) = .empty,
+    frame_index: ?usize = null,
     pixels: []u32 = &.{},
 
     width: u32 = 1000,
@@ -132,54 +140,94 @@ pub const WaylandClient = struct {
     }
 
     pub fn deinit(self: *WaylandClient) void {
-        if (self.pixels.len > 0) {
-            std.posix.munmap(@alignCast(std.mem.sliceAsBytes(self.pixels)));
-        }
-        if (self.shm_fd >= 0) _ = std.c.close(self.shm_fd);
+        for (self.buffers.items) |buffer| self.destroyBuffer(buffer);
+        self.buffers.deinit(self.allocator);
         _ = std.c.close(self.socket_fd);
     }
 
     pub fn resizeShmBuffer(self: *WaylandClient, w: u32, h: u32) !void {
         self.width = w;
         self.height = h;
+        self.frame_index = null;
+        self.pixels = &.{};
+        self.discardUnusedBuffers();
+        try self.createBuffer(w, h);
+    }
 
-        if (self.pixels.len > 0) {
-            std.posix.munmap(@alignCast(std.mem.sliceAsBytes(self.pixels)));
-            self.pixels = &.{};
-        }
-        if (self.shm_fd >= 0) {
-            _ = std.c.close(self.shm_fd);
-            self.shm_fd = -1;
-        }
-
+    fn createBuffer(self: *WaylandClient, w: u32, h: u32) !void {
         const stride = w * 4;
         const size = stride * h;
-        self.shm_size = size;
 
         const name = "sam3-wl-shm";
         const res = std.os.linux.syscall2(.memfd_create, @intFromPtr(name), 0);
         const fd: std.posix.fd_t = @intCast(res);
         if (fd < 0) return error.MemfdFailed;
-        self.shm_fd = fd;
+        errdefer _ = std.c.close(fd);
 
         if (std.c.ftruncate(fd, @intCast(size)) != 0) return error.FtruncateFailed;
 
         const mmap_ptr = try std.posix.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
-        self.pixels = @alignCast(std.mem.bytesAsSlice(u32, mmap_ptr));
+        const pixels: []u32 = @alignCast(std.mem.bytesAsSlice(u32, mmap_ptr));
+        errdefer std.posix.munmap(@alignCast(std.mem.sliceAsBytes(pixels)));
 
         // Create pool & buffer
-        self.shm_pool_id = self.allocId();
-        try self.sendCreatePool(self.shm_id, self.shm_pool_id, fd, @intCast(size));
+        const pool_id = self.allocId();
+        try self.sendCreatePool(self.shm_id, pool_id, fd, @intCast(size));
 
-        self.buffer_id = self.allocId();
+        const buffer_id = self.allocId();
         // format 1 = WL_SHM_FORMAT_XRGB8888
-        try self.sendMsg(self.shm_pool_id, 0, .{ self.buffer_id, @as(i32, 0), @as(i32, @intCast(w)), @as(i32, @intCast(h)), @as(i32, @intCast(stride)), @as(u32, 1) });
+        try self.sendMsg(pool_id, 0, .{ buffer_id, @as(i32, 0), @as(i32, @intCast(w)), @as(i32, @intCast(h)), @as(i32, @intCast(stride)), @as(u32, 1) });
+        try self.buffers.append(self.allocator, .{ .id = buffer_id, .pool_id = pool_id, .fd = fd, .pixels = pixels, .width = w, .height = h });
+    }
+
+    fn destroyBuffer(self: *WaylandClient, buffer: ShmBuffer) void {
+        self.sendMsg(buffer.id, 0, .{}) catch {}; // wl_buffer.destroy
+        self.sendMsg(buffer.pool_id, 1, .{}) catch {}; // wl_shm_pool.destroy
+        std.posix.munmap(@alignCast(std.mem.sliceAsBytes(buffer.pixels)));
+        _ = std.c.close(buffer.fd);
+    }
+
+    fn discardUnusedBuffers(self: *WaylandClient) void {
+        var i: usize = 0;
+        while (i < self.buffers.items.len) {
+            const buffer = self.buffers.items[i];
+            if (!buffer.busy and (buffer.width != self.width or buffer.height != self.height)) {
+                self.destroyBuffer(buffer);
+                _ = self.buffers.orderedRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    pub fn beginFrame(self: *WaylandClient) !bool {
+        self.discardUnusedBuffers();
+        var matching: usize = 0;
+        for (self.buffers.items, 0..) |buffer, i| {
+            if (buffer.width == self.width and buffer.height == self.height) {
+                matching += 1;
+                if (!buffer.busy) {
+                    self.frame_index = i;
+                    self.pixels = buffer.pixels;
+                    return true;
+                }
+            }
+        }
+        if (matching >= 2) return false;
+        try self.createBuffer(self.width, self.height);
+        self.frame_index = self.buffers.items.len - 1;
+        self.pixels = self.buffers.items[self.frame_index.?].pixels;
+        return true;
     }
 
     pub fn commitFrame(self: *WaylandClient) !void {
-        try self.sendMsg(self.surface_id, 1, .{ self.buffer_id, @as(i32, 0), @as(i32, 0) });
+        const index = self.frame_index orelse return error.NoFrame;
+        try self.sendMsg(self.surface_id, 1, .{ self.buffers.items[index].id, @as(i32, 0), @as(i32, 0) });
         try self.sendMsg(self.surface_id, 2, .{ @as(i32, 0), @as(i32, 0), @as(i32, @intCast(self.width)), @as(i32, @intCast(self.height)) });
         try self.sendMsg(self.surface_id, 6, .{});
+        self.buffers.items[index].busy = true;
+        self.frame_index = null;
+        self.pixels = &.{};
     }
 
     pub fn pollEvent(self: *WaylandClient, timeout_ms: i32) !?WaylandEvent {
@@ -314,10 +362,30 @@ pub const WaylandClient = struct {
                 return .close;
             }
 
-            // Pointer motion
-            if (id == self.pointer_id and opcode == 2 and size >= 16) {
-                const raw_x = std.mem.readInt(i32, msg_bytes[8..12], .little);
-                const raw_y = std.mem.readInt(i32, msg_bytes[12..16], .little);
+            // wl_buffer.release: the compositor has finished reading these pixels.
+            if (opcode == 0 and size == 8) {
+                for (self.buffers.items) |*buffer| {
+                    if (id == buffer.id) {
+                        buffer.busy = false;
+                        break;
+                    }
+                }
+            }
+
+            // Pointer enter supplies the coordinates of the first click, even if
+            // there has not yet been a motion event.
+            if (id == self.pointer_id and opcode == 0 and size >= 24) {
+                const raw_x = std.mem.readInt(i32, msg_bytes[16..20], .little);
+                const raw_y = std.mem.readInt(i32, msg_bytes[20..24], .little);
+                self.pointer_x = @as(f32, @floatFromInt(raw_x)) / 256.0;
+                self.pointer_y = @as(f32, @floatFromInt(raw_y)) / 256.0;
+                continue;
+            }
+
+            // wl_pointer.motion is (time, surface_x, surface_y).
+            if (id == self.pointer_id and opcode == 2 and size >= 20) {
+                const raw_x = std.mem.readInt(i32, msg_bytes[12..16], .little);
+                const raw_y = std.mem.readInt(i32, msg_bytes[16..20], .little);
                 self.pointer_x = @as(f32, @floatFromInt(raw_x)) / 256.0;
                 self.pointer_y = @as(f32, @floatFromInt(raw_y)) / 256.0;
                 return .{ .pointer_motion = .{ .x = self.pointer_x, .y = self.pointer_y } };
@@ -424,3 +492,48 @@ pub const WaylandClient = struct {
         if (sent < 0) return error.SendFailed;
     }
 };
+
+test "pointer coordinates use Wayland fixed-point fields and track enter before motion" {
+    var client: WaylandClient = .{
+        .allocator = std.testing.allocator,
+        .socket_fd = -1,
+        .pointer_id = 7,
+    };
+    try client.buffers.append(std.testing.allocator, .{
+        .id = 8, .pool_id = 9, .fd = -1, .pixels = &.{}, .width = 1, .height = 1, .busy = true,
+    });
+    defer client.buffers.deinit(std.testing.allocator);
+
+    // wl_pointer.enter(serial, surface, surface_x, surface_y)
+    var enter: [24]u8 = @splat(0);
+    std.mem.writeInt(u32, enter[0..4], 7, .little);
+    std.mem.writeInt(u32, enter[4..8], 24 << 16, .little);
+    std.mem.writeInt(i32, enter[16..20], 120 * 256, .little);
+    std.mem.writeInt(i32, enter[20..24], 80 * 256, .little);
+    @memcpy(client.recv_buf[0..enter.len], &enter);
+    client.recv_len = enter.len;
+    try std.testing.expect(client.parseNextEvent() == null);
+    try std.testing.expectEqual(@as(f32, 120), client.pointer_x);
+    try std.testing.expectEqual(@as(f32, 80), client.pointer_y);
+
+    // wl_pointer.motion(time, surface_x, surface_y): time must not become X.
+    var motion: [20]u8 = @splat(0);
+    std.mem.writeInt(u32, motion[0..4], 7, .little);
+    std.mem.writeInt(u32, motion[4..8], (20 << 16) | 2, .little);
+    std.mem.writeInt(u32, motion[8..12], 999_999, .little);
+    std.mem.writeInt(i32, motion[12..16], 42 * 256 + 128, .little);
+    std.mem.writeInt(i32, motion[16..20], 31 * 256, .little);
+    @memcpy(client.recv_buf[0..motion.len], &motion);
+    client.recv_len = motion.len;
+    const event = client.parseNextEvent().?;
+    try std.testing.expectEqual(@as(f32, 42.5), event.pointer_motion.x);
+    try std.testing.expectEqual(@as(f32, 31), event.pointer_motion.y);
+
+    var release: [8]u8 = @splat(0);
+    std.mem.writeInt(u32, release[0..4], 8, .little);
+    std.mem.writeInt(u32, release[4..8], 8 << 16, .little);
+    @memcpy(client.recv_buf[0..release.len], &release);
+    client.recv_len = release.len;
+    try std.testing.expect(client.parseNextEvent() == null);
+    try std.testing.expect(!client.buffers.items[0].busy);
+}

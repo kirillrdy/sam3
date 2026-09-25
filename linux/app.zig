@@ -90,9 +90,19 @@ pub const App = struct {
         // Open sample image by default
         self.openImageFromPath(self.example_path);
 
+        var pending_width = self.client.width;
+        var pending_height = self.client.height;
         while (true) {
-            self.redraw();
-            try self.client.commitFrame();
+            if (pending_width != self.client.width or pending_height != self.client.height) {
+                try self.client.resizeShmBuffer(pending_width, pending_height);
+            }
+            // Draw only into a buffer released by the compositor.
+            if (try self.client.beginFrame()) {
+                self.mutex.lock(self.io) catch return;
+                self.redraw();
+                self.mutex.unlock(self.io);
+                try self.client.commitFrame();
+            }
 
             // Poll events with timeout
             const ev_opt = try self.client.pollEvent(16);
@@ -100,10 +110,9 @@ pub const App = struct {
                 switch (ev) {
                     .close => break,
                     .configure => |cfg| {
-                        if (cfg.width > 0 and cfg.height > 0 and (cfg.width != self.client.width or cfg.height != self.client.height)) {
-                            try self.client.resizeShmBuffer(cfg.width, cfg.height);
-                            self.canvas_w = if (self.client.width > 32) self.client.width - 32 else 100;
-                            self.canvas_h = if (self.client.height > 180) self.client.height - 180 else 100;
+                        if (cfg.width > 0 and cfg.height > 0) {
+                            pending_width = cfg.width;
+                            pending_height = cfg.height;
                         }
                     },
                     .pointer_button => |btn| {
