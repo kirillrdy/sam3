@@ -4,6 +4,7 @@ pub const onnx = @import("onnx");
 pub const zimo = @import("zimo");
 const here = zimo.bind(@This(), @embedFile("sam3.zig"));
 threadlocal var active_model: ?*Model = null;
+threadlocal var active_concept_embedding: ?ConceptEmbedding = null;
 pub const tokenizer = @import("tokenizer.zig");
 pub const assets = @import("assets.zig");
 pub const render = @import("render.zig");
@@ -184,7 +185,8 @@ pub const Model = struct {
 
         const raw = img.rawBytes();
         const data = try here.call(.encodeConceptVision, .{ self.allocator, self.paths.concept_vision_encoder, raw, img.width, img.height });
-        return ConceptEmbedding.init(self.allocator, data);
+        const image_hash = std.hash.XxHash3.hash(0, raw);
+        return ConceptEmbedding.init(self.allocator, data, image_hash);
     }
 
     pub fn encodeText(self: *Model, phrase: []const u8) !TextEmbedding {
@@ -196,31 +198,19 @@ pub const Model = struct {
     }
 
     pub fn lookup(self: *Model, embedding: ConceptEmbedding, phrase: []const u8, threshold: f32) !Masks {
-        var text_embedding = try self.encodeText(phrase);
-        defer text_embedding.deinit();
+        active_model = self;
+        defer active_model = null;
+        active_concept_embedding = embedding;
+        defer active_concept_embedding = null;
 
-        const encoding = try self.concept_tokenizer.encode(phrase);
-        const token_shape = [_]i64{ 1, tokenizer.max_tokens };
-        const attention = try onnx.Value.borrowI64(&encoding.attention, &token_shape);
-        defer attention.deinit();
-
-        const inputs = [_]onnx.Value{
-            embedding.levels[0],
-            embedding.levels[1],
-            embedding.levels[2],
-            embedding.levels[6],
-            text_embedding.value,
-            attention,
-        };
-        var results: [concept_decoder_outputs.len]onnx.Value = undefined;
-        try self.concept_decoder.run(
-            &concept_decoder_inputs,
-            &inputs,
-            &concept_decoder_outputs,
-            &results,
-        );
-        defer for (results) |result| result.deinit();
-        return Masks.takeConcept(self.allocator, results[0], results[2], threshold);
+        const data = try here.call(.decodeConceptQuery, .{
+            self.allocator,
+            self.paths.concept_decoder,
+            embedding.image_hash,
+            phrase,
+            threshold,
+        });
+        return Masks.unpack(self.allocator, data);
     }
 };
 
@@ -251,8 +241,9 @@ pub const ConceptEmbedding = struct {
     allocator: std.mem.Allocator,
     data: []f32,
     levels: [concept_embedding_names.len]onnx.Value,
+    image_hash: u64 = 0,
 
-    pub fn init(allocator: std.mem.Allocator, data: []f32) !ConceptEmbedding {
+    pub fn init(allocator: std.mem.Allocator, data: []f32, image_hash: ?u64) !ConceptEmbedding {
         const offsets = [_]usize{
             0,
             21233664,
@@ -287,10 +278,12 @@ pub const ConceptEmbedding = struct {
         inline for (0..8) |i| {
             levels[i] = try onnx.Value.borrowF32(data[offsets[i]..][0..lens[i]], &shapes[i]);
         }
+        const effective_hash = if (image_hash) |h| (if (h != 0) h else std.hash.XxHash3.hash(0, std.mem.sliceAsBytes(data[0..@min(data.len, 1024)]))) else std.hash.XxHash3.hash(0, std.mem.sliceAsBytes(data[0..@min(data.len, 1024)]));
         return .{
             .allocator = allocator,
             .data = data,
             .levels = levels,
+            .image_hash = effective_hash,
         };
     }
 
@@ -442,6 +435,88 @@ pub fn encodeConceptText(
     return out;
 }
 
+pub fn decodeConceptQuery(
+    allocator: std.mem.Allocator,
+    model_id: []const u8,
+    image_hash: u64,
+    phrase: []const u8,
+    threshold: f32,
+) ![]f32 {
+    _ = model_id;
+    _ = image_hash;
+    const model = active_model orelse return error.NoActiveModel;
+    const embedding = active_concept_embedding orelse return error.NoActiveEmbedding;
+
+    var text_embedding = try model.encodeText(phrase);
+    defer text_embedding.deinit();
+
+    const encoding = try model.concept_tokenizer.encode(phrase);
+    const token_shape = [_]i64{ 1, tokenizer.max_tokens };
+    const attention = try onnx.Value.borrowI64(&encoding.attention, &token_shape);
+    defer attention.deinit();
+
+    const inputs = [_]onnx.Value{
+        embedding.levels[0],
+        embedding.levels[1],
+        embedding.levels[2],
+        embedding.levels[6],
+        text_embedding.value,
+        attention,
+    };
+    var results: [concept_decoder_outputs.len]onnx.Value = undefined;
+    try model.concept_decoder.run(
+        &concept_decoder_inputs,
+        &inputs,
+        &concept_decoder_outputs,
+        &results,
+    );
+    defer for (results) |result| result.deinit();
+
+    return packConceptResults(allocator, results[0], results[2], threshold);
+}
+
+fn packConceptResults(allocator: std.mem.Allocator, masks: onnx.Value, scores_value: onnx.Value, threshold: f32) ![]f32 {
+    var dims: [8]i64 = undefined;
+    const shape = try masks.shape(&dims);
+    if (shape.len != 4 or shape[0] != 1) return error.UnexpectedConceptMaskShape;
+
+    const available: usize = @intCast(shape[1]);
+    const height: usize = @intCast(shape[2]);
+    const width: usize = @intCast(shape[3]);
+    const planes = try masks.dataF32();
+    const raw_scores = try scores_value.dataF32();
+    if (raw_scores.len < available) return error.UnexpectedConceptScoreShape;
+
+    var count: usize = 0;
+    for (raw_scores[0..available]) |logit| {
+        const score = sigmoid(logit);
+        if (score >= threshold) count += 1;
+    }
+
+    const stride = width * height;
+    const total_floats = 4 + count + count * stride;
+    const out = try allocator.alloc(f32, total_floats);
+    errdefer allocator.free(out);
+
+    out[0] = @floatFromInt(count);
+    out[1] = @floatFromInt(width);
+    out[2] = @floatFromInt(height);
+
+    var max_score: f32 = 0;
+    var idx: usize = 0;
+    for (raw_scores[0..available], 0..) |logit, i| {
+        const score = sigmoid(logit);
+        if (score < threshold) continue;
+        if (idx == 0 or score > max_score) max_score = score;
+        out[4 + idx] = score;
+        @memcpy(out[4 + count + idx * stride ..][0..stride], planes[i * stride ..][0..stride]);
+        idx += 1;
+    }
+    out[3] = if (count == 0) 0 else max_score;
+
+    return out;
+}
+
 pub const Masks = struct {
     allocator: std.mem.Allocator,
 
@@ -452,6 +527,37 @@ pub const Masks = struct {
     height: usize,
 
     object_score: f32,
+
+    pub fn unpack(allocator: std.mem.Allocator, data: []f32) !Masks {
+        if (data.len < 4) return error.InvalidMaskData;
+        const count: usize = @intFromFloat(data[0]);
+        const width: usize = @intFromFloat(data[1]);
+        const height: usize = @intFromFloat(data[2]);
+        const object_score = data[3];
+        const stride = width * height;
+        const expected_len = 4 + count + count * stride;
+        if (data.len != expected_len) return error.InvalidMaskData;
+
+        const scores = try allocator.alloc(f32, count);
+        errdefer allocator.free(scores);
+        @memcpy(scores, data[4 .. 4 + count]);
+
+        const logits = try allocator.alloc(f32, count * stride);
+        errdefer allocator.free(logits);
+        @memcpy(logits, data[4 + count .. expected_len]);
+
+        allocator.free(data);
+
+        return .{
+            .allocator = allocator,
+            .logits = logits,
+            .scores = scores,
+            .count = count,
+            .width = width,
+            .height = height,
+            .object_score = object_score,
+        };
+    }
 
     fn take(allocator: std.mem.Allocator, iou: onnx.Value, masks: onnx.Value, object: onnx.Value) !Masks {
         var dims: [8]i64 = undefined;
@@ -641,4 +747,18 @@ test "zimo embedding caching" {
 
     try std.testing.expectEqual(text1.data.len, text2.data.len);
     try std.testing.expectEqualSlices(f32, text1.data, text2.data);
+
+    var concept1 = try loaded.model.encodeConcept(img);
+    defer concept1.deinit();
+
+    var masks1 = try loaded.model.lookup(concept1, "cat", 0.5);
+    defer masks1.deinit();
+
+    var masks2 = try loaded.model.lookup(concept1, "cat", 0.5);
+    defer masks2.deinit();
+
+    try std.testing.expectEqual(masks1.count, masks2.count);
+    try std.testing.expectEqual(masks1.width, masks2.width);
+    try std.testing.expectEqual(masks1.height, masks2.height);
+    try std.testing.expectEqualSlices(f32, masks1.scores, masks2.scores);
 }
