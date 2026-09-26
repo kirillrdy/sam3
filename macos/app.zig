@@ -40,7 +40,7 @@ pub const App = struct {
     image: ?zigimg.Image = null,
     frame: []u8 = &.{},
 
-    points: [max_points]sam3.render.Point = undefined,
+    points: [max_points]sam3.Point = undefined,
     points_len: usize = 0,
     click_mode_add: bool = true,
 
@@ -111,7 +111,7 @@ pub const App = struct {
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
 
-        var decoded = sam3.decode(self.allocator, bytes) catch |err| {
+        var decoded = sam3.decodeImage(self.allocator, bytes) catch |err| {
             std.debug.print("Failed to decode image: {t}\n", .{err});
             sam_macos_set_status("That file is not an image this can decode.");
             return;
@@ -154,7 +154,7 @@ pub const App = struct {
         self.points[self.points_len] = .{
             .x = std.math.clamp(norm_x, 0.0, 1.0),
             .y = std.math.clamp(norm_y, 0.0, 1.0),
-            .label = if (is_positive != 0) 1 else 0,
+            .label = if (is_positive != 0) .positive else .negative,
         };
         self.points_len += 1;
 
@@ -187,7 +187,7 @@ pub const App = struct {
         defer embedding.deinit();
 
         const decode_started = std.Io.Timestamp.now(self.io, .awake);
-        const masks = self.model.decode(embedding, self.points[0..self.points_len]) catch |err| {
+        const masks = self.model.segment(&embedding, self.points[0..self.points_len]) catch |err| {
             std.debug.print("Decoder failed: {t}: {s}\n", .{ err, sam3.onnx.lastError() });
             sam_macos_set_status("Segmentation failed");
             self.is_busy = false;
@@ -298,7 +298,7 @@ pub const App = struct {
         defer concept_embedding.deinit();
 
         const lookup_started = std.Io.Timestamp.now(self.io, .awake);
-        const masks = self.model.lookup(concept_embedding, phrase, 0.5) catch |err| {
+        const masks = self.model.find(&concept_embedding, phrase, .{ .min_score = 0.5 }) catch |err| {
             std.debug.print("Text lookup failed: {t}: {s}\n", .{ err, sam3.onnx.lastError() });
             sam_macos_set_status("Text lookup failed");
             self.is_busy = false;
@@ -391,10 +391,11 @@ pub const App = struct {
         sam_macos_set_status("Points cleared.");
     }
 
-    fn ensureEmbedding(self: *App, comptime concept: bool) !if (concept) sam3.ConceptEmbedding else sam3.Embedding {
+    fn ensureEmbedding(self: *App, comptime concept: bool) !if (concept) sam3.TextImageEmbedding else sam3.PointEmbedding {
         const img = self.image orelse return error.NoImageLoaded;
         const started = std.Io.Timestamp.now(self.io, .awake);
-        const embedding = if (concept) try self.model.encodeConcept(img) else try self.model.encode(img);
+        const rgb = sam3.RgbImage.fromImage(img);
+        const embedding = if (concept) try self.model.encodeForText(rgb) else try self.model.encodePoints(rgb);
         std.debug.print("  {s}encoded {d}x{d} in {d:.2} s\n", .{
             if (concept) "concept-" else "",
             img.width,
@@ -413,8 +414,7 @@ pub const App = struct {
             const masks = self.masks.?;
             const u_index: usize = @intCast(mask_index);
             if (u_index < masks.count) {
-                const stride = masks.width * masks.height;
-                plane = masks.logits[u_index * stride ..][0..stride];
+                plane = masks.plane(u_index);
                 mw = masks.width;
                 mh = masks.height;
             }

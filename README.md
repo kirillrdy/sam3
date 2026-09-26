@@ -11,6 +11,35 @@ The SAM 3 library runs inference directly; applications can add their own cachin
 - small binaries
 - target older GPUs  `-Dsm=sm_61`
 
+## Use as a Zig library
+
+Add this package as a Zig dependency and import its `sam3` module:
+
+```zig
+const sam3_dep = b.dependency("sam3", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("sam3", sam3_dep.module("sam3"));
+```
+
+`Model.open` downloads missing default model files into the cache and opens them.
+
+```zig
+var model = try sam3.Model.open(allocator, io);
+defer model.deinit();
+
+// rgb is borrowed, tightly packed RGB24 data: width * height * 3 bytes.
+const image: sam3.RgbImage = .{ .pixels = rgb, .width = width, .height = height };
+var embedding = try model.encodePoints(image);
+defer embedding.deinit();
+var masks = try model.segment(&embedding, &.{.{ .x = 0.5, .y = 0.5, .label = .positive }});
+defer masks.deinit();
+const first_mask = masks.plane(0); // Borrowed logits at masks.width x masks.height.
+```
+
+For text lookup, call `encodeForText(image)` once, then `find(&embedding, phrase,
+.{ .min_score = 0.5 })` for each phrase. Embeddings and masks own their memory;
+call `deinit` on each. The image only needs to remain valid during its encode
+call. Serialize inference calls when sharing a model between threads.
+
 ## Run the web UI
 
 ```sh

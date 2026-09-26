@@ -26,7 +26,7 @@ pub const App = struct {
     image: ?zigimg.Image = null,
     frame: []u8 = &.{},
 
-    points: [max_points]sam3.render.Point = undefined,
+    points: [max_points]sam3.Point = undefined,
     points_len: usize = 0,
     click_mode_add: bool = true,
 
@@ -198,7 +198,7 @@ pub const App = struct {
         self.mutex.lock(self.io) catch return false;
         defer self.mutex.unlock(self.io);
 
-        var decoded = sam3.decode(self.allocator, bytes) catch |err| {
+        var decoded = sam3.decodeImage(self.allocator, bytes) catch |err| {
             std.debug.print("Failed to decode image: {t}\n", .{err});
             self.setStatus("That file is not an image this can decode.");
             return false;
@@ -641,7 +641,7 @@ pub const App = struct {
         self.points[self.points_len] = .{
             .x = std.math.clamp(norm_x, 0.0, 1.0),
             .y = std.math.clamp(norm_y, 0.0, 1.0),
-            .label = if (is_positive != 0) 1 else 0,
+            .label = if (is_positive != 0) .positive else .negative,
         };
         self.points_len += 1;
 
@@ -670,7 +670,7 @@ pub const App = struct {
         defer embedding.deinit();
 
         const decode_started = std.Io.Timestamp.now(self.io, .awake);
-        const masks = self.model.decode(embedding, self.points[0..self.points_len]) catch |err| {
+        const masks = self.model.segment(&embedding, self.points[0..self.points_len]) catch |err| {
             std.debug.print("Decoder failed: {t}\n", .{err});
             self.setStatus("Segmentation failed");
             self.is_busy = false;
@@ -759,7 +759,7 @@ pub const App = struct {
         defer concept_embedding.deinit();
 
         const lookup_started = std.Io.Timestamp.now(self.io, .awake);
-        const masks = self.model.lookup(concept_embedding, phrase, 0.5) catch |err| {
+        const masks = self.model.find(&concept_embedding, phrase, .{ .min_score = 0.5 }) catch |err| {
             std.debug.print("Lookup failed: {t}\n", .{err});
             self.setStatus("Lookup failed");
             self.is_busy = false;
@@ -823,10 +823,11 @@ pub const App = struct {
         self.setStatus("Points cleared.");
     }
 
-    fn ensureEmbedding(self: *App, comptime concept: bool) !if (concept) sam3.ConceptEmbedding else sam3.Embedding {
+    fn ensureEmbedding(self: *App, comptime concept: bool) !if (concept) sam3.TextImageEmbedding else sam3.PointEmbedding {
         const img = self.image orelse return error.NoImageLoaded;
         const started = std.Io.Timestamp.now(self.io, .awake);
-        const embedding = if (concept) try self.model.encodeConcept(img) else try self.model.encode(img);
+        const rgb = sam3.RgbImage.fromImage(img);
+        const embedding = if (concept) try self.model.encodeForText(rgb) else try self.model.encodePoints(rgb);
         std.debug.print("  {s}encoded {d}x{d} in {f}\n", .{
             if (concept) "concept-" else "",
             img.width,
@@ -845,8 +846,7 @@ pub const App = struct {
             const masks = self.masks.?;
             const u_index: usize = @intCast(mask_index);
             if (u_index < masks.count) {
-                const stride = masks.width * masks.height;
-                plane = masks.logits[u_index * stride ..][0..stride];
+                plane = masks.plane(u_index);
                 mw = masks.width;
                 mh = masks.height;
             }
@@ -903,8 +903,7 @@ pub const App = struct {
                 const start = @max(selected.start, self.search_scroll);
                 const stop = @min(selected.end, end);
                 if (start < stop) {
-                    font.fillRect(pixels, stride, 24 + (start - self.search_scroll) * font.font_width, 81,
-                        (stop - start) * font.font_width, 22, 0x00335d50);
+                    font.fillRect(pixels, stride, 24 + (start - self.search_scroll) * font.font_width, 81, (stop - start) * font.font_width, 22, 0x00335d50);
                 }
             }
             font.drawText(pixels, stride, self.search_text[self.search_scroll..end], 24, 83, 0x00f2f4f6);
@@ -999,7 +998,7 @@ pub const App = struct {
         font.strokeRect(pixels, stride, x + 12, y + 46, w - 24, 28, 0x0000dc64);
         const path = self.browser_path[0..self.browser_path_len];
         const max_chars = (w - 42) / font.font_width;
-        font.drawText(pixels, stride, if (path.len == 0) "Type an absolute path" else path[path.len -| max_chars ..], x + 20, y + 52, if (path.len == 0) 0x008e949e else 0x00f2f4f6);
+        font.drawText(pixels, stride, if (path.len == 0) "Type an absolute path" else path[path.len -| max_chars..], x + 20, y + 52, if (path.len == 0) 0x008e949e else 0x00f2f4f6);
         const rows = browserVisibleRows(h);
         for (0..rows) |row| {
             const index = self.browser_scroll + row;
@@ -1076,10 +1075,27 @@ fn evdevToChar(key: u32, shift: bool, caps: bool) ?u8 {
     if (ch >= 'a' and ch <= 'z') return if (shift != caps) ch - 32 else ch;
     if (!shift) return ch;
     return switch (ch) {
-        '1' => '!', '2' => '@', '3' => '#', '4' => '$', '5' => '%',
-        '6' => '^', '7' => '&', '8' => '*', '9' => '(', '0' => ')',
-        '-' => '_', '=' => '+', '[' => '{', ']' => '}', ';' => ':',
-        '\'' => '"', '`' => '~', '\\' => '|', ',' => '<', '.' => '>', '/' => '?',
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        ';' => ':',
+        '\'' => '"',
+        '`' => '~',
+        '\\' => '|',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
         else => ch,
     };
 }

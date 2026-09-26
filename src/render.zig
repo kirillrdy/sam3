@@ -1,10 +1,6 @@
 const std = @import("std");
 const zigimg = @import("zigimg");
-pub const Point = struct {
-    x: f32,
-    y: f32,
-    label: i64 = 1,
-};
+pub const Point = @import("point.zig").Point;
 
 const Rgb24 = zigimg.color.Rgb24;
 
@@ -82,7 +78,7 @@ fn overlayMask(img: *zigimg.Image, mask: []const f32, color: Rgb24, alpha: f32) 
 fn drawPointMarker(img: *zigimg.Image, point: Point, radius: usize) void {
     const cx: isize = @intFromFloat(point.x * @as(f32, @floatFromInt(img.width)));
     const cy: isize = @intFromFloat(point.y * @as(f32, @floatFromInt(img.height)));
-    const color: Rgb24 = if (point.label == 1)
+    const color: Rgb24 = if (point.label == .positive)
         .{ .r = 0, .g = 255, .b = 0 }
     else
         .{ .r = 255, .g = 0, .b = 0 };
@@ -189,13 +185,13 @@ test "drawPointMarker draws positive green and negative red markers" {
 
     @memset(img.pixels.rgb24, .{ .r = 0, .g = 0, .b = 0 });
 
-    drawPointMarker(&img, .{ .x = 0.5, .y = 0.5, .label = 1 }, 2);
+    drawPointMarker(&img, .{ .x = 0.5, .y = 0.5, .label = .positive }, 2);
     const center_idx = 5 * 10 + 5;
     try std.testing.expectEqual(@as(u8, 0), img.pixels.rgb24[center_idx].r);
     try std.testing.expectEqual(@as(u8, 255), img.pixels.rgb24[center_idx].g);
     try std.testing.expectEqual(@as(u8, 0), img.pixels.rgb24[center_idx].b);
 
-    drawPointMarker(&img, .{ .x = 0.1, .y = 0.1, .label = 0 }, 1);
+    drawPointMarker(&img, .{ .x = 0.1, .y = 0.1, .label = .negative }, 1);
     const neg_idx = 1 * 10 + 1;
     try std.testing.expectEqual(@as(u8, 255), img.pixels.rgb24[neg_idx].r);
     try std.testing.expectEqual(@as(u8, 0), img.pixels.rgb24[neg_idx].g);
@@ -205,7 +201,7 @@ test "drawPointMarker draws positive green and negative red markers" {
 test "scoreMasks selects highest score and calculates coverage" {
     const logits = [_]f32{
         1.0, 1.0, -1.0, -1.0, // mask 0: 50%
-        1.0, 1.0,  1.0, -1.0, // mask 1: 75%
+        1.0, 1.0, 1.0, -1.0, // mask 1: 75%
     };
     const scores = [_]f32{ 0.7, 0.9 };
     var coverages: [2]f32 = undefined;

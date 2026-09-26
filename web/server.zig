@@ -137,7 +137,7 @@ const Server = struct {
         query: []const u8,
         body_buffer: []u8,
     ) !void {
-        var points: [max_points]sam3.render.Point = undefined;
+        var points: [max_points]sam3.Point = undefined;
         const prompt = parsePoints(query, &points) catch
             return request.respond("bad prompt\n", .{ .status = .bad_request });
         if (prompt.len == 0) {
@@ -163,7 +163,7 @@ const Server = struct {
         defer embedding.deinit();
 
         const started = Io.Timestamp.now(self.io, .awake);
-        var masks = self.model.decode(embedding, prompt) catch |err| {
+        var masks = self.model.segment(&embedding, prompt) catch |err| {
             std.debug.print("  ! decoder failed: {t}: {s}\n", .{ err, sam3.onnx.lastError() });
             return request.respond("segmentation failed\n", .{ .status = .internal_server_error });
         };
@@ -177,12 +177,13 @@ const Server = struct {
         return self.respondMasks(request, masks);
     }
 
-    fn encode(self: *Server, body: []const u8, comptime concept: bool) !(if (concept) sam3.ConceptEmbedding else sam3.Embedding) {
-        var img = try sam3.decode(self.gpa, body);
+    fn encode(self: *Server, body: []const u8, comptime concept: bool) !(if (concept) sam3.TextImageEmbedding else sam3.PointEmbedding) {
+        var img = try sam3.decodeImage(self.gpa, body);
         defer img.deinit(self.gpa);
 
         const started = Io.Timestamp.now(self.io, .awake);
-        const embedding = if (concept) try self.model.encodeConcept(img) else try self.model.encode(img);
+        const rgb = sam3.RgbImage.fromImage(img);
+        const embedding = if (concept) try self.model.encodeForText(rgb) else try self.model.encodePoints(rgb);
         std.debug.print("  {s}encoded {d}x{d} in {d:.2} s\n", .{
             if (concept) "concept-" else "",
             img.width,
@@ -223,7 +224,7 @@ const Server = struct {
         defer embedding.deinit();
 
         const started = Io.Timestamp.now(self.io, .awake);
-        var masks = self.model.lookup(embedding, phrase, 0.5) catch |err| {
+        var masks = self.model.find(&embedding, phrase, .{ .min_score = 0.5 }) catch |err| {
             std.debug.print("  ! text lookup failed: {t}: {s}\n", .{ err, sam3.onnx.lastError() });
             return request.respond("text lookup failed\n", .{ .status = .internal_server_error });
         };
@@ -282,7 +283,7 @@ fn parseText(query: []const u8, out: []u8) ![]const u8 {
     return "";
 }
 
-fn parsePoints(query: []const u8, out: []sam3.render.Point) ![]const sam3.render.Point {
+fn parsePoints(query: []const u8, out: []sam3.Point) ![]const sam3.Point {
     var count: usize = 0;
     var fields = std.mem.splitScalar(u8, query, '&');
     while (fields.next()) |field| {
@@ -298,7 +299,11 @@ fn parsePoints(query: []const u8, out: []sam3.render.Point) ![]const sam3.render
         out[count] = .{
             .x = try std.fmt.parseFloat(f32, x),
             .y = try std.fmt.parseFloat(f32, y),
-            .label = try std.fmt.parseInt(i64, label, 10),
+            .label = switch (try std.fmt.parseInt(i64, label, 10)) {
+                0 => .negative,
+                1 => .positive,
+                else => return error.MalformedPoint,
+            },
         };
         count += 1;
     }
@@ -336,29 +341,29 @@ fn secondsSince(io: Io, started: Io.Timestamp) f64 {
 }
 
 test "a prompt is read back as the points it names" {
-    var buffer: [8]sam3.render.Point = undefined;
+    var buffer: [8]sam3.Point = undefined;
 
     const points = try parsePoints("p=0.25,0.5,1&p=0.75,0.5,0", &buffer);
     try std.testing.expectEqual(@as(usize, 2), points.len);
     try std.testing.expectEqual(@as(f32, 0.25), points[0].x);
-    try std.testing.expectEqual(@as(i64, 1), points[0].label);
+    try std.testing.expectEqual(sam3.PointLabel.positive, points[0].label);
     try std.testing.expectEqual(@as(f32, 0.75), points[1].x);
-    try std.testing.expectEqual(@as(i64, 0), points[1].label);
+    try std.testing.expectEqual(sam3.PointLabel.negative, points[1].label);
 
     const defaulted = try parsePoints("mode=x&p=0.5,0.5", &buffer);
     try std.testing.expectEqual(@as(usize, 1), defaulted.len);
-    try std.testing.expectEqual(@as(i64, 1), defaulted[0].label);
+    try std.testing.expectEqual(sam3.PointLabel.positive, defaulted[0].label);
 
     try std.testing.expectEqual(@as(usize, 0), (try parsePoints("", &buffer)).len);
 }
 
 test "a malformed point is refused rather than guessed at" {
-    var buffer: [8]sam3.render.Point = undefined;
+    var buffer: [8]sam3.Point = undefined;
     try std.testing.expectError(error.MalformedPoint, parsePoints("p=0.5", &buffer));
     try std.testing.expectError(error.MalformedPoint, parsePoints("p=1,2,3,4", &buffer));
     try std.testing.expect(std.meta.isError(parsePoints("p=x,y,1", &buffer)));
 
-    var small: [1]sam3.render.Point = undefined;
+    var small: [1]sam3.Point = undefined;
     try std.testing.expectError(error.TooManyPoints, parsePoints("p=0,0,1&p=1,1,1", &small));
 }
 
