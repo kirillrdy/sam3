@@ -48,19 +48,35 @@ pub const Asset = struct {
     }
 };
 
-pub const assets = [_]Asset{
-    .{ .name = "vision_encoder.onnx", .url = "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/main/onnx/vision_encoder.onnx", .sha256 = "9f284aab8c3d8e81e9c79f7b566f9cea43b7bc9afdd920eee2390fb65b3db897" },
-    .{ .name = "vision_encoder.onnx_data", .url = "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/main/onnx/vision_encoder.onnx_data", .sha256 = "838e1f0b2d0394ed3bd3b3499775dd6676524e1dfc5a7371948a76dcb69e4dd3" },
-    .{ .name = "prompt_encoder_mask_decoder.onnx", .url = "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/main/onnx/prompt_encoder_mask_decoder.onnx", .sha256 = "4f9ac85291d634ae36a21ce940e3c09671cc05b6511966e5d3d96988b12b95f8" },
-    .{ .name = "prompt_encoder_mask_decoder.onnx_data", .url = "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/main/onnx/prompt_encoder_mask_decoder.onnx_data", .sha256 = "2d870726d484cb496760fd139c21f115cf1b945c6b69583489faa2ac79f1d2ae" },
-    .{ .name = "vision_encoder_int4.onnx", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/vision_encoder_int4.onnx", .sha256 = "88edb4602b7e7b2aa282543dea0b25a253bb13d5d7d5debbd19c2fb5e7941ae7" },
-    .{ .name = "vision_encoder_int4.onnx.data", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/vision_encoder_int4.onnx.data", .sha256 = "b89c9156064e926761f29be3f87b160fd34f4c93f1de46593295d155621829a2" },
-    .{ .name = "text_encoder_int4.onnx", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/text_encoder_int4.onnx", .sha256 = "92f824a1841b787dc8dafa8cb8e8dce0c874f8d2d629f6b1c8de88399ede3806" },
-    .{ .name = "text_encoder_int4.onnx.data", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/text_encoder_int4.onnx.data", .sha256 = "fcf5adcd6ad7b5155409367efde4ee981a5482fd5700191499a666ba4b637db5" },
-    .{ .name = "decoder_int4.onnx", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/decoder_int4.onnx", .sha256 = "2354b510382d025ab897fa158abe7da94d065c8f880d60aed35b01820361b06d" },
-    .{ .name = "tokenizer.json", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/tokenizer.json", .sha256 = "6d9109cc838977f3ca94a379eec36aecc7c807e1785cd729660ca2fc0171fb35" },
-    .{ .name = "cat.png", .url = "https://images.unsplash.com/photo-1514888286974-6c03e2ca1dba?w=800&fm=png", .sha256 = "dc6a561fc58bf60caff7a62cdd7593f5b517e43e4a75e9b220a80c3f1229ba3c" },
+pub const Assets = struct {
+    vision_encoder: Asset,
+    vision_encoder_data: Asset,
+    decoder: Asset,
+    decoder_data: Asset,
+    concept_vision_encoder: Asset,
+    concept_vision_encoder_data: Asset,
+    concept_text_encoder: Asset,
+    concept_text_encoder_data: Asset,
+    concept_decoder: Asset,
+    concept_tokenizer_json: Asset,
+    cat: Asset,
 };
+
+pub const default_assets: Assets = .{
+    .vision_encoder = .{ .name = "vision_encoder.onnx", .url = "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/main/onnx/vision_encoder.onnx", .sha256 = "9f284aab8c3d8e81e9c79f7b566f9cea43b7bc9afdd920eee2390fb65b3db897" },
+    .vision_encoder_data = .{ .name = "vision_encoder.onnx_data", .url = "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/main/onnx/vision_encoder.onnx_data", .sha256 = "838e1f0b2d0394ed3bd3b3499775dd6676524e1dfc5a7371948a76dcb69e4dd3" },
+    .decoder = .{ .name = "prompt_encoder_mask_decoder.onnx", .url = "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/main/onnx/prompt_encoder_mask_decoder.onnx", .sha256 = "4f9ac85291d634ae36a21ce940e3c09671cc05b6511966e5d3d96988b12b95f8" },
+    .decoder_data = .{ .name = "prompt_encoder_mask_decoder.onnx_data", .url = "https://huggingface.co/onnx-community/sam3-tracker-ONNX/resolve/main/onnx/prompt_encoder_mask_decoder.onnx_data", .sha256 = "2d870726d484cb496760fd139c21f115cf1b945c6b69583489faa2ac79f1d2ae" },
+    .concept_vision_encoder = .{ .name = "vision_encoder_int4.onnx", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/vision_encoder_int4.onnx", .sha256 = "88edb4602b7e7b2aa282543dea0b25a253bb13d5d7d5debbd19c2fb5e7941ae7" },
+    .concept_vision_encoder_data = .{ .name = "vision_encoder_int4.onnx.data", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/vision_encoder_int4.onnx.data", .sha256 = "b89c9156064e926761f29be3f87b160fd34f4c93f1de46593295d155621829a2" },
+    .concept_text_encoder = .{ .name = "text_encoder_int4.onnx", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/text_encoder_int4.onnx", .sha256 = "92f824a1841b787dc8dafa8cb8e8dce0c874f8d2d629f6b1c8de88399ede3806" },
+    .concept_text_encoder_data = .{ .name = "text_encoder_int4.onnx.data", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/text_encoder_int4.onnx.data", .sha256 = "fcf5adcd6ad7b5155409367efde4ee981a5482fd5700191499a666ba4b637db5" },
+    .concept_decoder = .{ .name = "decoder_int4.onnx", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/decoder_int4.onnx", .sha256 = "2354b510382d025ab897fa158abe7da94d065c8f880d60aed35b01820361b06d" },
+    .concept_tokenizer_json = .{ .name = "tokenizer.json", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/tokenizer.json", .sha256 = "6d9109cc838977f3ca94a379eec36aecc7c807e1785cd729660ca2fc0171fb35" },
+    .cat = .{ .name = "cat.png", .url = "https://images.unsplash.com/photo-1514888286974-6c03e2ca1dba?w=800&fm=png", .sha256 = "dc6a561fc58bf60caff7a62cdd7593f5b517e43e4a75e9b220a80c3f1229ba3c" },
+};
+
+pub const assets = default_assets;
 
 pub fn cacheDir(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]u8 {
     const home = environ.get("HOME") orelse return error.HomeNotSet;
@@ -75,56 +91,12 @@ pub fn loadDefaultModel(
 ) !sam3.Model {
     const cache_dir = try cacheDir(allocator, environ);
     defer allocator.free(cache_dir);
-    try std.Io.Dir.cwd().createDirPath(io, cache_dir);
 
-    var paths: [10][]u8 = undefined;
-    var initialized: usize = 0;
-    errdefer for (paths[0..initialized]) |path| allocator.free(path);
-
-    for (assets[0..10], 0..) |asset, i| {
-        paths[i] = try asset.get(allocator, io, cache_dir, use_zig_http);
-        initialized += 1;
-    }
-    defer for (paths) |path| allocator.free(path);
-
-    const tokenizer_json = try std.Io.Dir.cwd().readFileAlloc(
-        io,
-        paths[9],
-        allocator,
-        .limited(8 * 1024 * 1024),
-    );
-    defer allocator.free(tokenizer_json);
-
-    const model = sam3.Model.open(allocator, io, .{
-        .vision_encoder = paths[0],
-        .decoder = paths[2],
-        .concept_vision_encoder = paths[4],
-        .concept_text_encoder = paths[6],
-        .concept_decoder = paths[8],
-        .concept_tokenizer_json = tokenizer_json,
-    }) catch |err| {
+    return sam3.Model.open(allocator, io, cache_dir, default_assets, use_zig_http) catch |err| {
         const last = sam3.onnx.lastError();
         std.debug.print("Failed to initialize model: {t}{s}{s}\n", .{ err, if (last.len > 0) ": " else "", last });
         return err;
     };
-
-    return model;
-}
-
-pub fn cacheAssets(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    environ: *const std.process.Environ.Map,
-    use_zig_http: bool,
-) !void {
-    const cache_dir = try cacheDir(allocator, environ);
-    defer allocator.free(cache_dir);
-    try std.Io.Dir.cwd().createDirPath(io, cache_dir);
-
-    for (assets) |asset| {
-        const path = try asset.get(allocator, io, cache_dir, use_zig_http);
-        allocator.free(path);
-    }
 }
 
 fn download(
