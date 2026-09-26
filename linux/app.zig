@@ -6,6 +6,10 @@ const font = @import("font.zig");
 
 const render = sam3.render;
 const max_points = 32;
+const BrowserEntry = struct {
+    name: []u8,
+    is_dir: bool,
+};
 
 pub const App = struct {
     allocator: std.mem.Allocator,
@@ -17,6 +21,7 @@ pub const App = struct {
 
     mutex: std.Io.Mutex = .init,
     is_busy: bool = false,
+    redraw_pending: std.atomic.Value(bool) = .init(true),
 
     image: ?zigimg.Image = null,
     frame: []u8 = &.{},
@@ -39,6 +44,12 @@ pub const App = struct {
     search_caret: usize = 0,
     search_scroll: usize = 0,
     search_anchor: ?usize = null,
+    browser_open: bool = false,
+    browser_path: [4096]u8 = undefined,
+    browser_path_len: usize = 0,
+    browser_dir: []u8 = &.{},
+    browser_entries: std.ArrayList(BrowserEntry) = .empty,
+    browser_scroll: usize = 0,
     shift_down: bool = false,
     ctrl_down: bool = false,
     caps_lock: bool = false,
@@ -96,6 +107,9 @@ pub const App = struct {
         if (self.image) |*img| img.deinit(self.allocator);
         self.allocator.free(self.frame);
         self.allocator.free(self.coverages);
+        self.clearBrowserEntries();
+        self.browser_entries.deinit(self.allocator);
+        if (self.browser_dir.len > 0) self.allocator.free(self.browser_dir);
         self.client.deinit();
     }
 
@@ -103,20 +117,23 @@ pub const App = struct {
         const len = @min(text.len, self.status_text.len);
         @memcpy(self.status_text[0..len], text[0..len]);
         self.status_len = len;
+        self.redraw_pending.store(true, .release);
     }
 
     pub fn run(self: *App) !void {
         // Open sample image by default
-        self.openImageFromPath(self.example_path);
+        _ = self.openImageFromPath(self.example_path);
 
         self.pending_width = self.client.width;
         self.pending_height = self.client.height;
         while (true) {
             if (self.pending_width != self.client.width or self.pending_height != self.client.height) {
                 try self.client.resizeShmBuffer(self.pending_width, self.pending_height);
+                self.redraw_pending.store(true, .release);
             }
-            // Draw only into a buffer released by the compositor.
-            if (try self.client.beginFrame()) {
+            // Draw only when contents change, into a buffer released by the compositor.
+            if (self.redraw_pending.load(.acquire) and try self.client.beginFrame()) {
+                _ = self.redraw_pending.swap(false, .acq_rel);
                 self.mutex.lock(self.io) catch return;
                 self.redraw();
                 self.mutex.unlock(self.io);
@@ -129,6 +146,7 @@ pub const App = struct {
                 switch (ev) {
                     .close => break,
                     .configure => |cfg| {
+                        self.redraw_pending.store(true, .release);
                         self.is_maximized = cfg.maximized;
                         if (cfg.width > 0 and cfg.height > 0) {
                             if (!cfg.maximized) {
@@ -147,10 +165,12 @@ pub const App = struct {
                             if (try self.handlePointerClick(btn.x, btn.y, btn.button, btn.serial)) {
                                 break;
                             }
+                            self.redraw_pending.store(true, .release);
                         }
                     },
                     .keyboard_key => |k| {
                         self.handleKey(k.key, k.state);
+                        if (k.state == 1) self.redraw_pending.store(true, .release);
                     },
                     .pointer_motion => |motion| try self.updateCursor(motion.x, motion.y),
                 }
@@ -158,7 +178,7 @@ pub const App = struct {
         }
     }
 
-    pub fn openImageFromPath(self: *App, path: []const u8) void {
+    pub fn openImageFromPath(self: *App, path: []const u8) bool {
         const file_bytes = std.Io.Dir.cwd().readFileAlloc(
             self.io,
             path,
@@ -167,21 +187,21 @@ pub const App = struct {
         ) catch |err| {
             std.debug.print("Failed to read image file {s}: {t}\n", .{ path, err });
             self.setStatus("Could not open image file.");
-            return;
+            return false;
         };
         defer self.allocator.free(file_bytes);
 
-        self.openImageFromBytes(file_bytes);
+        return self.openImageFromBytes(file_bytes);
     }
 
-    pub fn openImageFromBytes(self: *App, bytes: []const u8) void {
-        self.mutex.lock(self.io) catch return;
+    pub fn openImageFromBytes(self: *App, bytes: []const u8) bool {
+        self.mutex.lock(self.io) catch return false;
         defer self.mutex.unlock(self.io);
 
         var decoded = sam3.decode(self.allocator, bytes) catch |err| {
             std.debug.print("Failed to decode image: {t}\n", .{err});
             self.setStatus("That file is not an image this can decode.");
-            return;
+            return false;
         };
 
         if (self.image) |*old| old.deinit(self.allocator);
@@ -199,7 +219,7 @@ pub const App = struct {
             self.image = null;
             self.frame = &.{};
             self.setStatus("Out of memory for frame buffer.");
-            return;
+            return false;
         };
 
         self.renderComposite(-1);
@@ -210,6 +230,73 @@ pub const App = struct {
             decoded.height,
         }) catch "Image loaded.";
         self.setStatus(msg);
+        return true;
+    }
+
+    fn clearBrowserEntries(self: *App) void {
+        for (self.browser_entries.items) |entry| self.allocator.free(entry.name);
+        self.browser_entries.clearRetainingCapacity();
+    }
+
+    fn browseDir(self: *App, path: []const u8) void {
+        const dir = std.Io.Dir.cwd().openDir(self.io, path, .{ .iterate = true }) catch {
+            self.setStatus("Cannot open that folder.");
+            return;
+        };
+        defer dir.close(self.io);
+
+        const owned = self.allocator.dupe(u8, path) catch return;
+        if (self.browser_dir.len > 0) self.allocator.free(self.browser_dir);
+        self.browser_dir = owned;
+        self.clearBrowserEntries();
+        self.browser_scroll = 0;
+        self.setBrowserPath(owned);
+
+        var it = dir.iterate();
+        while (it.next(self.io) catch null) |entry| {
+            if (entry.name.len == 0 or std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+            const is_dir = entry.kind == .directory;
+            const name = self.allocator.dupe(u8, entry.name) catch break;
+            self.browser_entries.append(self.allocator, .{ .name = name, .is_dir = is_dir }) catch {
+                self.allocator.free(name);
+                break;
+            };
+        }
+        std.mem.sort(BrowserEntry, self.browser_entries.items, {}, struct {
+            fn lessThan(_: void, a: BrowserEntry, b: BrowserEntry) bool {
+                if (a.is_dir != b.is_dir) return a.is_dir;
+                return std.ascii.lessThanIgnoreCase(a.name, b.name);
+            }
+        }.lessThan);
+    }
+
+    fn setBrowserPath(self: *App, path: []const u8) void {
+        self.browser_path_len = @min(path.len, self.browser_path.len);
+        @memcpy(self.browser_path[0..self.browser_path_len], path[0..self.browser_path_len]);
+    }
+
+    fn openBrowser(self: *App) void {
+        self.browser_open = true;
+        const home = if (std.c.getenv("HOME")) |value| std.mem.span(value) else "/";
+        self.browseDir(if (self.browser_dir.len > 0) self.browser_dir else home);
+    }
+
+    fn browserOpenPath(self: *App, path: []const u8) void {
+        const dir = std.Io.Dir.cwd().openDir(self.io, path, .{ .iterate = true }) catch null;
+        if (dir) |d| {
+            d.close(self.io);
+            self.browseDir(path);
+        } else if (self.openImageFromPath(path)) {
+            self.browser_open = false;
+        }
+    }
+
+    fn browserActivate(self: *App, index: usize) void {
+        if (index >= self.browser_entries.items.len) return;
+        const entry = self.browser_entries.items[index];
+        const path = std.fs.path.join(self.allocator, &.{ self.browser_dir, entry.name }) catch return;
+        defer self.allocator.free(path);
+        self.browserOpenPath(path);
     }
 
     fn getResizeEdge(self: *App, x: usize, y: usize) u32 {
@@ -304,6 +391,32 @@ pub const App = struct {
             return false;
         }
 
+        if (self.browser_open) {
+            if (button != 0x110) return false;
+            const bx: usize = 16;
+            const by: usize = 140;
+            const bw = @min(stride -| 32, 640);
+            const bh = @min(self.client.height -| 190, 420);
+            if (x >= bx + bw -| 92 and x < bx + bw -| 12 and y >= by + 8 and y < by + 36) {
+                self.browser_open = false;
+            } else if (x >= bx + 12 and x < bx + 92 and y >= by + 8 and y < by + 36) {
+                const parent = std.fs.path.dirname(self.browser_dir) orelse "/";
+                self.browseDir(parent);
+            } else if (x >= bx + 12 and x < bx + bw -| 12 and y >= by + 46 and y < by + 74) {
+                self.browser_path_len = 0;
+            } else if (y >= by + 82 and y < by + bh -| 42 and x >= bx + 12 and x < bx + bw -| 12) {
+                self.browserActivate(self.browser_scroll + (y - by - 82) / 24);
+            } else if (x >= bx + 12 and x < bx + 92 and y >= by + bh -| 36 and y < by + bh -| 8) {
+                if (self.browser_scroll > 0) self.browser_scroll -= 1;
+            } else if (x >= bx + 100 and x < bx + 180 and y >= by + bh -| 36 and y < by + bh -| 8) {
+                if (self.browser_scroll + browserVisibleRows(bh) < self.browser_entries.items.len) self.browser_scroll += 1;
+            } else if (x >= bx + bw -| 100 and x < bx + bw -| 12 and y >= by + bh -| 36 and y < by + bh -| 8) {
+                const path = self.browser_path[0..self.browser_path_len];
+                self.browserOpenPath(path);
+            }
+            return false;
+        }
+
         if (x >= 16 and x < 376 and y >= 78 and y < 106 and button == 0x110) {
             self.search_focused = true;
             const visible = (x -| 24) / font.font_width;
@@ -317,9 +430,13 @@ pub const App = struct {
         if (self.is_busy) return false;
 
         // Top row buttons:
+        if (x >= 526 and x < 656 and y >= 42 and y <= 70) {
+            self.openBrowser();
+            return false;
+        }
         // [Sample Image] (16, 42, 130, 28)
         if (x >= 16 and x <= 146 and y >= 42 and y <= 70) {
-            self.openImageFromPath(self.example_path);
+            _ = self.openImageFromPath(self.example_path);
             return false;
         }
 
@@ -436,6 +553,32 @@ pub const App = struct {
         if (state != 1) return;
         if (key == 58) {
             self.caps_lock = !self.caps_lock;
+            return;
+        }
+        if (self.browser_open) {
+            if (self.ctrl_down and key == 30) {
+                self.browser_path_len = 0;
+                return;
+            }
+            switch (key) {
+                1 => self.browser_open = false, // Escape
+                28 => self.browserOpenPath(self.browser_path[0..self.browser_path_len]), // Enter
+                14 => self.browser_path_len -|= 1, // Backspace
+                103 => { // Up
+                    if (self.browser_scroll > 0) self.browser_scroll -= 1;
+                },
+                108 => { // Down
+                    if (self.browser_scroll + browserVisibleRows(@min(self.client.height -| 190, 420)) < self.browser_entries.items.len) self.browser_scroll += 1;
+                },
+                else => if (!self.ctrl_down) {
+                    if (evdevToChar(key, self.shift_down, self.caps_lock)) |ch| {
+                        if (self.browser_path_len < self.browser_path.len) {
+                            self.browser_path[self.browser_path_len] = ch;
+                            self.browser_path_len += 1;
+                        }
+                    }
+                },
+            }
             return;
         }
         if (!self.search_focused) return;
@@ -709,6 +852,7 @@ pub const App = struct {
             }
         }
         render.compositeRgba(self.allocator, img, self.frame, plane, mw, mh, self.points[0..self.points_len]);
+        self.redraw_pending.store(true, .release);
     }
 
     fn redraw(self: *App) void {
@@ -748,6 +892,7 @@ pub const App = struct {
 
         // [Clear Points]
         font.drawButton(pixels, stride, 386, 42, 130, 28, "Clear Points", false, false, 0x0000dc64);
+        font.drawButton(pixels, stride, 526, 42, 130, 28, "Open Image", false, false, 0x0000dc64);
 
         // Row 2: Search field + Find button
         font.fillRect(pixels, stride, 16, 78, 360, 28, if (self.search_focused) 0x0023272e else 0x001c1f25);
@@ -836,8 +981,45 @@ pub const App = struct {
                 cur_btn_x += 168;
             }
         }
+        if (self.browser_open) self.drawBrowser(pixels, stride, h);
+    }
+
+    fn drawBrowser(self: *App, pixels: []u32, stride: usize, height: usize) void {
+        const x: usize = 16;
+        const y: usize = 140;
+        const w = @min(stride -| 32, 640);
+        const h = @min(height -| 190, 420);
+        if (w < 200 or h < 130) return;
+        font.fillRect(pixels, stride, x, y, w, h, 0x0023272e);
+        font.strokeRect(pixels, stride, x, y, w, h, 0x0000dc64);
+        font.drawButton(pixels, stride, x + 12, y + 8, 80, 28, "Parent", false, false, 0x0000dc64);
+        font.drawText(pixels, stride, "Choose image", x + 104, y + 14, 0x00f2f4f6);
+        font.drawButton(pixels, stride, x + w - 92, y + 8, 80, 28, "Cancel", false, false, 0x0000dc64);
+        font.fillRect(pixels, stride, x + 12, y + 46, w - 24, 28, 0x001c1f25);
+        font.strokeRect(pixels, stride, x + 12, y + 46, w - 24, 28, 0x0000dc64);
+        const path = self.browser_path[0..self.browser_path_len];
+        const max_chars = (w - 42) / font.font_width;
+        font.drawText(pixels, stride, if (path.len == 0) "Type an absolute path" else path[path.len -| max_chars ..], x + 20, y + 52, if (path.len == 0) 0x008e949e else 0x00f2f4f6);
+        const rows = browserVisibleRows(h);
+        for (0..rows) |row| {
+            const index = self.browser_scroll + row;
+            if (index >= self.browser_entries.items.len) break;
+            const entry = self.browser_entries.items[index];
+            const ry = y + 82 + row * 24;
+            font.fillRect(pixels, stride, x + 12, ry, w - 24, 22, if (row % 2 == 0) 0x001c1f25 else 0x0023272e);
+            const max_name = (w - 60) / font.font_width;
+            font.drawText(pixels, stride, if (entry.is_dir) "/" else " ", x + 18, ry + 3, 0x0000dc64);
+            font.drawText(pixels, stride, entry.name[0..@min(entry.name.len, max_name)], x + 30, ry + 3, 0x00e6e8ec);
+        }
+        font.drawButton(pixels, stride, x + 12, y + h - 36, 80, 28, "Up", false, false, 0x0000dc64);
+        font.drawButton(pixels, stride, x + 100, y + h - 36, 80, 28, "Down", false, false, 0x0000dc64);
+        font.drawButton(pixels, stride, x + w - 100, y + h - 36, 88, 28, "Open Path", false, false, 0x0000dc64);
     }
 };
+
+fn browserVisibleRows(height: usize) usize {
+    return (height -| 124) / 24;
+}
 
 fn evdevToChar(key: u32, shift: bool, caps: bool) ?u8 {
     const ch: u8 = switch (key) {
