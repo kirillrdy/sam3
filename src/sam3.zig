@@ -211,8 +211,19 @@ pub const Model = struct {
         return TextEmbedding.init(self.allocator, data);
     }
 
+    /// Caller owns the returned text encoder features and can cache them by phrase.
+    pub fn encodeTextFeatures(self: *Model, phrase: []const u8) ![]f32 {
+        const encoding = try self.concept_tokenizer.encode(phrase);
+        return encodeConceptText(self, self.allocator, encoding);
+    }
+
     pub fn find(self: *Model, embedding: *const TextImageEmbedding, phrase: []const u8, options: FindOptions) !Masks {
-        return decodeConceptQuery(self, self.allocator, embedding, phrase, options.min_score);
+        return decodeConceptQuery(self, self.allocator, embedding, phrase, null, options.min_score);
+    }
+
+    /// Use text encoder features from `encodeTextFeatures`, possibly from a cache.
+    pub fn findWithTextFeatures(self: *Model, embedding: *const TextImageEmbedding, phrase: []const u8, features: []const f32, options: FindOptions) !Masks {
+        return decodeConceptQuery(self, self.allocator, embedding, phrase, features, options.min_score);
     }
 };
 
@@ -406,11 +417,20 @@ fn decodeConceptQuery(
     allocator: std.mem.Allocator,
     embedding: *const TextImageEmbedding,
     phrase: []const u8,
+    features: ?[]const f32,
     threshold: f32,
 ) !Masks {
     const encoding = try model.concept_tokenizer.encode(phrase);
-    var text_embedding = try model.encodeText(encoding);
-    defer text_embedding.deinit();
+    var text_embedding: ?TextEmbedding = null;
+    defer if (text_embedding) |*value| value.deinit();
+    const text_value = if (features) |data| blk: {
+        if (data.len != tokenizer.max_tokens * 256) return error.InvalidTextFeatures;
+        break :blk try onnx.Value.borrowF32(data, &.{ 1, tokenizer.max_tokens, 256 });
+    } else blk: {
+        text_embedding = try model.encodeText(encoding);
+        break :blk text_embedding.?.value;
+    };
+    defer if (features != null) text_value.deinit();
 
     const token_shape = [_]i64{ 1, tokenizer.max_tokens };
     const attention = try onnx.Value.borrowI64(&encoding.attention, &token_shape);
@@ -421,7 +441,7 @@ fn decodeConceptQuery(
         embedding.levels[1],
         embedding.levels[2],
         embedding.levels[3],
-        text_embedding.value,
+        text_value,
         attention,
     };
     var results: [concept_decoder_outputs.len]onnx.Value = undefined;
