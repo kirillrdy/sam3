@@ -15,10 +15,6 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Image {
 
 pub const image_size: usize = 1008;
 
-pub const Point = render.Point;
-
-pub const Assets = assets.Assets;
-pub const Paths = Assets;
 
 const vision_input = "pixel_values";
 const embedding_names = [_][*:0]const u8{
@@ -150,7 +146,7 @@ pub const Model = struct {
         return Embedding.init(self.allocator, data);
     }
 
-    pub fn decode(self: *Model, embedding: Embedding, points: []const Point) !Masks {
+    pub fn decode(self: *Model, embedding: Embedding, points: []const render.Point) !Masks {
         const coordinates = try self.allocator.alloc(f32, points.len * 2);
         defer self.allocator.free(coordinates);
         const labels = try self.allocator.alloc(i64, points.len);

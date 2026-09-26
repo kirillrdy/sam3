@@ -40,7 +40,7 @@ pub const App = struct {
     image: ?zigimg.Image = null,
     frame: []u8 = &.{},
 
-    points: [max_points]sam3.Point = undefined,
+    points: [max_points]sam3.render.Point = undefined,
     points_len: usize = 0,
     click_mode_add: bool = true,
 
