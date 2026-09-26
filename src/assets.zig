@@ -10,9 +10,10 @@ pub const Asset = struct {
         self: Asset,
         allocator: std.mem.Allocator,
         io: std.Io,
-        cache_dir: []const u8,
     ) ![]u8 {
-        const path = try std.fs.path.join(allocator, &.{ cache_dir, self.name });
+        const home_c = std.c.getenv("HOME") orelse return error.HomeNotSet;
+        const home = std.mem.span(home_c);
+        const path = try std.fs.path.join(allocator, &.{ home, ".cache", "sam3-zig", self.name });
         errdefer allocator.free(path);
 
         if (try hashFile(io, path)) |have| {
@@ -74,11 +75,6 @@ pub const default_assets: Assets = .{
     .concept_tokenizer_json = .{ .name = "tokenizer.json", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/tokenizer.json", .sha256 = "6d9109cc838977f3ca94a379eec36aecc7c807e1785cd729660ca2fc0171fb35" },
     .cat = .{ .name = "cat.png", .url = "https://images.unsplash.com/photo-1514888286974-6c03e2ca1dba?w=800&fm=png", .sha256 = "dc6a561fc58bf60caff7a62cdd7593f5b517e43e4a75e9b220a80c3f1229ba3c" },
 };
-
-pub fn cacheDir(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]u8 {
-    const home = environ.get("HOME") orelse return error.HomeNotSet;
-    return std.fs.path.join(allocator, &.{ home, ".cache", "sam3-zig" });
-}
 
 
 fn download(
