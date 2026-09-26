@@ -36,7 +36,6 @@ pub const LoadedModel = struct {
     cached: CachedAssets,
 
     pub fn deinit(self: *LoadedModel) void {
-        sam3.zimo.close();
         self.model.deinit();
         self.cached.deinit();
     }
@@ -50,11 +49,6 @@ pub fn loadDefaultModel(
 ) !LoadedModel {
     var cached = try cacheAssets(allocator, io, environ, use_zig_http);
     errdefer cached.deinit();
-
-    const home = environ.get("HOME") orelse ".";
-    const zimo_dir = try std.fs.path.join(allocator, &.{ home, ".cache", "sam3-zig", ".zimo" });
-    defer allocator.free(zimo_dir);
-    sam3.zimo.open(allocator, io, zimo_dir) catch {};
 
     const tokenizer_json = try std.Io.Dir.cwd().readFileAlloc(
         io,
