@@ -6,15 +6,18 @@ pub const Asset = struct {
     url: []const u8,
     sha256: []const u8,
 
-    pub fn ensure(
+    pub fn get(
         self: Asset,
         allocator: std.mem.Allocator,
         io: std.Io,
-        path: []const u8,
+        cache_dir: []const u8,
         use_zig_http: bool,
-    ) !void {
+    ) ![]u8 {
+        const path = try std.fs.path.join(allocator, &.{ cache_dir, self.name });
+        errdefer allocator.free(path);
+
         if (try hashFile(io, path)) |have| {
-            if (std.ascii.eqlIgnoreCase(&have, self.sha256)) return;
+            if (std.ascii.eqlIgnoreCase(&have, self.sha256)) return path;
             std.debug.print("  {s}: present but checksum differs, re-downloading\n", .{self.name});
         }
 
@@ -40,6 +43,8 @@ pub const Asset = struct {
         const cwd = std.Io.Dir.cwd();
         try cwd.rename(part_path, cwd, path, io);
         std.debug.print("  {s}: cached in {s}\n", .{ self.name, path });
+
+        return path;
     }
 };
 
@@ -57,49 +62,45 @@ pub const assets = [_]Asset{
     .{ .name = "cat.png", .url = "https://images.unsplash.com/photo-1514888286974-6c03e2ca1dba?w=800&fm=png", .sha256 = "dc6a561fc58bf60caff7a62cdd7593f5b517e43e4a75e9b220a80c3f1229ba3c" },
 };
 
-pub const CachedAssets = struct {
-    allocator: std.mem.Allocator,
-    paths: [assets.len][]u8,
-
-    pub fn deinit(self: *CachedAssets) void {
-        for (self.paths) |path| self.allocator.free(path);
-        self.* = undefined;
-    }
-};
-
-pub const LoadedModel = struct {
-    model: sam3.Model,
-    cached: CachedAssets,
-
-    pub fn deinit(self: *LoadedModel) void {
-        self.model.deinit();
-        self.cached.deinit();
-    }
-};
+pub fn cacheDir(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]u8 {
+    const home = environ.get("HOME") orelse return error.HomeNotSet;
+    return std.fs.path.join(allocator, &.{ home, ".cache", "sam3-zig" });
+}
 
 pub fn loadDefaultModel(
     allocator: std.mem.Allocator,
     io: std.Io,
     environ: *const std.process.Environ.Map,
     use_zig_http: bool,
-) !LoadedModel {
-    var cached = try cacheAssets(allocator, io, environ, use_zig_http);
-    errdefer cached.deinit();
+) !sam3.Model {
+    const cache_dir = try cacheDir(allocator, environ);
+    defer allocator.free(cache_dir);
+    try std.Io.Dir.cwd().createDirPath(io, cache_dir);
+
+    var paths: [10][]u8 = undefined;
+    var initialized: usize = 0;
+    errdefer for (paths[0..initialized]) |path| allocator.free(path);
+
+    for (assets[0..10], 0..) |asset, i| {
+        paths[i] = try asset.get(allocator, io, cache_dir, use_zig_http);
+        initialized += 1;
+    }
+    defer for (paths) |path| allocator.free(path);
 
     const tokenizer_json = try std.Io.Dir.cwd().readFileAlloc(
         io,
-        cached.paths[9],
+        paths[9],
         allocator,
         .limited(8 * 1024 * 1024),
     );
     defer allocator.free(tokenizer_json);
 
     const model = sam3.Model.open(allocator, io, .{
-        .vision_encoder = cached.paths[0],
-        .decoder = cached.paths[2],
-        .concept_vision_encoder = cached.paths[4],
-        .concept_text_encoder = cached.paths[6],
-        .concept_decoder = cached.paths[8],
+        .vision_encoder = paths[0],
+        .decoder = paths[2],
+        .concept_vision_encoder = paths[4],
+        .concept_text_encoder = paths[6],
+        .concept_decoder = paths[8],
         .concept_tokenizer_json = tokenizer_json,
     }) catch |err| {
         const last = sam3.onnx.lastError();
@@ -107,10 +108,7 @@ pub fn loadDefaultModel(
         return err;
     };
 
-    return .{
-        .model = model,
-        .cached = cached,
-    };
+    return model;
 }
 
 pub fn cacheAssets(
@@ -118,22 +116,15 @@ pub fn cacheAssets(
     io: std.Io,
     environ: *const std.process.Environ.Map,
     use_zig_http: bool,
-) !CachedAssets {
-    const home = environ.get("HOME") orelse return error.HomeNotSet;
-    const cache_dir = try std.fs.path.join(allocator, &.{ home, ".cache", "sam3-zig" });
+) !void {
+    const cache_dir = try cacheDir(allocator, environ);
     defer allocator.free(cache_dir);
     try std.Io.Dir.cwd().createDirPath(io, cache_dir);
 
-    var cached: CachedAssets = .{ .allocator = allocator, .paths = undefined };
-    var initialized: usize = 0;
-    errdefer for (cached.paths[0..initialized]) |path| allocator.free(path);
-
-    for (assets, 0..) |asset, i| {
-        cached.paths[i] = try std.fs.path.join(allocator, &.{ cache_dir, asset.name });
-        initialized += 1;
-        try asset.ensure(allocator, io, cached.paths[i], use_zig_http);
+    for (assets) |asset| {
+        const path = try asset.get(allocator, io, cache_dir, use_zig_http);
+        allocator.free(path);
     }
-    return cached;
 }
 
 fn download(
