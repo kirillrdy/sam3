@@ -12,13 +12,10 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("\n=== SAM 3 Web UI ===\n\n", .{});
     std.debug.print("  Model runtime: {s}\n", .{sam3.onnx.version()});
 
-    const cache_dir = try sam3.assets.cacheDir(allocator, init.environ_map);
-    defer allocator.free(cache_dir);
-
-    var model = try sam3.Model.open(allocator, init.io, cache_dir);
+    var model = try sam3.Model.open(allocator, init.io);
     defer model.deinit();
 
-    const example_path = try sam3.assets.default_assets.cat.get(allocator, init.io, cache_dir);
+    const example_path = try sam3.assets.default_assets.cat.get(allocator, init.io);
     defer allocator.free(example_path);
 
     std.debug.print("  Loaded segmentation and text lookup graphs\n\n", .{});

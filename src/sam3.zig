@@ -67,46 +67,46 @@ pub const Model = struct {
     concept_decoder: onnx.Session,
     concept_tokenizer: tokenizer.Tokenizer,
 
-    pub fn open(allocator: std.mem.Allocator, io: std.Io, cache_dir: []const u8) !Model {
+    pub fn open(allocator: std.mem.Allocator, io: std.Io) !Model {
         const env = try onnx.Env.init(allocator, io);
         errdefer env.deinit();
 
         const model_assets = assets.default_assets;
 
-        const vision_data = try model_assets.vision_encoder_data.get(allocator, io, cache_dir);
+        const vision_data = try model_assets.vision_encoder_data.get(allocator, io);
         defer allocator.free(vision_data);
-        const vision_path = try model_assets.vision_encoder.get(allocator, io, cache_dir);
+        const vision_path = try model_assets.vision_encoder.get(allocator, io);
         defer allocator.free(vision_path);
         const vision = try onnx.Session.open(env, vision_path);
         errdefer vision.deinit();
 
-        const decoder_data = try model_assets.decoder_data.get(allocator, io, cache_dir);
+        const decoder_data = try model_assets.decoder_data.get(allocator, io);
         defer allocator.free(decoder_data);
-        const decoder_path = try model_assets.decoder.get(allocator, io, cache_dir);
+        const decoder_path = try model_assets.decoder.get(allocator, io);
         defer allocator.free(decoder_path);
         const decoder = try onnx.Session.open(env, decoder_path);
         errdefer decoder.deinit();
 
-        const concept_vision_data = try model_assets.concept_vision_encoder_data.get(allocator, io, cache_dir);
+        const concept_vision_data = try model_assets.concept_vision_encoder_data.get(allocator, io);
         defer allocator.free(concept_vision_data);
-        const concept_vision_path = try model_assets.concept_vision_encoder.get(allocator, io, cache_dir);
+        const concept_vision_path = try model_assets.concept_vision_encoder.get(allocator, io);
         defer allocator.free(concept_vision_path);
         const concept_vision = try onnx.Session.open(env, concept_vision_path);
         errdefer concept_vision.deinit();
 
-        const concept_text_data = try model_assets.concept_text_encoder_data.get(allocator, io, cache_dir);
+        const concept_text_data = try model_assets.concept_text_encoder_data.get(allocator, io);
         defer allocator.free(concept_text_data);
-        const concept_text_path = try model_assets.concept_text_encoder.get(allocator, io, cache_dir);
+        const concept_text_path = try model_assets.concept_text_encoder.get(allocator, io);
         defer allocator.free(concept_text_path);
         const concept_text = try onnx.Session.open(env, concept_text_path);
         errdefer concept_text.deinit();
 
-        const concept_decoder_path = try model_assets.concept_decoder.get(allocator, io, cache_dir);
+        const concept_decoder_path = try model_assets.concept_decoder.get(allocator, io);
         defer allocator.free(concept_decoder_path);
         const concept_decoder = try onnx.Session.open(env, concept_decoder_path);
         errdefer concept_decoder.deinit();
 
-        const tokenizer_json_path = try model_assets.concept_tokenizer_json.get(allocator, io, cache_dir);
+        const tokenizer_json_path = try model_assets.concept_tokenizer_json.get(allocator, io);
         defer allocator.free(tokenizer_json_path);
         const tokenizer_json = try std.Io.Dir.cwd().readFileAlloc(
             io,
