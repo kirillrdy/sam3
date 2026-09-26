@@ -5,8 +5,26 @@ pub const assets = @import("assets.zig").default_assets;
 pub const render = @import("render.zig");
 const zigimg = @import("zigimg");
 pub const Image = zigimg.Image;
+pub const Point = @import("point.zig").Point;
+pub const PointLabel = @import("point.zig").Label;
 
-pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Image {
+/// Borrowed, tightly packed RGB pixels. The caller retains ownership.
+pub const RgbImage = struct {
+    pixels: []const u8,
+    width: usize,
+    height: usize,
+
+    pub fn fromImage(img: Image) RgbImage {
+        return .{ .pixels = img.rawBytes(), .width = img.width, .height = img.height };
+    }
+};
+
+pub const FindOptions = struct {
+    min_score: f32 = 0.5,
+};
+
+/// Decode file bytes for applications that use zigimg images.
+pub fn decodeImage(allocator: std.mem.Allocator, bytes: []const u8) !Image {
     var decoded = try Image.fromMemory(allocator, bytes);
     errdefer decoded.deinit(allocator);
     try decoded.convert(allocator, .rgb24);
@@ -61,6 +79,7 @@ pub const Model = struct {
     concept_decoder: onnx.Session,
     concept_tokenizer: tokenizer.Tokenizer,
 
+    /// Downloads missing default graphs into the cache and opens them.
     pub fn open(allocator: std.mem.Allocator, io: std.Io) !Model {
         const env = try onnx.Env.init(allocator, io);
         errdefer env.deinit();
@@ -132,12 +151,13 @@ pub const Model = struct {
         self.env.deinit();
     }
 
-    pub fn encode(self: *Model, img: Image) !Embedding {
+    /// The returned embedding owns its memory and can serve multiple point prompts.
+    pub fn encodePoints(self: *Model, img: RgbImage) !PointEmbedding {
         const data = try encodeVision(self, self.allocator, img);
-        return Embedding.init(self.allocator, data);
+        return PointEmbedding.init(self.allocator, data);
     }
 
-    pub fn decode(self: *Model, embedding: Embedding, points: []const render.Point) !Masks {
+    pub fn segment(self: *Model, embedding: *const PointEmbedding, points: []const Point) !Masks {
         const coordinates = try self.allocator.alloc(f32, points.len * 2);
         defer self.allocator.free(coordinates);
         const labels = try self.allocator.alloc(i64, points.len);
@@ -147,7 +167,7 @@ pub const Model = struct {
         for (points, 0..) |p, i| {
             coordinates[i * 2] = p.x * scale;
             coordinates[i * 2 + 1] = p.y * scale;
-            labels[i] = p.label;
+            labels[i] = @intFromEnum(p.label);
         }
 
         const point_count: i64 = @intCast(points.len);
@@ -180,9 +200,10 @@ pub const Model = struct {
         return Masks.take(self.allocator, results[0], results[1], results[2]);
     }
 
-    pub fn encodeConcept(self: *Model, img: Image) !ConceptEmbedding {
+    /// The returned embedding owns its memory and can serve multiple text prompts.
+    pub fn encodeForText(self: *Model, img: RgbImage) !TextImageEmbedding {
         const data = try encodeConceptVision(self, self.allocator, img);
-        return ConceptEmbedding.init(self.allocator, data);
+        return TextImageEmbedding.init(self.allocator, data);
     }
 
     fn encodeText(self: *Model, encoding: tokenizer.Encoding) !TextEmbedding {
@@ -190,17 +211,17 @@ pub const Model = struct {
         return TextEmbedding.init(self.allocator, data);
     }
 
-    pub fn lookup(self: *Model, embedding: ConceptEmbedding, phrase: []const u8, threshold: f32) !Masks {
-        return decodeConceptQuery(self, self.allocator, embedding, phrase, threshold);
+    pub fn find(self: *Model, embedding: *const TextImageEmbedding, phrase: []const u8, options: FindOptions) !Masks {
+        return decodeConceptQuery(self, self.allocator, embedding, phrase, options.min_score);
     }
 };
 
-pub const Embedding = struct {
+pub const PointEmbedding = struct {
     allocator: std.mem.Allocator,
     data: []f32,
     levels: [embedding_names.len]onnx.Value,
 
-    fn init(allocator: std.mem.Allocator, data: []f32) !Embedding {
+    fn init(allocator: std.mem.Allocator, data: []f32) !PointEmbedding {
         return .{
             .allocator = allocator,
             .data = data,
@@ -212,18 +233,18 @@ pub const Embedding = struct {
         };
     }
 
-    pub fn deinit(self: *Embedding) void {
+    pub fn deinit(self: *PointEmbedding) void {
         self.allocator.free(self.data);
         self.* = undefined;
     }
 };
 
-pub const ConceptEmbedding = struct {
+pub const TextImageEmbedding = struct {
     allocator: std.mem.Allocator,
     data: []f32,
     levels: [concept_embedding_names.len]onnx.Value,
 
-    fn init(allocator: std.mem.Allocator, data: []f32) !ConceptEmbedding {
+    fn init(allocator: std.mem.Allocator, data: []f32) !TextImageEmbedding {
         const offsets = [_]usize{
             0,
             21233664,
@@ -253,7 +274,7 @@ pub const ConceptEmbedding = struct {
         };
     }
 
-    pub fn deinit(self: *ConceptEmbedding) void {
+    pub fn deinit(self: *TextImageEmbedding) void {
         self.allocator.free(self.data);
         self.* = undefined;
     }
@@ -281,7 +302,7 @@ const TextEmbedding = struct {
 fn encodeVision(
     model: *Model,
     allocator: std.mem.Allocator,
-    img: Image,
+    img: RgbImage,
 ) ![]f32 {
     const pixels = try preprocessCpu(allocator, img, @splat(0.5), @splat(0.5));
     defer allocator.free(pixels);
@@ -316,7 +337,7 @@ fn encodeVision(
 fn encodeConceptVision(
     model: *Model,
     allocator: std.mem.Allocator,
-    img: Image,
+    img: RgbImage,
 ) ![]f32 {
     const pixels = try preprocessCpu(
         allocator,
@@ -383,7 +404,7 @@ fn encodeConceptText(
 fn decodeConceptQuery(
     model: *Model,
     allocator: std.mem.Allocator,
-    embedding: ConceptEmbedding,
+    embedding: *const TextImageEmbedding,
     phrase: []const u8,
     threshold: f32,
 ) !Masks {
@@ -425,6 +446,13 @@ pub const Masks = struct {
     height: usize,
 
     object_score: f32,
+
+    /// The borrowed logits for one mask, in row-major order at width x height.
+    pub fn plane(self: *const Masks, index: usize) []const f32 {
+        std.debug.assert(index < self.count);
+        const stride = self.width * self.height;
+        return self.logits[index * stride ..][0..stride];
+    }
 
     fn take(allocator: std.mem.Allocator, iou: onnx.Value, masks: onnx.Value, object: onnx.Value) !Masks {
         var dims: [8]i64 = undefined;
@@ -512,8 +540,13 @@ fn max(values: []const f32) f32 {
 }
 
 /// The CPU path, and the reference the CUDA kernel is checked against.
-fn preprocessCpu(allocator: std.mem.Allocator, img: Image, mean: [3]f32, deviation: [3]f32) ![]f32 {
-    const pixels = img.pixels.rgb24;
+fn preprocessCpu(allocator: std.mem.Allocator, img: RgbImage, mean: [3]f32, deviation: [3]f32) ![]f32 {
+    if (img.width == 0 or img.height == 0) return error.InvalidImage;
+    const pixel_count = std.math.mul(usize, img.width, img.height) catch return error.InvalidImage;
+    const byte_count = std.math.mul(usize, pixel_count, 3) catch return error.InvalidImage;
+    if (img.pixels.len != byte_count) return error.InvalidImage;
+
+    const pixels = img.pixels;
     const plane_size = image_size * image_size;
     const out = try allocator.alloc(f32, 3 * plane_size);
     errdefer allocator.free(out);
@@ -530,23 +563,23 @@ fn preprocessCpu(allocator: std.mem.Allocator, img: Image, mean: [3]f32, deviati
         const y0 = clampPixelIndex(in_y, img.height);
         const y1 = @min(y0 + 1, img.height - 1);
         const wy = @max(0.0, in_y - @as(f32, @floatFromInt(y0)));
-        const row0 = pixels[y0 * img.width ..][0..img.width];
-        const row1 = pixels[y1 * img.width ..][0..img.width];
+        const row0 = pixels[y0 * img.width * 3 ..][0 .. img.width * 3];
+        const row1 = pixels[y1 * img.width * 3 ..][0 .. img.width * 3];
 
         for (0..image_size) |x| {
             const in_x = ratio_x * (@as(f32, @floatFromInt(x)) + 0.5) - 0.5;
             const x0 = clampPixelIndex(in_x, img.width);
             const x1 = @min(x0 + 1, img.width - 1);
             const wx = @max(0.0, in_x - @as(f32, @floatFromInt(x0)));
-            const p00 = row0[x0];
-            const p01 = row0[x1];
-            const p10 = row1[x0];
-            const p11 = row1[x1];
+            const p00 = row0[x0 * 3 ..][0..3];
+            const p01 = row0[x1 * 3 ..][0..3];
+            const p10 = row1[x0 * 3 ..][0..3];
+            const p11 = row1[x1 * 3 ..][0..3];
             const index = y * image_size + x;
-            const a: [3]f32 = .{ @floatFromInt(p00.r), @floatFromInt(p00.g), @floatFromInt(p00.b) };
-            const b: [3]f32 = .{ @floatFromInt(p01.r), @floatFromInt(p01.g), @floatFromInt(p01.b) };
-            const c: [3]f32 = .{ @floatFromInt(p10.r), @floatFromInt(p10.g), @floatFromInt(p10.b) };
-            const d: [3]f32 = .{ @floatFromInt(p11.r), @floatFromInt(p11.g), @floatFromInt(p11.b) };
+            const a: [3]f32 = .{ @floatFromInt(p00[0]), @floatFromInt(p00[1]), @floatFromInt(p00[2]) };
+            const b: [3]f32 = .{ @floatFromInt(p01[0]), @floatFromInt(p01[1]), @floatFromInt(p01[2]) };
+            const c: [3]f32 = .{ @floatFromInt(p10[0]), @floatFromInt(p10[1]), @floatFromInt(p10[2]) };
+            const d: [3]f32 = .{ @floatFromInt(p11[0]), @floatFromInt(p11[1]), @floatFromInt(p11[2]) };
 
             inline for (0..3) |channel| {
                 const top = a[channel] + (b[channel] - a[channel]) * wx;
@@ -563,6 +596,41 @@ fn clampPixelIndex(coordinate: f32, limit: usize) usize {
     if (coordinate <= 0.0) return 0;
     const floored: usize = @intFromFloat(@floor(coordinate));
     return @min(floored, limit - 1);
+}
+
+test "RGB image view validates input and preserves channel order" {
+    const allocator = std.testing.allocator;
+    const rgb = [_]u8{ 255, 128, 0 };
+    const pixels = try preprocessCpu(allocator, .{
+        .pixels = &rgb,
+        .width = 1,
+        .height = 1,
+    }, @splat(0), @splat(1));
+    defer allocator.free(pixels);
+
+    const plane_size = image_size * image_size;
+    try std.testing.expectEqual(@as(f32, 1), pixels[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 128.0 / 255.0), pixels[plane_size], 0.00001);
+    try std.testing.expectEqual(@as(f32, 0), pixels[2 * plane_size]);
+    try std.testing.expectError(error.InvalidImage, preprocessCpu(allocator, .{
+        .pixels = rgb[0..2],
+        .width = 1,
+        .height = 1,
+    }, @splat(0), @splat(1)));
+}
+
+test "mask planes borrow the corresponding logits" {
+    var masks: Masks = .{
+        .allocator = std.testing.allocator,
+        .logits = try std.testing.allocator.dupe(f32, &.{ 1, 2, 3, 4 }),
+        .scores = try std.testing.allocator.dupe(f32, &.{ 0.8, 0.9 }),
+        .count = 2,
+        .width = 2,
+        .height = 1,
+        .object_score = 0.9,
+    };
+    defer masks.deinit();
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, masks.plane(1));
 }
 
 test {
