@@ -11,7 +11,6 @@ pub const Asset = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         cache_dir: []const u8,
-        use_zig_http: bool,
     ) ![]u8 {
         const path = try std.fs.path.join(allocator, &.{ cache_dir, self.name });
         errdefer allocator.free(path);
@@ -25,7 +24,7 @@ pub const Asset = struct {
         defer allocator.free(part_path);
 
         std.debug.print("  {s}: downloading\n", .{self.name});
-        try download(allocator, io, self.url, part_path, use_zig_http);
+        try download(allocator, io, self.url, part_path);
 
         const have = (try hashFile(io, part_path)) orelse return error.DownloadDisappeared;
         if (!std.ascii.eqlIgnoreCase(&have, self.sha256)) {
@@ -76,43 +75,13 @@ pub const default_assets: Assets = .{
     .cat = .{ .name = "cat.png", .url = "https://images.unsplash.com/photo-1514888286974-6c03e2ca1dba?w=800&fm=png", .sha256 = "dc6a561fc58bf60caff7a62cdd7593f5b517e43e4a75e9b220a80c3f1229ba3c" },
 };
 
-pub const assets = default_assets;
-
 pub fn cacheDir(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]u8 {
     const home = environ.get("HOME") orelse return error.HomeNotSet;
     return std.fs.path.join(allocator, &.{ home, ".cache", "sam3-zig" });
 }
 
-pub fn loadDefaultModel(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    environ: *const std.process.Environ.Map,
-    use_zig_http: bool,
-) !sam3.Model {
-    const cache_dir = try cacheDir(allocator, environ);
-    defer allocator.free(cache_dir);
-
-    return sam3.Model.open(allocator, io, cache_dir, default_assets, use_zig_http) catch |err| {
-        const last = sam3.onnx.lastError();
-        std.debug.print("Failed to initialize model: {t}{s}{s}\n", .{ err, if (last.len > 0) ": " else "", last });
-        return err;
-    };
-}
 
 fn download(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    url: []const u8,
-    dest_path: []const u8,
-    use_zig_http: bool,
-) !void {
-    if (use_zig_http) {
-        return downloadZig(allocator, io, url, dest_path);
-    }
-    return downloadWithCurl(allocator, io, url, dest_path);
-}
-
-fn downloadWithCurl(
     allocator: std.mem.Allocator,
     io: std.Io,
     url: []const u8,
@@ -130,34 +99,6 @@ fn downloadWithCurl(
         .exited => |code| if (code != 0) error.HttpRequestFailed,
         else => error.HttpRequestFailed,
     };
-}
-
-fn downloadZig(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    url: []const u8,
-    dest_path: []const u8,
-) !void {
-    var file = try std.Io.Dir.cwd().createFile(io, dest_path, .{});
-    defer file.close(io);
-
-    var write_buffer: [64 * 1024]u8 = undefined;
-    var file_writer = file.writer(io, &write_buffer);
-
-    var client: std.http.Client = .{ .allocator = allocator, .io = io };
-    defer client.deinit();
-
-    const result = try client.fetch(.{
-        .location = .{ .url = url },
-        .method = .GET,
-        .response_writer = &file_writer.interface,
-    });
-    try file_writer.interface.flush();
-
-    if (result.status != .ok) {
-        std.debug.print("  HTTP {d} for {s}\n", .{ @intFromEnum(result.status), url });
-        return error.HttpRequestFailed;
-    }
 }
 
 fn hashFile(io: std.Io, path: []const u8) !?[64]u8 {
