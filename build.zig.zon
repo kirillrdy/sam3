@@ -20,11 +20,7 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
-        "main.zig",
         "src",
-        "web",
-        "linux",
-        "macos",
         "README.md",
     },
 }

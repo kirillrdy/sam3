@@ -32,19 +32,6 @@ pub fn build(b: *std.Build) void {
         "Store float tensors on the device as halves (default: true with -Dbackend=opencl or metal)",
     ) orelse (backend != .cuda);
 
-    const host = b.option(
-        []const u8,
-        "host",
-        "Address the web UI binds to (default: 127.0.0.1)",
-    ) orelse "127.0.0.1";
-
-    const port = b.option(
-        u16,
-        "port",
-        "Port the web UI listens on (default: 3000)",
-    ) orelse 3000;
-
-
     const zigimg = b.dependency("zigimg", .{
         .target = target,
         .optimize = optimize,
@@ -68,139 +55,8 @@ pub fn build(b: *std.Build) void {
     });
     mod.addImport("onnx", onnx.module("onnx"));
 
-    const server_options = b.addOptions();
-    server_options.addOption([]const u8, "host", host);
-    server_options.addOption(u16, "port", port);
-
-    const wasm_target = b.resolveTargetQuery(.{
-        .cpu_arch = .wasm32,
-        .os_tag = .freestanding,
-    });
-
-    const client = b.addExecutable(.{
-        .name = "client",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("web/client.zig"),
-            .target = wasm_target,
-            .optimize = optimize,
-            .strip = if (optimize == .ReleaseFast) true else null,
-            .imports = &.{
-                .{ .name = "zigimg", .module = b.dependency("zigimg", .{
-                    .target = wasm_target,
-                    .optimize = optimize,
-                }).module("zigimg") },
-            },
-        }),
-    });
-
-    client.entry = .disabled;
-    client.rdynamic = true;
-
-    const web_exe = b.addExecutable(.{
-        .name = "sam3-web",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = if (optimize == .ReleaseFast) true else null,
-            .imports = &.{
-                .{ .name = "sam3", .module = mod },
-            },
-        }),
-    });
-
-    web_exe.root_module.addAnonymousImport("client_wasm", .{
-        .root_source_file = client.getEmittedBin(),
-    });
-    web_exe.root_module.addOptions("build_options", server_options);
-    b.installArtifact(web_exe);
-
-    const run_step = b.step("run", b.fmt("Run the web UI on http://{s}:{d}/", .{ host, port }));
-    const run_cmd = b.addRunArtifact(web_exe);
-    run_step.dependOn(&run_cmd.step);
-    run_cmd.setCwd(b.path("."));
-
-    if (target.result.os.tag.isDarwin()) {
-        const macos_mod = b.createModule(.{
-            .root_source_file = b.path("macos/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = if (optimize == .ReleaseFast) true else null,
-            .imports = &.{
-                .{ .name = "sam3", .module = mod },
-                .{ .name = "zigimg", .module = zigimg.module("zigimg") },
-            },
-        });
-        macos_mod.addIncludePath(b.path("macos"));
-        macos_mod.addCSourceFile(.{
-            .file = b.path("macos/bridge.m"),
-            .flags = &.{"-fobjc-arc"},
-        });
-        macos_mod.link_libc = true;
-        macos_mod.linkSystemLibrary("objc", .{});
-        macos_mod.linkFramework("Foundation", .{});
-        macos_mod.linkFramework("AppKit", .{});
-        macos_mod.linkFramework("QuartzCore", .{});
-        macos_mod.linkFramework("UniformTypeIdentifiers", .{});
-
-        const macos_exe = b.addExecutable(.{
-            .name = "sam3-macos",
-            .root_module = macos_mod,
-        });
-        b.installArtifact(macos_exe);
-
-        const run_macos_step = b.step("run-macos", "Run the native macOS UI");
-        const run_macos_cmd = b.addRunArtifact(macos_exe);
-        run_macos_step.dependOn(&run_macos_cmd.step);
-        run_macos_cmd.setCwd(b.path("."));
-    }
-
-    if (target.result.os.tag == .linux) {
-        const linux_mod = b.createModule(.{
-            .root_source_file = b.path("linux/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = if (optimize == .ReleaseFast) true else null,
-            .imports = &.{
-                .{ .name = "sam3", .module = mod },
-                .{ .name = "zigimg", .module = zigimg.module("zigimg") },
-            },
-        });
-        linux_mod.link_libc = true;
-
-        const linux_exe = b.addExecutable(.{
-            .name = "sam3-linux",
-            .root_module = linux_mod,
-        });
-        b.installArtifact(linux_exe);
-
-        const run_linux_step = b.step("run-linux", "Run the native Linux Wayland UI");
-        const run_linux_cmd = b.addRunArtifact(linux_exe);
-        run_linux_step.dependOn(&run_linux_cmd.step);
-        run_linux_cmd.setCwd(b.path("."));
-
-        const run_wayland_step = b.step("run-wayland", "Run the native Linux Wayland UI (alias for run-linux)");
-        run_wayland_step.dependOn(&run_linux_cmd.step);
-    }
-
     const test_step = b.step("test", "Run tests");
     addTest(b, test_step, mod);
-    addTest(b, test_step, b.createModule(.{
-        .root_source_file = b.path("web/server.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "sam3", .module = mod },
-        },
-    }));
-    addTest(b, test_step, b.createModule(.{
-        .root_source_file = b.path("web/client.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "zigimg", .module = zigimg.module("zigimg") },
-        },
-    }));
     addTest(b, test_step, b.createModule(.{
         .root_source_file = b.path("src/render.zig"),
         .target = target,
@@ -208,11 +64,6 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "zigimg", .module = zigimg.module("zigimg") },
         },
-    }));
-    addTest(b, test_step, b.createModule(.{
-        .root_source_file = b.path("linux/font.zig"),
-        .target = target,
-        .optimize = optimize,
     }));
 }
 
