@@ -11,7 +11,7 @@ pub fn main(init: std.process.Init) !void {
     var model = try sam3.Model.open(allocator, init.io);
     defer model.deinit();
 
-    const example_path = try sam3.assets.default_assets.cat.get(allocator, init.io);
+    const example_path = try sam3.assets.cat.get(allocator, init.io);
     defer allocator.free(example_path);
 
     std.debug.print("  Loaded segmentation and text lookup graphs\n", .{});
