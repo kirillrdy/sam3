@@ -13,7 +13,7 @@ pub fn main(init: std.process.Init) !void {
 
     const cache_dir = try sam3.assets.cacheDir(allocator, init.environ_map);
     defer allocator.free(cache_dir);
-    const example_path = try sam3.assets.assets[10].get(allocator, init.io, cache_dir, false);
+    const example_path = try sam3.assets.assets.cat.get(allocator, init.io, cache_dir, false);
     defer allocator.free(example_path);
 
     std.debug.print("  Loaded segmentation and text lookup graphs\n", .{});
