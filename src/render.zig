@@ -6,13 +6,13 @@ pub const Point = struct {
     label: i64 = 1,
 };
 
-pub const Rgb24 = zigimg.color.Rgb24;
+const Rgb24 = zigimg.color.Rgb24;
 
-pub const mask_color: Rgb24 = .{ .r = 0, .g = 220, .b = 100 };
-pub const mask_alpha: f32 = 0.5;
-pub const marker_radius: usize = 7;
+const mask_color: Rgb24 = .{ .r = 0, .g = 220, .b = 100 };
+const mask_alpha: f32 = 0.5;
+const marker_radius: usize = 7;
 
-pub fn bilinear(
+fn bilinear(
     allocator: std.mem.Allocator,
     src: []const f32,
     src_w: usize,
@@ -57,7 +57,7 @@ fn clampIndex(coordinate: f32, limit: usize) usize {
     return @min(floored, limit - 1);
 }
 
-pub fn overlayMask(img: *zigimg.Image, mask: []const f32, color: Rgb24, alpha: f32) void {
+fn overlayMask(img: *zigimg.Image, mask: []const f32, color: Rgb24, alpha: f32) void {
     const pixels = img.pixels.rgb24;
     std.debug.assert(mask.len == pixels.len);
 
@@ -79,7 +79,7 @@ pub fn overlayMask(img: *zigimg.Image, mask: []const f32, color: Rgb24, alpha: f
     }
 }
 
-pub fn drawPointMarker(img: *zigimg.Image, point: Point, radius: usize) void {
+fn drawPointMarker(img: *zigimg.Image, point: Point, radius: usize) void {
     const cx: isize = @intFromFloat(point.x * @as(f32, @floatFromInt(img.width)));
     const cy: isize = @intFromFloat(point.y * @as(f32, @floatFromInt(img.height)));
     const color: Rgb24 = if (point.label == 1)

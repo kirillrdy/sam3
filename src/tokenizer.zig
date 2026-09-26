@@ -1,8 +1,8 @@
 const std = @import("std");
 
 pub const max_tokens = 32;
-pub const bos_token: i64 = 49406;
-pub const eos_token: i64 = 49407;
+const bos_token: i64 = 49406;
+const eos_token: i64 = 49407;
 
 pub const Encoding = struct {
     ids: [max_tokens]i64,

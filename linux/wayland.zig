@@ -75,7 +75,7 @@ pub const WaylandClient = struct {
     recv_buf: [32768]u8 = undefined,
     recv_len: usize = 0,
 
-    pub fn allocId(self: *WaylandClient) u32 {
+    fn allocId(self: *WaylandClient) u32 {
         const id = self.next_id;
         self.next_id += 1;
         return id;

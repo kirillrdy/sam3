@@ -3,7 +3,7 @@ const sam3 = @import("sam3");
 const render = sam3.render;
 const zigimg = @import("zigimg");
 
-pub const SamCallbacks = extern struct {
+const SamCallbacks = extern struct {
     on_open_file: ?*const fn (path: [*:0]const u8) callconv(.c) void,
     on_sample_click: ?*const fn () callconv(.c) void,
     on_mode_change: ?*const fn (mode: c_int) callconv(.c) void,
@@ -13,18 +13,18 @@ pub const SamCallbacks = extern struct {
     on_select_mask: ?*const fn (mask_index: c_int) callconv(.c) void,
 };
 
-pub const SamMaskInfo = extern struct {
+const SamMaskInfo = extern struct {
     score: f32,
     coverage: f32,
 };
 
-pub extern fn sam_macos_init(callbacks: *const SamCallbacks) c_int;
-pub extern fn sam_macos_run() void;
-pub extern fn sam_macos_set_status(text: [*:0]const u8) void;
-pub extern fn sam_macos_set_image(rgba_pixels: ?[*]const u8, width: c_int, height: c_int) void;
-pub extern fn sam_macos_set_masks(count: c_int, masks: ?[*]const SamMaskInfo, best_index: c_int, selected_index: c_int) void;
-pub extern fn sam_macos_set_busy(is_busy: c_int) void;
-pub extern fn sam_macos_dispatch_main(func: *const fn (?*anyopaque) callconv(.c) void, ctx: ?*anyopaque) void;
+extern fn sam_macos_init(callbacks: *const SamCallbacks) c_int;
+extern fn sam_macos_run() void;
+extern fn sam_macos_set_status(text: [*:0]const u8) void;
+extern fn sam_macos_set_image(rgba_pixels: ?[*]const u8, width: c_int, height: c_int) void;
+extern fn sam_macos_set_masks(count: c_int, masks: ?[*]const SamMaskInfo, best_index: c_int, selected_index: c_int) void;
+extern fn sam_macos_set_busy(is_busy: c_int) void;
+extern fn sam_macos_dispatch_main(func: *const fn (?*anyopaque) callconv(.c) void, ctx: ?*anyopaque) void;
 
 const max_points = 32;
 
@@ -91,7 +91,7 @@ pub const App = struct {
         sam_macos_run();
     }
 
-    pub fn openImageFromPath(self: *App, path: []const u8) void {
+    fn openImageFromPath(self: *App, path: []const u8) void {
         const file_bytes = std.Io.Dir.cwd().readFileAlloc(
             self.io,
             path,
@@ -107,7 +107,7 @@ pub const App = struct {
         self.openImageFromBytes(file_bytes);
     }
 
-    pub fn openImageFromBytes(self: *App, bytes: []const u8) void {
+    fn openImageFromBytes(self: *App, bytes: []const u8) void {
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
 
@@ -147,7 +147,7 @@ pub const App = struct {
         sam_macos_set_status(msg);
     }
 
-    pub fn handleCanvasClick(self: *App, norm_x: f32, norm_y: f32, is_positive: c_int) void {
+    fn handleCanvasClick(self: *App, norm_x: f32, norm_y: f32, is_positive: c_int) void {
         if (self.is_busy or self.image == null or self.points_len >= max_points) return;
 
         self.mutex.lock(self.io) catch return;
@@ -240,7 +240,7 @@ pub const App = struct {
         sam_macos_set_busy(0);
     }
 
-    pub fn handleFindText(self: *App, text: [*:0]const u8) void {
+    fn handleFindText(self: *App, text: [*:0]const u8) void {
         if (self.is_busy or self.image == null) return;
         const phrase = std.mem.span(text);
         if (phrase.len == 0) return;
@@ -363,7 +363,7 @@ pub const App = struct {
         sam_macos_set_busy(0);
     }
 
-    pub fn handleSelectMask(self: *App, mask_index: c_int) void {
+    fn handleSelectMask(self: *App, mask_index: c_int) void {
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
 
@@ -372,7 +372,7 @@ pub const App = struct {
         sam_macos_set_image(self.frame.ptr, @intCast(self.image.?.width), @intCast(self.image.?.height));
     }
 
-    pub fn handleClearPoints(self: *App) void {
+    fn handleClearPoints(self: *App) void {
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
 

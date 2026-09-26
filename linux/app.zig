@@ -113,7 +113,7 @@ pub const App = struct {
         self.client.deinit();
     }
 
-    pub fn setStatus(self: *App, text: []const u8) void {
+    fn setStatus(self: *App, text: []const u8) void {
         const len = @min(text.len, self.status_text.len);
         @memcpy(self.status_text[0..len], text[0..len]);
         self.status_len = len;
@@ -178,7 +178,7 @@ pub const App = struct {
         }
     }
 
-    pub fn openImageFromPath(self: *App, path: []const u8) bool {
+    fn openImageFromPath(self: *App, path: []const u8) bool {
         const file_bytes = std.Io.Dir.cwd().readFileAlloc(
             self.io,
             path,
@@ -194,7 +194,7 @@ pub const App = struct {
         return self.openImageFromBytes(file_bytes);
     }
 
-    pub fn openImageFromBytes(self: *App, bytes: []const u8) bool {
+    fn openImageFromBytes(self: *App, bytes: []const u8) bool {
         self.mutex.lock(self.io) catch return false;
         defer self.mutex.unlock(self.io);
 
@@ -634,7 +634,7 @@ pub const App = struct {
         self.handleFindText(phrase);
     }
 
-    pub fn handleCanvasClick(self: *App, norm_x: f32, norm_y: f32, is_positive: c_int) void {
+    fn handleCanvasClick(self: *App, norm_x: f32, norm_y: f32, is_positive: c_int) void {
         if (self.is_busy or self.image == null or self.points_len >= max_points) return;
 
         self.mutex.lock(self.io) catch return;
@@ -710,7 +710,7 @@ pub const App = struct {
         self.is_busy = false;
     }
 
-    pub fn handleFindText(self: *App, phrase: []const u8) void {
+    fn handleFindText(self: *App, phrase: []const u8) void {
         self.is_busy = true;
 
         var status_buf: [256]u8 = undefined;
@@ -808,7 +808,7 @@ pub const App = struct {
         self.is_busy = false;
     }
 
-    pub fn handleClearPoints(self: *App) void {
+    fn handleClearPoints(self: *App) void {
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
 
