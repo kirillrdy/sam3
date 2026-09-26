@@ -49,6 +49,7 @@ Features:
 - Concept text search ("Find by word") with direct keyboard typing.
 - Candidate mask selection with score and coverage statistics.
 - Asynchronous background inference with thread-safe UI updates.
+- Open Image browser for loading images from disk. Select a file in the browser, or click the path field and type an absolute path. Use Parent, Up, and Down to navigate; Escape closes the browser.
 
 
 Model downloads use `curl` by default. If `curl` is not available, build with
