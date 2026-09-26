@@ -72,21 +72,10 @@ pub const Model = struct {
     concept_tokenizer: tokenizer.Tokenizer,
 
     pub fn open(allocator: std.mem.Allocator, io: std.Io, cache_dir: []const u8) !Model {
-        return openWithAssets(allocator, io, cache_dir, assets.default_assets) catch |err| {
-            const last = onnx.lastError();
-            std.debug.print("Failed to initialize model: {t}{s}{s}\n", .{ err, if (last.len > 0) ": " else "", last });
-            return err;
-        };
-    }
-
-    pub fn openWithAssets(
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        cache_dir: []const u8,
-        model_assets: Assets,
-    ) !Model {
         const env = try onnx.Env.init(allocator, io);
         errdefer env.deinit();
+
+        const model_assets = assets.default_assets;
 
         const vision_data = try model_assets.vision_encoder_data.get(allocator, io, cache_dir);
         defer allocator.free(vision_data);
