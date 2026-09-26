@@ -138,8 +138,7 @@ pub const Model = struct {
     }
 
     pub fn encode(self: *Model, img: Image) !Embedding {
-        const raw = img.rawBytes();
-        const data = try encodeVision(self, self.allocator, raw, img.width, img.height);
+        const data = try encodeVision(self, self.allocator, img);
         return Embedding.init(self.allocator, data);
     }
 
@@ -187,8 +186,7 @@ pub const Model = struct {
     }
 
     pub fn encodeConcept(self: *Model, img: Image) !ConceptEmbedding {
-        const raw = img.rawBytes();
-        const data = try encodeConceptVision(self, self.allocator, raw, img.width, img.height);
+        const data = try encodeConceptVision(self, self.allocator, img);
         return ConceptEmbedding.init(self.allocator, data);
     }
 
@@ -198,8 +196,7 @@ pub const Model = struct {
     }
 
     pub fn lookup(self: *Model, embedding: ConceptEmbedding, phrase: []const u8, threshold: f32) !Masks {
-        const data = try decodeConceptQuery(self, self.allocator, embedding, phrase, threshold);
-        return Masks.unpack(self.allocator, data);
+        return decodeConceptQuery(self, self.allocator, embedding, phrase, threshold);
     }
 };
 
@@ -301,15 +298,8 @@ const TextEmbedding = struct {
 fn encodeVision(
     model: *Model,
     allocator: std.mem.Allocator,
-    raw_pixels: []const u8,
-    width: usize,
-    height: usize,
+    img: Image,
 ) ![]f32 {
-    const img: Image = .{
-        .width = width,
-        .height = height,
-        .pixels = .{ .rgb24 = @alignCast(@constCast(std.mem.bytesAsSlice(zigimg.color.Rgb24, raw_pixels))) },
-    };
     const pixels = try preprocessCpu(allocator, img, @splat(0.5), @splat(0.5));
     defer allocator.free(pixels);
 
@@ -343,15 +333,8 @@ fn encodeVision(
 fn encodeConceptVision(
     model: *Model,
     allocator: std.mem.Allocator,
-    raw_pixels: []const u8,
-    width: usize,
-    height: usize,
+    img: Image,
 ) ![]f32 {
-    const img: Image = .{
-        .width = width,
-        .height = height,
-        .pixels = .{ .rgb24 = @alignCast(@constCast(std.mem.bytesAsSlice(zigimg.color.Rgb24, raw_pixels))) },
-    };
     const pixels = try preprocessCpu(
         allocator,
         img,
@@ -421,7 +404,7 @@ fn decodeConceptQuery(
     embedding: ConceptEmbedding,
     phrase: []const u8,
     threshold: f32,
-) ![]f32 {
+) !Masks {
     var text_embedding = try model.encodeText(phrase);
     defer text_embedding.deinit();
 
@@ -447,49 +430,7 @@ fn decodeConceptQuery(
     );
     defer for (results) |result| result.deinit();
 
-    return packConceptResults(allocator, results[0], results[2], threshold);
-}
-
-fn packConceptResults(allocator: std.mem.Allocator, masks: onnx.Value, scores_value: onnx.Value, threshold: f32) ![]f32 {
-    var dims: [8]i64 = undefined;
-    const shape = try masks.shape(&dims);
-    if (shape.len != 4 or shape[0] != 1) return error.UnexpectedConceptMaskShape;
-
-    const available: usize = @intCast(shape[1]);
-    const height: usize = @intCast(shape[2]);
-    const width: usize = @intCast(shape[3]);
-    const planes = try masks.dataF32();
-    const raw_scores = try scores_value.dataF32();
-    if (raw_scores.len < available) return error.UnexpectedConceptScoreShape;
-
-    var count: usize = 0;
-    for (raw_scores[0..available]) |logit| {
-        const score = sigmoid(logit);
-        if (score >= threshold) count += 1;
-    }
-
-    const stride = width * height;
-    const total_floats = 4 + count + count * stride;
-    const out = try allocator.alloc(f32, total_floats);
-    errdefer allocator.free(out);
-
-    out[0] = @floatFromInt(count);
-    out[1] = @floatFromInt(width);
-    out[2] = @floatFromInt(height);
-
-    var max_score: f32 = 0;
-    var idx: usize = 0;
-    for (raw_scores[0..available], 0..) |logit, i| {
-        const score = sigmoid(logit);
-        if (score < threshold) continue;
-        if (idx == 0 or score > max_score) max_score = score;
-        out[4 + idx] = score;
-        @memcpy(out[4 + count + idx * stride ..][0..stride], planes[i * stride ..][0..stride]);
-        idx += 1;
-    }
-    out[3] = if (count == 0) 0 else max_score;
-
-    return out;
+    return Masks.takeConcept(allocator, results[0], results[2], threshold);
 }
 
 pub const Masks = struct {
@@ -502,37 +443,6 @@ pub const Masks = struct {
     height: usize,
 
     object_score: f32,
-
-    fn unpack(allocator: std.mem.Allocator, data: []f32) !Masks {
-        if (data.len < 4) return error.InvalidMaskData;
-        const count: usize = @intFromFloat(data[0]);
-        const width: usize = @intFromFloat(data[1]);
-        const height: usize = @intFromFloat(data[2]);
-        const object_score = data[3];
-        const stride = width * height;
-        const expected_len = 4 + count + count * stride;
-        if (data.len != expected_len) return error.InvalidMaskData;
-
-        const scores = try allocator.alloc(f32, count);
-        errdefer allocator.free(scores);
-        @memcpy(scores, data[4 .. 4 + count]);
-
-        const logits = try allocator.alloc(f32, count * stride);
-        errdefer allocator.free(logits);
-        @memcpy(logits, data[4 + count .. expected_len]);
-
-        allocator.free(data);
-
-        return .{
-            .allocator = allocator,
-            .logits = logits,
-            .scores = scores,
-            .count = count,
-            .width = width,
-            .height = height,
-            .object_score = object_score,
-        };
-    }
 
     fn take(allocator: std.mem.Allocator, iou: onnx.Value, masks: onnx.Value, object: onnx.Value) !Masks {
         var dims: [8]i64 = undefined;
@@ -606,15 +516,6 @@ pub const Masks = struct {
     pub fn deinit(self: *Masks) void {
         self.allocator.free(self.logits);
         self.allocator.free(self.scores);
-    }
-
-    fn best(self: Masks) usize {
-        if (self.count == 0) return 0;
-        var winner: usize = 0;
-        for (self.scores, 0..) |score, i| {
-            if (score > self.scores[winner]) winner = i;
-        }
-        return winner;
     }
 };
 

@@ -53,9 +53,7 @@ Features:
 - Open Image browser for loading images from disk. Select a file in the browser, or click the path field and type an absolute path. Use Parent, Up, and Down to navigate; Escape closes the browser.
 
 
-Model downloads use `curl` by default. If `curl` is not available, build with
-`-Dzig-http=true` to use Zig's built-in HTTP client instead.
+Model downloads use `curl`.
 
 The CUDA backend runs pure native Zig + PTX kernels (including double-buffered
 TF32 Tensor Core MMA and fused bias/GELU epilogues on Ampere+, with synchronous staging fallbacks for earlier architectures) directly on the CUDA driver API without linking or requiring cuBLAS.
-
