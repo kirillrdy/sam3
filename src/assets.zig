@@ -1,5 +1,4 @@
 const std = @import("std");
-const sam3 = @import("sam3.zig");
 
 pub const Asset = struct {
     name: []const u8,
@@ -20,6 +19,8 @@ pub const Asset = struct {
             if (std.ascii.eqlIgnoreCase(&have, self.sha256)) return path;
             std.debug.print("  {s}: present but checksum differs, re-downloading\n", .{self.name});
         }
+
+        try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?);
 
         const part_path = try std.fmt.allocPrint(allocator, "{s}.part", .{path});
         defer allocator.free(part_path);
@@ -75,7 +76,6 @@ pub const default_assets: Assets = .{
     .concept_tokenizer_json = .{ .name = "tokenizer.json", .url = "https://huggingface.co/danilobukvic/sam3-text-onnx/resolve/main/tokenizer.json", .sha256 = "6d9109cc838977f3ca94a379eec36aecc7c807e1785cd729660ca2fc0171fb35" },
     .cat = .{ .name = "cat.png", .url = "https://images.unsplash.com/photo-1514888286974-6c03e2ca1dba?w=800&fm=png", .sha256 = "dc6a561fc58bf60caff7a62cdd7593f5b517e43e4a75e9b220a80c3f1229ba3c" },
 };
-
 
 fn download(
     allocator: std.mem.Allocator,
