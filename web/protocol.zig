@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const magic = [4]u8{ 'S', 'A', 'M', '3' };
+const magic = [4]u8{ 'S', 'A', 'M', '3' };
 
 pub const Header = extern struct {
     magic: [4]u8 = magic,

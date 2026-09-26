@@ -2,7 +2,7 @@ const std = @import("std");
 
 // Source Code Pro Regular, 15 px, rasterized into grayscale cells.
 pub const font_width: usize = 9;
-pub const font_height: usize = 18;
+const font_height: usize = 18;
 const atlas = @embedFile("font_atlas.bin");
 
 fn blend(background: u32, foreground: u32, alpha: u8) u32 {
@@ -14,7 +14,7 @@ fn blend(background: u32, foreground: u32, alpha: u8) u32 {
     return rb | g;
 }
 
-pub fn drawChar(pixels: []u32, stride: usize, ch: u8, x: usize, y: usize, color: u32) void {
+fn drawChar(pixels: []u32, stride: usize, ch: u8, x: usize, y: usize, color: u32) void {
     if (ch < 32 or ch > 126 or stride == 0) return;
     const glyph_offset = @as(usize, ch - 32) * font_width * font_height;
     for (0..font_height) |dy| {
@@ -49,7 +49,7 @@ fn nextChar(text: []const u8, index: *usize) u8 {
     return '?';
 }
 
-pub fn textWidth(value: []const u8) usize {
+fn textWidth(value: []const u8) usize {
     var chars: usize = 0;
     var i: usize = 0;
     while (i < value.len) {

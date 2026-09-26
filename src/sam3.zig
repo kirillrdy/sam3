@@ -1,9 +1,9 @@
 const std = @import("std");
 pub const onnx = @import("onnx");
-pub const tokenizer = @import("tokenizer.zig");
+const tokenizer = @import("tokenizer.zig");
 pub const assets = @import("assets.zig").default_assets;
 pub const render = @import("render.zig");
-pub const zigimg = @import("zigimg");
+const zigimg = @import("zigimg");
 pub const Image = zigimg.Image;
 
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Image {
@@ -13,7 +13,7 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Image {
     return decoded;
 }
 
-pub const image_size: usize = 1008;
+const image_size: usize = 1008;
 
 const vision_input = "pixel_values";
 const embedding_names = [_][*:0]const u8{
@@ -192,7 +192,7 @@ pub const Model = struct {
         return ConceptEmbedding.init(self.allocator, data);
     }
 
-    pub fn encodeText(self: *Model, phrase: []const u8) !TextEmbedding {
+    fn encodeText(self: *Model, phrase: []const u8) !TextEmbedding {
         const data = try encodeConceptText(self, self.allocator, phrase);
         return TextEmbedding.init(self.allocator, data);
     }
@@ -208,7 +208,7 @@ pub const Embedding = struct {
     data: []f32,
     levels: [embedding_names.len]onnx.Value,
 
-    pub fn init(allocator: std.mem.Allocator, data: []f32) !Embedding {
+    fn init(allocator: std.mem.Allocator, data: []f32) !Embedding {
         return .{
             .allocator = allocator,
             .data = data,
@@ -231,7 +231,7 @@ pub const ConceptEmbedding = struct {
     data: []f32,
     levels: [concept_embedding_names.len]onnx.Value,
 
-    pub fn init(allocator: std.mem.Allocator, data: []f32) !ConceptEmbedding {
+    fn init(allocator: std.mem.Allocator, data: []f32) !ConceptEmbedding {
         const offsets = [_]usize{
             0,
             21233664,
@@ -279,12 +279,12 @@ pub const ConceptEmbedding = struct {
     }
 };
 
-pub const TextEmbedding = struct {
+const TextEmbedding = struct {
     allocator: std.mem.Allocator,
     data: []f32,
     value: onnx.Value,
 
-    pub fn init(allocator: std.mem.Allocator, data: []f32) !TextEmbedding {
+    fn init(allocator: std.mem.Allocator, data: []f32) !TextEmbedding {
         return .{
             .allocator = allocator,
             .data = data,
@@ -292,7 +292,7 @@ pub const TextEmbedding = struct {
         };
     }
 
-    pub fn deinit(self: *TextEmbedding) void {
+    fn deinit(self: *TextEmbedding) void {
         self.allocator.free(self.data);
         self.* = undefined;
     }
@@ -503,7 +503,7 @@ pub const Masks = struct {
 
     object_score: f32,
 
-    pub fn unpack(allocator: std.mem.Allocator, data: []f32) !Masks {
+    fn unpack(allocator: std.mem.Allocator, data: []f32) !Masks {
         if (data.len < 4) return error.InvalidMaskData;
         const count: usize = @intFromFloat(data[0]);
         const width: usize = @intFromFloat(data[1]);
@@ -608,7 +608,7 @@ pub const Masks = struct {
         self.allocator.free(self.scores);
     }
 
-    pub fn best(self: Masks) usize {
+    fn best(self: Masks) usize {
         if (self.count == 0) return 0;
         var winner: usize = 0;
         for (self.scores, 0..) |score, i| {
