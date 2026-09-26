@@ -40,47 +40,10 @@ For text lookup, call `encodeForText(image)` once, then `find(&embedding, phrase
 call `deinit` on each. The image only needs to remain valid during its encode
 call. Serialize inference calls when sharing a model between threads.
 
-## Run the web UI
+## Native apps
 
-```sh
-zig build run --release=fast -Dbackend=cuda
-```
-
-Then open <http://127.0.0.1:3000/>.
-
-## Run the native macOS UI
-
-On macOS, you can run the native Cocoa/AppKit UI directly:
-
-```sh
-zig build run-macos --release=fast
-```
-
-The native macOS app provides the same capabilities as the web UI without needing a browser:
-- Native AppKit window with dark mode theme
-- Open image dialog and drag-and-drop file loading
-- Interactive point-based segmentation (clicks add to or cut from the mask)
-- Concept text search ("Find by word")
-- Candidate mask selection with score and frame coverage statistics
-- In-process Metal GPU inference with asynchronous background execution
-
-## Run the native Linux UI (Wayland)
-
-On Linux under Wayland, run the native desktop UI directly:
-
-```sh
-zig build run-linux --release=fast -Dbackend=cuda
-```
-
-Features:
-- Pure Zig implementation of the Wayland wire protocol (`wl_shm`, `xdg_wm_base`, `wl_seat`, `wl_pointer`, `wl_keyboard`) over UNIX domain sockets with zero external C library dependencies (no `libwayland-client`).
-- Embedded bitmap font and software rasterizer for fast, lightweight rendering.
-- Interactive point segmentation: left click to add positive points, right click to cut (negative points).
-- Concept text search ("Find by word") with direct keyboard typing.
-- Candidate mask selection with score and coverage statistics.
-- Asynchronous background inference with thread-safe UI updates.
-- Open Image browser for loading images from disk. Select a file in the browser, or click the path field and type an absolute path. Use Parent, Up, and Down to navigate; Escape closes the browser.
-
+The macOS and Linux desktop apps live in `../playground/sam3-apps` and share one
+`build.zig`. See that project's README for build and run commands.
 
 Model downloads use `curl`.
 
