@@ -137,7 +137,7 @@ const Server = struct {
         query: []const u8,
         body_buffer: []u8,
     ) !void {
-        var points: [max_points]sam3.Point = undefined;
+        var points: [max_points]sam3.render.Point = undefined;
         const prompt = parsePoints(query, &points) catch
             return request.respond("bad prompt\n", .{ .status = .bad_request });
         if (prompt.len == 0) {
@@ -282,7 +282,7 @@ fn parseText(query: []const u8, out: []u8) ![]const u8 {
     return "";
 }
 
-fn parsePoints(query: []const u8, out: []sam3.Point) ![]const sam3.Point {
+fn parsePoints(query: []const u8, out: []sam3.render.Point) ![]const sam3.render.Point {
     var count: usize = 0;
     var fields = std.mem.splitScalar(u8, query, '&');
     while (fields.next()) |field| {
@@ -336,7 +336,7 @@ fn secondsSince(io: Io, started: Io.Timestamp) f64 {
 }
 
 test "a prompt is read back as the points it names" {
-    var buffer: [8]sam3.Point = undefined;
+    var buffer: [8]sam3.render.Point = undefined;
 
     const points = try parsePoints("p=0.25,0.5,1&p=0.75,0.5,0", &buffer);
     try std.testing.expectEqual(@as(usize, 2), points.len);
@@ -353,12 +353,12 @@ test "a prompt is read back as the points it names" {
 }
 
 test "a malformed point is refused rather than guessed at" {
-    var buffer: [8]sam3.Point = undefined;
+    var buffer: [8]sam3.render.Point = undefined;
     try std.testing.expectError(error.MalformedPoint, parsePoints("p=0.5", &buffer));
     try std.testing.expectError(error.MalformedPoint, parsePoints("p=1,2,3,4", &buffer));
     try std.testing.expect(std.meta.isError(parsePoints("p=x,y,1", &buffer)));
 
-    var small: [1]sam3.Point = undefined;
+    var small: [1]sam3.render.Point = undefined;
     try std.testing.expectError(error.TooManyPoints, parsePoints("p=0,0,1&p=1,1,1", &small));
 }
 
