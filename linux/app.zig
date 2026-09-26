@@ -676,8 +676,8 @@ pub const App = struct {
             self.is_busy = false;
             return;
         };
-        const decode_elapsed = secondsSince(self.io, decode_started);
-        std.debug.print("  {d} point(s) -> {d} masks in {d:.2} s\n", .{
+        const decode_elapsed = decode_started.untilNow(self.io, .awake);
+        std.debug.print("  {d} point(s) -> {d} masks in {f}\n", .{
             self.points_len,
             masks.count,
             decode_elapsed,
@@ -698,9 +698,9 @@ pub const App = struct {
 
         self.renderComposite(self.selected_mask);
 
-        const elapsed = secondsSince(self.io, started);
+        const elapsed = started.untilNow(self.io, .awake);
         var status_buf: [128]u8 = undefined;
-        const status = std.fmt.bufPrint(&status_buf, "{d} point(s) -> {d} masks in {d:.2} s", .{
+        const status = std.fmt.bufPrint(&status_buf, "{d} point(s) -> {d} masks in {f}", .{
             self.points_len,
             masks.count,
             elapsed,
@@ -765,8 +765,8 @@ pub const App = struct {
             self.is_busy = false;
             return;
         };
-        const lookup_elapsed = secondsSince(self.io, lookup_started);
-        std.debug.print("  \"{s}\" -> {d} object(s) in {d:.2} s\n", .{
+        const lookup_elapsed = lookup_started.untilNow(self.io, .awake);
+        std.debug.print("  \"{s}\" -> {d} object(s) in {f}\n", .{
             phrase,
             masks.count,
             lookup_elapsed,
@@ -795,9 +795,9 @@ pub const App = struct {
             self.selected_mask = self.best_mask_idx;
             self.renderComposite(self.selected_mask);
 
-            const elapsed = secondsSince(self.io, started);
+            const elapsed = started.untilNow(self.io, .awake);
             var status_buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&status_buf, "{d} object(s) matched “{s}” in {d:.2} s", .{
+            const msg = std.fmt.bufPrint(&status_buf, "{d} object(s) matched “{s}” in {f}", .{
                 masks.count,
                 phrase,
                 elapsed,
@@ -827,11 +827,11 @@ pub const App = struct {
         const img = self.image orelse return error.NoImageLoaded;
         const started = std.Io.Timestamp.now(self.io, .awake);
         const embedding = if (concept) try self.model.encodeConcept(img) else try self.model.encode(img);
-        std.debug.print("  {s}encoded {d}x{d} in {d:.2} s\n", .{
+        std.debug.print("  {s}encoded {d}x{d} in {f}\n", .{
             if (concept) "concept-" else "",
             img.width,
             img.height,
-            secondsSince(self.io, started),
+            started.untilNow(self.io, .awake),
         });
         return embedding;
     }
@@ -1082,9 +1082,4 @@ fn evdevToChar(key: u32, shift: bool, caps: bool) ?u8 {
         '\'' => '"', '`' => '~', '\\' => '|', ',' => '<', '.' => '>', '/' => '?',
         else => ch,
     };
-}
-
-fn secondsSince(io: std.Io, started: std.Io.Timestamp) f64 {
-    const elapsed = started.durationTo(std.Io.Timestamp.now(io, .awake));
-    return @as(f64, @floatFromInt(elapsed.nanoseconds)) / 1e9;
 }
