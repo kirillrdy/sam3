@@ -2,6 +2,7 @@
 
 Native SAM 3 image segmentation and text lookup with CUDA, Intel ARC, OpenCL, and Metal
 backends. Model graphs execute through the repository's Zig ONNX runtime.
+The SAM 3 library runs inference directly; applications can add their own caching, including zimo, around calls to the library.
 
 - support CUDA, Intel Arc, OpenCL, Metal
 - zero dependencies ( except for metal backend )

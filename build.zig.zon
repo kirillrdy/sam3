@@ -16,10 +16,6 @@
             .url = "git+https://github.com/kirillrdy/onnx#bb219804f5f9f077d9b3c5ba8e4947de5819824f",
             .hash = "onnx-0.0.0-S9CpBdaICACbLqNhZzK-IQHBxGwe-YibEOmgmSrNitzG",
         },
-        .zimo = .{
-            .url = "git+https://github.com/kirillrdy/cache#38eaed4c59f76dc8ec03c7ea07ecfb721c2b57ca",
-            .hash = "zimo-0.1.0-014_hIq2AAA7hEZ6zdz0Cv989Mn3NJJ5KZyjtK5QbzDZ",
-        },
     },
     .paths = .{
         "build.zig",
