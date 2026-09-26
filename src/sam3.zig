@@ -36,11 +36,7 @@ const concept_embedding_names = [_][*:0]const u8{
     "fpn_hidden_state_0",
     "fpn_hidden_state_1",
     "fpn_hidden_state_2",
-    "fpn_hidden_state_3",
-    "fpn_position_encoding_0",
-    "fpn_position_encoding_1",
     "fpn_position_encoding_2",
-    "fpn_position_encoding_3",
 };
 const concept_decoder_inputs = [_][*:0]const u8{
     "fpn_hidden_state_0",
@@ -52,7 +48,6 @@ const concept_decoder_inputs = [_][*:0]const u8{
 };
 const concept_decoder_outputs = [_][*:0]const u8{
     "pred_masks",
-    "pred_boxes",
     "pred_logits",
 };
 
@@ -190,8 +185,8 @@ pub const Model = struct {
         return ConceptEmbedding.init(self.allocator, data);
     }
 
-    fn encodeText(self: *Model, phrase: []const u8) !TextEmbedding {
-        const data = try encodeConceptText(self, self.allocator, phrase);
+    fn encodeText(self: *Model, encoding: tokenizer.Encoding) !TextEmbedding {
+        const data = try encodeConceptText(self, self.allocator, encoding);
         return TextEmbedding.init(self.allocator, data);
     }
 
@@ -234,33 +229,21 @@ pub const ConceptEmbedding = struct {
             21233664,
             26542080,
             27869184,
-            28200960,
-            49434624,
-            54743040,
-            56070144,
         };
         const lens = [_]usize{
             21233664,
             5308416,
             1327104,
-            331776,
-            21233664,
-            5308416,
             1327104,
-            331776,
         };
         const shapes = [_][4]i64{
             .{ 1, 256, 288, 288 },
             .{ 1, 256, 144, 144 },
             .{ 1, 256, 72, 72 },
-            .{ 1, 256, 36, 36 },
-            .{ 1, 256, 288, 288 },
-            .{ 1, 256, 144, 144 },
             .{ 1, 256, 72, 72 },
-            .{ 1, 256, 36, 36 },
         };
         var levels: [concept_embedding_names.len]onnx.Value = undefined;
-        inline for (0..8) |i| {
+        inline for (0..concept_embedding_names.len) |i| {
             levels[i] = try onnx.Value.borrowF32(data[offsets[i]..][0..lens[i]], &shapes[i]);
         }
         return .{
@@ -356,8 +339,8 @@ fn encodeConceptVision(
     );
     defer for (levels) |level| level.deinit();
 
-    const lens = [_]usize{ 21233664, 5308416, 1327104, 331776, 21233664, 5308416, 1327104, 331776 };
-    const total_floats = 56401920;
+    const lens = [_]usize{ 21233664, 5308416, 1327104, 1327104 };
+    const total_floats = 29196288;
     const out = try allocator.alloc(f32, total_floats);
     errdefer allocator.free(out);
 
@@ -374,9 +357,8 @@ fn encodeConceptVision(
 fn encodeConceptText(
     model: *Model,
     allocator: std.mem.Allocator,
-    phrase: []const u8,
+    encoding: tokenizer.Encoding,
 ) ![]f32 {
-    const encoding = try model.concept_tokenizer.encode(phrase);
     const token_shape = [_]i64{ 1, tokenizer.max_tokens };
     const ids = try onnx.Value.borrowI64(&encoding.ids, &token_shape);
     defer ids.deinit();
@@ -405,10 +387,10 @@ fn decodeConceptQuery(
     phrase: []const u8,
     threshold: f32,
 ) !Masks {
-    var text_embedding = try model.encodeText(phrase);
+    const encoding = try model.concept_tokenizer.encode(phrase);
+    var text_embedding = try model.encodeText(encoding);
     defer text_embedding.deinit();
 
-    const encoding = try model.concept_tokenizer.encode(phrase);
     const token_shape = [_]i64{ 1, tokenizer.max_tokens };
     const attention = try onnx.Value.borrowI64(&encoding.attention, &token_shape);
     defer attention.deinit();
@@ -417,7 +399,7 @@ fn decodeConceptQuery(
         embedding.levels[0],
         embedding.levels[1],
         embedding.levels[2],
-        embedding.levels[6],
+        embedding.levels[3],
         text_embedding.value,
         attention,
     };
@@ -430,7 +412,7 @@ fn decodeConceptQuery(
     );
     defer for (results) |result| result.deinit();
 
-    return Masks.takeConcept(allocator, results[0], results[2], threshold);
+    return Masks.takeConcept(allocator, results[0], results[1], threshold);
 }
 
 pub const Masks = struct {
