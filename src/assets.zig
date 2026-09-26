@@ -5,6 +5,42 @@ pub const Asset = struct {
     name: []const u8,
     url: []const u8,
     sha256: []const u8,
+
+    pub fn ensure(
+        self: Asset,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        path: []const u8,
+        use_zig_http: bool,
+    ) !void {
+        if (try hashFile(io, path)) |have| {
+            if (std.ascii.eqlIgnoreCase(&have, self.sha256)) return;
+            std.debug.print("  {s}: present but checksum differs, re-downloading\n", .{self.name});
+        }
+
+        const part_path = try std.fmt.allocPrint(allocator, "{s}.part", .{path});
+        defer allocator.free(part_path);
+
+        std.debug.print("  {s}: downloading\n", .{self.name});
+        try download(allocator, io, self.url, part_path, use_zig_http);
+
+        const have = (try hashFile(io, part_path)) orelse return error.DownloadDisappeared;
+        if (!std.ascii.eqlIgnoreCase(&have, self.sha256)) {
+            std.debug.print(
+                \\  {s}: SHA-256 mismatch
+                \\    expected {s}
+                \\    actual   {s}
+                \\
+            , .{ self.name, self.sha256, &have });
+            std.Io.Dir.cwd().deleteFile(io, part_path) catch {};
+            return error.ChecksumMismatch;
+        }
+        std.debug.print("  {s}: verified against the published SHA-256\n", .{self.name});
+
+        const cwd = std.Io.Dir.cwd();
+        try cwd.rename(part_path, cwd, path, io);
+        std.debug.print("  {s}: cached in {s}\n", .{ self.name, path });
+    }
 };
 
 pub const assets = [_]Asset{
@@ -95,45 +131,9 @@ pub fn cacheAssets(
     for (assets, 0..) |asset, i| {
         cached.paths[i] = try std.fs.path.join(allocator, &.{ cache_dir, asset.name });
         initialized += 1;
-        try ensureAsset(allocator, io, asset, cached.paths[i], use_zig_http);
+        try asset.ensure(allocator, io, cached.paths[i], use_zig_http);
     }
     return cached;
-}
-
-fn ensureAsset(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    asset: Asset,
-    path: []const u8,
-    use_zig_http: bool,
-) !void {
-    if (try hashFile(io, path)) |have| {
-        if (std.ascii.eqlIgnoreCase(&have, asset.sha256)) return;
-        std.debug.print("  {s}: present but checksum differs, re-downloading\n", .{asset.name});
-    }
-
-    const part_path = try std.fmt.allocPrint(allocator, "{s}.part", .{path});
-    defer allocator.free(part_path);
-
-    std.debug.print("  {s}: downloading\n", .{asset.name});
-    try download(allocator, io, asset.url, part_path, use_zig_http);
-
-    const have = (try hashFile(io, part_path)) orelse return error.DownloadDisappeared;
-    if (!std.ascii.eqlIgnoreCase(&have, asset.sha256)) {
-        std.debug.print(
-            \\  {s}: SHA-256 mismatch
-            \\    expected {s}
-            \\    actual   {s}
-            \\
-        , .{ asset.name, asset.sha256, &have });
-        std.Io.Dir.cwd().deleteFile(io, part_path) catch {};
-        return error.ChecksumMismatch;
-    }
-    std.debug.print("  {s}: verified against the published SHA-256\n", .{asset.name});
-
-    const cwd = std.Io.Dir.cwd();
-    try cwd.rename(part_path, cwd, path, io);
-    std.debug.print("  {s}: cached in {s}\n", .{ asset.name, path });
 }
 
 fn download(
