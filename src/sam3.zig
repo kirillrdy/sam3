@@ -202,8 +202,7 @@ pub const Model = struct {
 
     /// The returned embedding owns its memory and can serve multiple text prompts.
     pub fn encodeForText(self: *Model, img: RgbImage) !TextImageEmbedding {
-        const data = try encodeConceptVision(self, self.allocator, img);
-        return TextImageEmbedding.init(self.allocator, data);
+        return encodeConceptVision(self, img);
     }
 
     fn encodeText(self: *Model, encoding: tokenizer.Encoding) !TextEmbedding {
@@ -251,42 +250,10 @@ pub const PointEmbedding = struct {
 };
 
 pub const TextImageEmbedding = struct {
-    allocator: std.mem.Allocator,
-    data: []f32,
     levels: [concept_embedding_names.len]onnx.Value,
 
-    fn init(allocator: std.mem.Allocator, data: []f32) !TextImageEmbedding {
-        const offsets = [_]usize{
-            0,
-            21233664,
-            26542080,
-            27869184,
-        };
-        const lens = [_]usize{
-            21233664,
-            5308416,
-            1327104,
-            1327104,
-        };
-        const shapes = [_][4]i64{
-            .{ 1, 256, 288, 288 },
-            .{ 1, 256, 144, 144 },
-            .{ 1, 256, 72, 72 },
-            .{ 1, 256, 72, 72 },
-        };
-        var levels: [concept_embedding_names.len]onnx.Value = undefined;
-        inline for (0..concept_embedding_names.len) |i| {
-            levels[i] = try onnx.Value.borrowF32(data[offsets[i]..][0..lens[i]], &shapes[i]);
-        }
-        return .{
-            .allocator = allocator,
-            .data = data,
-            .levels = levels,
-        };
-    }
-
     pub fn deinit(self: *TextImageEmbedding) void {
-        self.allocator.free(self.data);
+        for (self.levels) |level| level.deinit();
         self.* = undefined;
     }
 };
@@ -347,43 +314,29 @@ fn encodeVision(
 
 fn encodeConceptVision(
     model: *Model,
-    allocator: std.mem.Allocator,
     img: RgbImage,
-) ![]f32 {
+) !TextImageEmbedding {
     const pixels = try preprocessCpu(
-        allocator,
+        model.allocator,
         img,
         .{ 0.485, 0.456, 0.406 },
         .{ 0.229, 0.224, 0.225 },
     );
-    defer allocator.free(pixels);
+    defer model.allocator.free(pixels);
 
     const pixel_shape = [_]i64{ 1, 3, image_size, image_size };
     const pixel_values = try onnx.Value.borrowF32(pixels, &pixel_shape);
     defer pixel_values.deinit();
 
     var levels: [concept_embedding_names.len]onnx.Value = undefined;
-    try model.concept_vision.run(
+    try model.concept_vision.runDevice(
         &.{vision_input},
         &.{pixel_values},
         &concept_embedding_names,
         &levels,
     );
-    defer for (levels) |level| level.deinit();
 
-    const lens = [_]usize{ 21233664, 5308416, 1327104, 1327104 };
-    const total_floats = 29196288;
-    const out = try allocator.alloc(f32, total_floats);
-    errdefer allocator.free(out);
-
-    var offset: usize = 0;
-    for (levels, lens) |level, len| {
-        const data = try level.dataF32();
-        @memcpy(out[offset..][0..len], data);
-        offset += len;
-    }
-
-    return out;
+    return .{ .levels = levels };
 }
 
 fn encodeConceptText(
@@ -560,7 +513,7 @@ fn max(values: []const f32) f32 {
 }
 
 /// The CPU path, and the reference the CUDA kernel is checked against.
-fn preprocessCpu(allocator: std.mem.Allocator, img: RgbImage, mean: [3]f32, deviation: [3]f32) ![]f32 {
+pub fn preprocessCpu(allocator: std.mem.Allocator, img: RgbImage, mean: [3]f32, deviation: [3]f32) ![]f32 {
     if (img.width == 0 or img.height == 0) return error.InvalidImage;
     const pixel_count = std.math.mul(usize, img.width, img.height) catch return error.InvalidImage;
     const byte_count = std.math.mul(usize, pixel_count, 3) catch return error.InvalidImage;

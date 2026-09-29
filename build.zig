@@ -65,6 +65,26 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zigimg", .module = zigimg.module("zigimg") },
         },
     }));
+
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sam3", .module = mod },
+            .{ .name = "zigimg", .module = zigimg.module("zigimg") },
+        },
+    });
+    const bench_exe = b.addExecutable(.{
+        .name = "benchmark",
+        .root_module = bench_mod,
+    });
+    const run_bench = b.addRunArtifact(bench_exe);
+    if (b.args) |args| {
+        run_bench.addArgs(args);
+    }
+    const bench_step = b.step("bench", "Run text querying benchmark on cat image");
+    bench_step.dependOn(&run_bench.step);
 }
 
 fn addTest(b: *std.Build, step: *std.Build.Step, module: *std.Build.Module) void {
