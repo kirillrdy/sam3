@@ -80,6 +80,7 @@ pub fn build(b: *std.Build) void {
         .root_module = bench_mod,
     });
     const run_bench = b.addRunArtifact(bench_exe);
+    b.installArtifact(bench_exe);
     if (b.args) |args| {
         run_bench.addArgs(args);
     }
