@@ -13,8 +13,8 @@
             .hash = "zigimg-0.1.0-8_eo2jPCFwDJF89NMU5gJjpTRoFdda26viRcdxyJP0Ks",
         },
         .onnx = .{
-            .url = "git+https://github.com/kirillrdy/onnx#e952ce51b3ee3933020114cb74a1873e6e49307b",
-            .hash = "onnx-0.0.0-S9CpBQgqCQAssVwcoB9_TWozzFkdmHVNajEP8lJbTAn2",
+            .url = "git+https://github.com/kirillrdy/onnx#4f39794f87a3070dfedfc177672a29d5c4985d3d",
+            .hash = "onnx-0.0.0-S9CpBaUvCQAUKY3GhI7_ul-o0yTCs6Naz5cw_bxKVa6o",
         },
     },
     .paths = .{
