@@ -81,9 +81,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_bench = b.addRunArtifact(bench_exe);
     b.installArtifact(bench_exe);
-    if (b.args) |args| {
-        run_bench.addArgs(args);
-    }
+    run_bench.addPassthruArgs();
     const bench_step = b.step("bench", "Run text querying benchmark on cat image");
     bench_step.dependOn(&run_bench.step);
 }

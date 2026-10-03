@@ -5,16 +5,17 @@
 
     .fingerprint = 0x7e580585fe19b56a,
 
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
 
     .dependencies = .{
         .zigimg = .{
-            .url = "git+https://github.com/nothke/zigimg#581795265e1caee099baae32883c0f9d4f28f81a",
-            .hash = "zigimg-0.1.0-8_eo2jPCFwDJF89NMU5gJjpTRoFdda26viRcdxyJP0Ks",
+            // Temporary Zig 0.17 migration fork: https://github.com/zigimg/zigimg/pull/335
+            .url = "git+https://github.com/sergot/zigimg#c701c9f99779d7ddf594dcc6da8f858fd277d61f",
+            .hash = "zigimg-0.1.0-8_eo2ri_FwBqF5UYiggLz4IGjHJO_n9-B6gT9Ayqg8G4",
         },
         .onnx = .{
-            .url = "git+https://github.com/kirillrdy/onnx#4f39794f87a3070dfedfc177672a29d5c4985d3d",
-            .hash = "onnx-0.0.0-S9CpBaUvCQAUKY3GhI7_ul-o0yTCs6Naz5cw_bxKVa6o",
+            .url = "git+https://github.com/kirillrdy/onnx#4044387be81d251354cf1c77297ae183c92b7fd5",
+            .hash = "onnx-0.0.0-S9CpBXszCQA43QLAi1GBP22k3lnIdpPUJglNsto7-4h7",
         },
     },
     .paths = .{
