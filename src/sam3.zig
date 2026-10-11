@@ -72,8 +72,8 @@ const concept_decoder_outputs = [_][*:0]const u8{
 pub const Model = struct {
     allocator: std.mem.Allocator,
     env: onnx.Env,
-    vision: onnx.Session,
-    decoder: onnx.Session,
+    vision: ?onnx.Session,
+    decoder: ?onnx.Session,
     concept_vision: onnx.Session,
     concept_text: onnx.Session,
     concept_decoder: onnx.Session,
@@ -81,22 +81,35 @@ pub const Model = struct {
 
     /// Downloads missing default graphs into the cache and opens them.
     pub fn open(allocator: std.mem.Allocator, io: std.Io) !Model {
+        return openWithPoints(allocator, io, true);
+    }
+
+    /// Opens only text-prompt graphs, omitting the point encoder and decoder.
+    pub fn openText(allocator: std.mem.Allocator, io: std.Io) !Model {
+        return openWithPoints(allocator, io, false);
+    }
+
+    fn openWithPoints(allocator: std.mem.Allocator, io: std.Io, points: bool) !Model {
         const env = try onnx.Env.init(allocator, io);
         errdefer env.deinit();
 
-        const vision_data = try assets.vision_encoder_data.get(allocator, io);
-        defer allocator.free(vision_data);
-        const vision_path = try assets.vision_encoder.get(allocator, io);
-        defer allocator.free(vision_path);
-        const vision = try onnx.Session.open(env, vision_path);
-        errdefer vision.deinit();
+        const vision: ?onnx.Session = if (points) blk: {
+            const data = try assets.vision_encoder_data.get(allocator, io);
+            defer allocator.free(data);
+            const path = try assets.vision_encoder.get(allocator, io);
+            defer allocator.free(path);
+            break :blk try onnx.Session.open(env, path);
+        } else null;
+        errdefer if (vision) |session| session.deinit();
 
-        const decoder_data = try assets.decoder_data.get(allocator, io);
-        defer allocator.free(decoder_data);
-        const decoder_path = try assets.decoder.get(allocator, io);
-        defer allocator.free(decoder_path);
-        const decoder = try onnx.Session.open(env, decoder_path);
-        errdefer decoder.deinit();
+        const decoder: ?onnx.Session = if (points) blk: {
+            const data = try assets.decoder_data.get(allocator, io);
+            defer allocator.free(data);
+            const path = try assets.decoder.get(allocator, io);
+            defer allocator.free(path);
+            break :blk try onnx.Session.open(env, path);
+        } else null;
+        errdefer if (decoder) |session| session.deinit();
 
         const concept_vision_data = try assets.concept_vision_encoder_data.get(allocator, io);
         defer allocator.free(concept_vision_data);
@@ -146,8 +159,8 @@ pub const Model = struct {
         self.concept_decoder.deinit();
         self.concept_text.deinit();
         self.concept_vision.deinit();
-        self.decoder.deinit();
-        self.vision.deinit();
+        if (self.decoder) |session| session.deinit();
+        if (self.vision) |session| session.deinit();
         self.env.deinit();
     }
 
@@ -189,7 +202,8 @@ pub const Model = struct {
         inputs[3..].* = embedding.levels;
 
         var results: [decoder_outputs.len]onnx.Value = undefined;
-        try self.decoder.run(
+        const decoder = self.decoder orelse return error.PointModelsNotLoaded;
+        try decoder.run(
             &decoder_inputs,
             &inputs,
             &decoder_outputs,
@@ -290,7 +304,8 @@ fn encodeVision(
     defer pixel_values.deinit();
 
     var levels: [embedding_names.len]onnx.Value = undefined;
-    try model.vision.run(
+    const vision = model.vision orelse return error.PointModelsNotLoaded;
+    try vision.run(
         &.{vision_input},
         &.{pixel_values},
         &embedding_names,
