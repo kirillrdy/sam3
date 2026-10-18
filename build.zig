@@ -1,36 +1,8 @@
 const std = @import("std");
-const onnx_build = @import("onnx");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-
-    const default_backend: onnx_build.Backend = if (target.result.os.tag.isDarwin()) .metal else .opencl;
-    const backend = b.option(
-        onnx_build.Backend,
-        "backend",
-        "ONNX execution backend: native OpenCL, Metal, or CUDA",
-    ) orelse default_backend;
-
-    if (backend == .metal and !target.result.os.tag.isDarwin()) {
-        std.log.err("the Metal backend requires an Apple target", .{});
-        std.process.exit(1);
-    }
-
-    const cuda_arch = b.option(
-        []const u8,
-        "sm",
-        "Compute capability the CUDA kernels are built for (default: " ++ onnx_build.default_cuda_arch ++ ")",
-    ) orelse onnx_build.default_cuda_arch;
-
-    // What the runtime stores a float tensor as. Half is the default
-    // on OpenCL and Metal, where nearly every operator is bound by how many
-    // bytes it moves, and is the precision GPU execution providers use anyway.
-    const half = b.option(
-        bool,
-        "half",
-        "Store float tensors on the device as halves (default: true with -Dbackend=opencl or metal)",
-    ) orelse (backend != .cuda);
 
     const zigimg = b.dependency("zigimg", .{
         .target = target,
@@ -49,9 +21,6 @@ pub fn build(b: *std.Build) void {
     const onnx = b.dependency("onnx", .{
         .target = target,
         .optimize = optimize,
-        .backend = backend,
-        .sm = cuda_arch,
-        .half = half,
     });
     mod.addImport("onnx", onnx.module("onnx"));
 
