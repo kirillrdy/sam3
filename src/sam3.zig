@@ -450,6 +450,16 @@ pub fn preprocessCpu(allocator: std.mem.Allocator, img: RgbImage, mean: [3]f32, 
     const ratio_y = @as(f32, @floatFromInt(img.height)) / @as(f32, @floatFromInt(image_size));
     const ratio_x = @as(f32, @floatFromInt(img.width)) / @as(f32, @floatFromInt(image_size));
     const byte_scale: f32 = 1.0 / 255.0;
+    const inv_deviation: [3]f32 = .{
+        1.0 / deviation[0],
+        1.0 / deviation[1],
+        1.0 / deviation[2],
+    };
+
+    var x_samples: [image_size]render.AxisSample = undefined;
+    for (&x_samples, 0..) |*sx, x| {
+        sx.* = render.axisSample(x, ratio_x, img.width);
+    }
 
     // Resize all three interleaved byte channels together and write directly
     // into the model's planar normalized tensor.
@@ -458,8 +468,7 @@ pub fn preprocessCpu(allocator: std.mem.Allocator, img: RgbImage, mean: [3]f32, 
         const row0 = pixels[sy.lo * img.width * 3 ..][0 .. img.width * 3];
         const row1 = pixels[sy.hi * img.width * 3 ..][0 .. img.width * 3];
 
-        for (0..image_size) |x| {
-            const sx = render.axisSample(x, ratio_x, img.width);
+        for (x_samples, 0..) |sx, x| {
             const p00 = row0[sx.lo * 3 ..][0..3];
             const p01 = row0[sx.hi * 3 ..][0..3];
             const p10 = row1[sx.lo * 3 ..][0..3];
@@ -475,7 +484,7 @@ pub fn preprocessCpu(allocator: std.mem.Allocator, img: RgbImage, mean: [3]f32, 
                     sx.w,
                     sy.w,
                 ) * byte_scale;
-                out[channel * plane_size + index] = (resized - mean[channel]) / deviation[channel];
+                out[channel * plane_size + index] = (resized - mean[channel]) * inv_deviation[channel];
             }
         }
     }
@@ -515,6 +524,119 @@ test "mask planes borrow the corresponding logits" {
     };
     defer masks.deinit();
     try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, masks.plane(1));
+}
+
+test "Masks.take extracts point decoder masks, scores, and object score" {
+    const allocator = std.testing.allocator;
+    const iou_data = [_]f32{ 0.42, 0.91 };
+    const mask_data = [_]f32{
+        -1.0, 2.0,
+        3.0,  -4.0,
+        5.0,  6.0,
+        -7.0, 8.0,
+    };
+    const obj_data = [_]f32{0.85};
+
+    const iou = try onnx.Value.borrowF32(&iou_data, &.{ 1, 1, 2 });
+    defer iou.deinit();
+    const mask_val = try onnx.Value.borrowF32(&mask_data, &.{ 1, 1, 2, 2, 2 });
+    defer mask_val.deinit();
+    const obj = try onnx.Value.borrowF32(&obj_data, &.{ 1, 1 });
+    defer obj.deinit();
+
+    var masks = try Masks.take(allocator, iou, mask_val, obj);
+    defer masks.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), masks.count);
+    try std.testing.expectEqual(@as(usize, 2), masks.width);
+    try std.testing.expectEqual(@as(usize, 2), masks.height);
+    try std.testing.expectEqual(@as(f32, 0.85), masks.object_score);
+    try std.testing.expectEqualSlices(f32, &iou_data, masks.scores);
+    try std.testing.expectEqualSlices(f32, &.{ -1.0, 2.0, 3.0, -4.0 }, masks.plane(0));
+    try std.testing.expectEqualSlices(f32, &.{ 5.0, 6.0, -7.0, 8.0 }, masks.plane(1));
+}
+
+test "Masks.takeConcept filters masks by sigmoid score threshold" {
+    const allocator = std.testing.allocator;
+    const mask_data = [_]f32{
+        1.0,  2.0,
+        3.0,  4.0,
+        -1.0, -2.0,
+        5.0,  6.0,
+        7.0,  8.0,
+        9.0,  10.0,
+    };
+    // sigmoid(2.0) ~= 0.8808, sigmoid(0.0) = 0.5, sigmoid(-2.0) ~= 0.1192
+    const logits_data = [_]f32{ 2.0, -2.0, 0.0 };
+
+    const mask_val = try onnx.Value.borrowF32(&mask_data, &.{ 1, 3, 2, 2 });
+    defer mask_val.deinit();
+    const score_val = try onnx.Value.borrowF32(&logits_data, &.{ 1, 3 });
+    defer score_val.deinit();
+
+    var kept = try Masks.takeConcept(allocator, mask_val, score_val, 0.5);
+    defer kept.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), kept.count);
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0, 3.0, 4.0 }, kept.plane(0));
+    try std.testing.expectEqualSlices(f32, &.{ 7.0, 8.0, 9.0, 10.0 }, kept.plane(1));
+    try std.testing.expectApproxEqAbs(sigmoid(2.0), kept.object_score, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), kept.scores[1], 1e-6);
+
+    var empty = try Masks.takeConcept(allocator, mask_val, score_val, 0.99);
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.count);
+    try std.testing.expectEqual(@as(f32, 0.0), empty.object_score);
+
+    const bad_shape = try onnx.Value.borrowF32(&mask_data, &.{ 2, 3, 2, 1 });
+    defer bad_shape.deinit();
+    try std.testing.expectError(
+        error.UnexpectedConceptMaskShape,
+        Masks.takeConcept(allocator, bad_shape, score_val, 0.5),
+    );
+}
+
+test "main sam3 image path: decode, preprocess, score, and composite" {
+    const allocator = std.testing.allocator;
+
+    // 2x2 RGB image encoded as PNG in memory, then decoded via decodeImage.
+    var src = try Image.create(allocator, 2, 2, .rgb24);
+    defer src.deinit(allocator);
+    src.pixels.rgb24[0] = .{ .r = 255, .g = 0, .b = 0 };
+    src.pixels.rgb24[1] = .{ .r = 0, .g = 255, .b = 0 };
+    src.pixels.rgb24[2] = .{ .r = 0, .g = 0, .b = 255 };
+    src.pixels.rgb24[3] = .{ .r = 255, .g = 255, .b = 255 };
+
+    var png_buf: [1024]u8 = undefined;
+    const png_bytes = try src.writeToMemory(allocator, &png_buf, .{ .png = .{} });
+
+    var decoded = try decodeImage(allocator, png_bytes);
+    defer decoded.deinit(allocator);
+
+    const rgb = RgbImage.fromImage(decoded);
+    const tensor = try preprocessCpu(allocator, rgb, .{ 0.5, 0.5, 0.5 }, .{ 0.5, 0.5, 0.5 });
+    defer allocator.free(tensor);
+
+    const plane_size = image_size * image_size;
+    try std.testing.expectEqual(@as(usize, 3 * plane_size), tensor.len);
+    // Top-left corner maps to pixel (0,0) = (255, 0, 0) -> normalized (1.0, -1.0, -1.0).
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), tensor[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), tensor[plane_size], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), tensor[2 * plane_size], 1e-5);
+
+    const mask_logits = [_]f32{ 1.0, -1.0, -1.0, -1.0 };
+    const scores = [_]f32{0.95};
+    var coverages: [1]f32 = undefined;
+    const best = render.scoreMasks(&mask_logits, &scores, 1, 2, 2, &coverages);
+    try std.testing.expectEqual(@as(usize, 0), best);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), coverages[0], 1e-6);
+
+    var rgba: [2 * 2 * 4]u8 = undefined;
+    render.compositeRgba(decoded, &rgba, &mask_logits, 2, 2, &.{});
+    // Pixel (0,0) is tinted with mask_color (0, 220, 100) at alpha 0.5 over (255, 0, 0).
+    try std.testing.expectEqualSlices(u8, &.{ 127, 110, 50, 255 }, rgba[0..4]);
+    // Pixel (1,0) is untinted (0, 255, 0).
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, rgba[4..8]);
 }
 
 test {

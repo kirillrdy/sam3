@@ -104,8 +104,7 @@ pub const Tokenizer = struct {
             var best_left: ?[]const u8 = null;
             var best_right: ?[]const u8 = null;
             for (symbols.items[0 .. symbols.items.len - 1], symbols.items[1..]) |left, right| {
-                const key = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ left, right });
-                if (self.merges.get(key)) |rank| {
+                if (try self.lookupMerge(allocator, left, right)) |rank| {
                     if (rank < best_rank) {
                         best_rank = rank;
                         best_left = left;
@@ -136,6 +135,24 @@ pub const Tokenizer = struct {
         const ids = try allocator.alloc(i64, symbols.items.len);
         for (symbols.items, ids) |symbol, *id| id.* = self.vocab.get(symbol) orelse eos_token;
         return ids;
+    }
+
+    fn lookupMerge(
+        self: *const Tokenizer,
+        allocator: std.mem.Allocator,
+        left: []const u8,
+        right: []const u8,
+    ) !?usize {
+        const needed = left.len + 1 + right.len;
+        var stack_buf: [256]u8 = undefined;
+        const buf = if (needed <= stack_buf.len)
+            stack_buf[0..needed]
+        else
+            try allocator.alloc(u8, needed);
+        @memcpy(buf[0..left.len], left);
+        buf[left.len] = 0;
+        @memcpy(buf[left.len + 1 ..], right);
+        return self.merges.get(buf);
     }
 };
 
@@ -239,4 +256,33 @@ test "pre-tokenization separates words, digits, punctuation, and contractions" {
         try std.testing.expectEqualStrings(want, nextPiece(text, &cursor).?);
     }
     try std.testing.expectEqual(null, nextPiece(text, &cursor));
+}
+
+test "encode applies BPE merges, BOS/EOS framing, and max_tokens truncation" {
+    const json =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {
+        \\      "c": 1, "a": 2, "t</w>": 3,
+        \\      "ca": 4, "cat</w>": 5
+        \\    },
+        \\    "merges": [["c", "a"], ["ca", "t</w>"]]
+        \\  }
+        \\}
+    ;
+    var tok = try Tokenizer.init(std.testing.allocator, json);
+    defer tok.deinit();
+
+    const enc = try tok.encode("Cat");
+    try std.testing.expectEqual(bos_token, enc.ids[0]);
+    try std.testing.expectEqual(@as(i64, 5), enc.ids[1]);
+    try std.testing.expectEqual(eos_token, enc.ids[2]);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 1, 1, 0 }, enc.attention[0..4]);
+
+    // 40 single-token words exceed max_tokens (32); output must reserve slot 0 for BOS and 31 for EOS.
+    const long_enc = try tok.encode("a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a");
+    try std.testing.expectEqual(bos_token, long_enc.ids[0]);
+    try std.testing.expectEqual(eos_token, long_enc.ids[max_tokens - 1]);
+    for (long_enc.attention) |att| try std.testing.expectEqual(@as(i64, 1), att);
 }

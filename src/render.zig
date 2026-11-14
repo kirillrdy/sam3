@@ -76,7 +76,6 @@ pub fn scoreMasks(logits: []const f32, scores: []const f32, count: usize, width:
 }
 
 pub fn compositeRgba(
-    allocator: std.mem.Allocator,
     img: zigimg.Image,
     frame_rgba: []u8,
     mask_plane: ?[]const f32,
@@ -84,7 +83,6 @@ pub fn compositeRgba(
     mask_height: usize,
     points: []const Point,
 ) void {
-    _ = allocator;
     if (img.width == 0 or img.height == 0) return;
     const pixels = img.pixels.rgb24;
     std.debug.assert(frame_rgba.len >= pixels.len * 4);
@@ -142,7 +140,7 @@ test "compositeRgba tints positive logit pixels" {
 
     const mask = [_]f32{ 1.0, -1.0 };
     var rgba: [8]u8 = undefined;
-    compositeRgba(allocator, img, &rgba, &mask, 2, 1, &.{});
+    compositeRgba(img, &rgba, &mask, 2, 1, &.{});
 
     try std.testing.expectEqualSlices(u8, &.{ 50, 160, 100, 255, 100, 100, 100, 255 }, &rgba);
 }
@@ -154,7 +152,7 @@ test "compositeRgba draws positive green and negative red markers" {
     @memset(img.pixels.rgb24, .{ .r = 0, .g = 0, .b = 0 });
 
     var rgba: [20 * 20 * 4]u8 = undefined;
-    compositeRgba(allocator, img, &rgba, null, 0, 0, &.{
+    compositeRgba(img, &rgba, null, 0, 0, &.{
         .{ .x = 0.2, .y = 0.2, .label = .positive },
         .{ .x = 0.8, .y = 0.8, .label = .negative },
     });
