@@ -39,13 +39,13 @@ pub const Tokenizer = struct {
 
         const strings = self.arena.allocator();
 
-        try self.vocab.ensureTotalCapacity(allocator, @intCast(model.vocab.map.count()));
+        try self.vocab.ensureTotalCapacity(strings, @intCast(model.vocab.map.count()));
         for (model.vocab.map.keys(), model.vocab.map.values()) |k, v| {
             const owned = try strings.dupe(u8, k);
             self.vocab.putAssumeCapacity(owned, v);
         }
 
-        try self.merges.ensureTotalCapacity(allocator, @intCast(model.merges.len));
+        try self.merges.ensureTotalCapacity(strings, @intCast(model.merges.len));
         for (model.merges, 0..) |m, rank| {
             const key = try std.fmt.allocPrint(strings, "{s}\x00{s}", .{ m[0], m[1] });
             self.merges.putAssumeCapacity(key, rank);
@@ -55,8 +55,6 @@ pub const Tokenizer = struct {
     }
 
     pub fn deinit(self: *Tokenizer) void {
-        self.merges.deinit(self.allocator);
-        self.vocab.deinit(self.allocator);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -78,15 +76,14 @@ pub const Tokenizer = struct {
 
         var cursor: usize = 0;
         var count: usize = 1;
-        while (nextPiece(normalized, &cursor)) |piece| {
-            const ids = try self.encodePiece(arena, piece);
-            for (ids) |id| {
+        while (count < max_tokens - 1) {
+            const piece = nextPiece(normalized, &cursor) orelse break;
+            for (try self.encodePiece(arena, piece)) |id| {
                 if (count == max_tokens - 1) break;
                 result.ids[count] = id;
                 result.attention[count] = 1;
                 count += 1;
             }
-            if (count == max_tokens - 1) break;
         }
         result.ids[count] = eos_token;
         result.attention[count] = 1;
@@ -119,25 +116,21 @@ pub const Tokenizer = struct {
             const left = best_left orelse break;
             const right = best_right.?;
 
-            var merged: std.ArrayList([]const u8) = .empty;
+            var write: usize = 0;
             var i: usize = 0;
-            while (i < symbols.items.len) {
+            while (i < symbols.items.len) : (write += 1) {
                 if (i + 1 < symbols.items.len and
                     std.mem.eql(u8, symbols.items[i], left) and
                     std.mem.eql(u8, symbols.items[i + 1], right))
                 {
-                    try merged.append(allocator, try std.fmt.allocPrint(
-                        allocator,
-                        "{s}{s}",
-                        .{ symbols.items[i], symbols.items[i + 1] },
-                    ));
+                    symbols.items[write] = try std.fmt.allocPrint(allocator, "{s}{s}", .{ left, right });
                     i += 2;
                 } else {
-                    try merged.append(allocator, symbols.items[i]);
+                    symbols.items[write] = symbols.items[i];
                     i += 1;
                 }
             }
-            symbols = merged;
+            symbols.items.len = write;
         }
 
         const ids = try allocator.alloc(i64, symbols.items.len);
@@ -152,8 +145,9 @@ fn nextPiece(text: []const u8, cursor: *usize) ?[]const u8 {
 
     const start = cursor.*;
     const first = text[cursor.*];
-    if (first == '\'' and contractionLength(text[start..]) != 0) {
-        cursor.* += contractionLength(text[start..]);
+    const contraction_len = if (first == '\'') contractionLength(text[start..]) else 0;
+    if (contraction_len != 0) {
+        cursor.* += contraction_len;
     } else if (isLetter(first)) {
         cursor.* += 1;
         while (cursor.* < text.len and isLetter(text[cursor.*])) cursor.* += 1;
@@ -181,18 +175,16 @@ fn isLetter(byte: u8) bool {
     return std.ascii.isAlphabetic(byte) or byte >= 0x80;
 }
 
+fn isDirectByte(byte: u8) bool {
+    return (byte >= '!' and byte <= '~') or (byte >= 0xa1 and byte <= 0xac) or byte >= 0xae;
+}
+
 fn byteCodepoint(byte: u8) u21 {
-    if ((byte >= '!' and byte <= '~') or
-        (byte >= 0xa1 and byte <= 0xac) or
-        (byte >= 0xae)) return byte;
+    if (isDirectByte(byte)) return byte;
 
     var offset: u21 = 0;
-    var candidate: u16 = 0;
-    while (candidate < byte) : (candidate += 1) {
-        const value: u8 = @intCast(candidate);
-        if (!((value >= '!' and value <= '~') or
-            (value >= 0xa1 and value <= 0xac) or
-            value >= 0xae)) offset += 1;
+    for (0..byte) |candidate| {
+        if (!isDirectByte(@intCast(candidate))) offset += 1;
     }
     return 256 + offset;
 }

@@ -25,15 +25,7 @@ pub fn build(b: *std.Build) void {
     mod.addImport("onnx", onnx.module("onnx"));
 
     const test_step = b.step("test", "Run tests");
-    addTest(b, test_step, mod);
-    addTest(b, test_step, b.createModule(.{
-        .root_source_file = b.path("src/render.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "zigimg", .module = zigimg.module("zigimg") },
-        },
-    }));
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
 
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench.zig"),
@@ -41,7 +33,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "sam3", .module = mod },
-            .{ .name = "zigimg", .module = zigimg.module("zigimg") },
         },
     });
     const bench_exe = b.addExecutable(.{
@@ -53,8 +44,4 @@ pub fn build(b: *std.Build) void {
     run_bench.addPassthruArgs();
     const bench_step = b.step("bench", "Run text querying benchmark on cat image");
     bench_step.dependOn(&run_bench.step);
-}
-
-fn addTest(b: *std.Build, step: *std.Build.Step, module: *std.Build.Module) void {
-    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
 }

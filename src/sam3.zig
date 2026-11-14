@@ -1,7 +1,8 @@
 const std = @import("std");
 pub const onnx = @import("onnx");
 const tokenizer = @import("tokenizer.zig");
-pub const assets = @import("assets.zig").default_assets;
+const assets_mod = @import("assets.zig");
+pub const assets = assets_mod.default_assets;
 pub const render = @import("render.zig");
 const zigimg = @import("zigimg");
 pub const Image = zigimg.Image;
@@ -56,11 +57,7 @@ const concept_embedding_names = [_][*:0]const u8{
     "fpn_hidden_state_2",
     "fpn_position_encoding_2",
 };
-const concept_decoder_inputs = [_][*:0]const u8{
-    "fpn_hidden_state_0",
-    "fpn_hidden_state_1",
-    "fpn_hidden_state_2",
-    "fpn_position_encoding_2",
+const concept_decoder_inputs = concept_embedding_names ++ [_][*:0]const u8{
     "text_features",
     "attention_mask",
 };
@@ -93,41 +90,25 @@ pub const Model = struct {
         const env = try onnx.Env.init(allocator, io);
         errdefer env.deinit();
 
-        const vision: ?onnx.Session = if (points) blk: {
-            const data = try assets.vision_encoder_data.get(allocator, io);
-            defer allocator.free(data);
-            const path = try assets.vision_encoder.get(allocator, io);
-            defer allocator.free(path);
-            break :blk try onnx.Session.open(env, path);
-        } else null;
+        const vision: ?onnx.Session = if (points)
+            try openSession(allocator, io, env, assets.vision_encoder, assets.vision_encoder_data)
+        else
+            null;
         errdefer if (vision) |session| session.deinit();
 
-        const decoder: ?onnx.Session = if (points) blk: {
-            const data = try assets.decoder_data.get(allocator, io);
-            defer allocator.free(data);
-            const path = try assets.decoder.get(allocator, io);
-            defer allocator.free(path);
-            break :blk try onnx.Session.open(env, path);
-        } else null;
+        const decoder: ?onnx.Session = if (points)
+            try openSession(allocator, io, env, assets.decoder, assets.decoder_data)
+        else
+            null;
         errdefer if (decoder) |session| session.deinit();
 
-        const concept_vision_data = try assets.concept_vision_encoder_data.get(allocator, io);
-        defer allocator.free(concept_vision_data);
-        const concept_vision_path = try assets.concept_vision_encoder.get(allocator, io);
-        defer allocator.free(concept_vision_path);
-        const concept_vision = try onnx.Session.open(env, concept_vision_path);
+        const concept_vision = try openSession(allocator, io, env, assets.concept_vision_encoder, assets.concept_vision_encoder_data);
         errdefer concept_vision.deinit();
 
-        const concept_text_data = try assets.concept_text_encoder_data.get(allocator, io);
-        defer allocator.free(concept_text_data);
-        const concept_text_path = try assets.concept_text_encoder.get(allocator, io);
-        defer allocator.free(concept_text_path);
-        const concept_text = try onnx.Session.open(env, concept_text_path);
+        const concept_text = try openSession(allocator, io, env, assets.concept_text_encoder, assets.concept_text_encoder_data);
         errdefer concept_text.deinit();
 
-        const concept_decoder_path = try assets.concept_decoder.get(allocator, io);
-        defer allocator.free(concept_decoder_path);
-        const concept_decoder = try onnx.Session.open(env, concept_decoder_path);
+        const concept_decoder = try openSession(allocator, io, env, assets.concept_decoder, null);
         errdefer concept_decoder.deinit();
 
         const tokenizer_json_path = try assets.concept_tokenizer_json.get(allocator, io);
@@ -166,8 +147,8 @@ pub const Model = struct {
 
     /// The returned embedding owns its memory and can serve multiple point prompts.
     pub fn encodePoints(self: *Model, img: RgbImage) !PointEmbedding {
-        const data = try encodeVision(self, self.allocator, img);
-        return PointEmbedding.init(self.allocator, data);
+        const vision = self.vision orelse return error.PointModelsNotLoaded;
+        return .{ .levels = try encodeImage(self.allocator, vision, img, @splat(0.5), @splat(0.5), &embedding_names) };
     }
 
     pub fn segment(self: *Model, embedding: *const PointEmbedding, points: []const Point) !Masks {
@@ -180,7 +161,7 @@ pub const Model = struct {
         for (points, 0..) |p, i| {
             coordinates[i * 2] = p.x * scale;
             coordinates[i * 2 + 1] = p.y * scale;
-            labels[i] = @intFromEnum(p.label);
+            labels[i] = @backingInt(p.label);
         }
 
         const point_count: i64 = @intCast(points.len);
@@ -216,149 +197,83 @@ pub const Model = struct {
 
     /// The returned embedding owns its memory and can serve multiple text prompts.
     pub fn encodeForText(self: *Model, img: RgbImage) !TextImageEmbedding {
-        return encodeConceptVision(self, img);
-    }
-
-    fn encodeText(self: *Model, encoding: tokenizer.Encoding) !TextEmbedding {
-        const data = try encodeConceptText(self, self.allocator, encoding);
-        return TextEmbedding.init(self.allocator, data);
+        return .{ .levels = try encodeImage(
+            self.allocator,
+            self.concept_vision,
+            img,
+            .{ 0.485, 0.456, 0.406 },
+            .{ 0.229, 0.224, 0.225 },
+            &concept_embedding_names,
+        ) };
     }
 
     /// Caller owns the returned text encoder features and can cache them by phrase.
     pub fn encodeTextFeatures(self: *Model, phrase: []const u8) ![]f32 {
         const encoding = try self.concept_tokenizer.encode(phrase);
-        return encodeConceptText(self, self.allocator, encoding);
+        return encodeConceptText(self, encoding);
     }
 
     pub fn find(self: *Model, embedding: *const TextImageEmbedding, phrase: []const u8, options: FindOptions) !Masks {
-        return decodeConceptQuery(self, self.allocator, embedding, phrase, null, options.min_score);
+        return decodeConceptQuery(self, embedding, phrase, null, options.min_score);
     }
 
     /// Use text encoder features from `encodeTextFeatures`, possibly from a cache.
     pub fn findWithTextFeatures(self: *Model, embedding: *const TextImageEmbedding, phrase: []const u8, features: []const f32, options: FindOptions) !Masks {
-        return decodeConceptQuery(self, self.allocator, embedding, phrase, features, options.min_score);
+        return decodeConceptQuery(self, embedding, phrase, features, options.min_score);
     }
 };
 
-pub const PointEmbedding = struct {
+fn DeviceEmbedding(comptime count: usize) type {
+    return struct {
+        levels: [count]onnx.Value,
+
+        pub fn deinit(self: *@This()) void {
+            for (self.levels) |level| level.deinit();
+            self.* = undefined;
+        }
+    };
+}
+
+pub const PointEmbedding = DeviceEmbedding(embedding_names.len);
+pub const TextImageEmbedding = DeviceEmbedding(concept_embedding_names.len);
+
+fn openSession(
     allocator: std.mem.Allocator,
-    data: []f32,
-    levels: [embedding_names.len]onnx.Value,
-
-    fn init(allocator: std.mem.Allocator, data: []f32) !PointEmbedding {
-        return .{
-            .allocator = allocator,
-            .data = data,
-            .levels = .{
-                try onnx.Value.borrowF32(data[0..2654208], &.{ 1, 32, 288, 288 }),
-                try onnx.Value.borrowF32(data[2654208..][0..1327104], &.{ 1, 64, 144, 144 }),
-                try onnx.Value.borrowF32(data[3981312..][0..1327104], &.{ 1, 256, 72, 72 }),
-            },
-        };
+    io: std.Io,
+    env: onnx.Env,
+    model_asset: assets_mod.Asset,
+    data_asset: ?assets_mod.Asset,
+) !onnx.Session {
+    if (data_asset) |asset| {
+        const data = try asset.get(allocator, io);
+        allocator.free(data);
     }
+    const path = try model_asset.get(allocator, io);
+    defer allocator.free(path);
+    return onnx.Session.open(env, path);
+}
 
-    pub fn deinit(self: *PointEmbedding) void {
-        self.allocator.free(self.data);
-        self.* = undefined;
-    }
-};
-
-pub const TextImageEmbedding = struct {
-    levels: [concept_embedding_names.len]onnx.Value,
-
-    pub fn deinit(self: *TextImageEmbedding) void {
-        for (self.levels) |level| level.deinit();
-        self.* = undefined;
-    }
-};
-
-const TextEmbedding = struct {
+fn encodeImage(
     allocator: std.mem.Allocator,
-    data: []f32,
-    value: onnx.Value,
-
-    fn init(allocator: std.mem.Allocator, data: []f32) !TextEmbedding {
-        return .{
-            .allocator = allocator,
-            .data = data,
-            .value = try onnx.Value.borrowF32(data, &.{ 1, tokenizer.max_tokens, 256 }),
-        };
-    }
-
-    fn deinit(self: *TextEmbedding) void {
-        self.allocator.free(self.data);
-        self.* = undefined;
-    }
-};
-
-fn encodeVision(
-    model: *Model,
-    allocator: std.mem.Allocator,
+    session: onnx.Session,
     img: RgbImage,
-) ![]f32 {
-    const pixels = try preprocessCpu(allocator, img, @splat(0.5), @splat(0.5));
+    mean: [3]f32,
+    deviation: [3]f32,
+    comptime output_names: []const [*:0]const u8,
+) ![output_names.len]onnx.Value {
+    const pixels = try preprocessCpu(allocator, img, mean, deviation);
     defer allocator.free(pixels);
 
     const pixel_shape = [_]i64{ 1, 3, image_size, image_size };
     const pixel_values = try onnx.Value.borrowF32(pixels, &pixel_shape);
     defer pixel_values.deinit();
 
-    var levels: [embedding_names.len]onnx.Value = undefined;
-    const vision = model.vision orelse return error.PointModelsNotLoaded;
-    try vision.run(
-        &.{vision_input},
-        &.{pixel_values},
-        &embedding_names,
-        &levels,
-    );
-    defer for (levels) |level| level.deinit();
-
-    const total_floats = 2654208 + 1327104 + 1327104;
-    const out = try allocator.alloc(f32, total_floats);
-    errdefer allocator.free(out);
-
-    const l0 = try levels[0].dataF32();
-    const l1 = try levels[1].dataF32();
-    const l2 = try levels[2].dataF32();
-    @memcpy(out[0..2654208], l0);
-    @memcpy(out[2654208..][0..1327104], l1);
-    @memcpy(out[3981312..][0..1327104], l2);
-
-    return out;
+    var levels: [output_names.len]onnx.Value = undefined;
+    try session.runDevice(&.{vision_input}, &.{pixel_values}, output_names, &levels);
+    return levels;
 }
 
-fn encodeConceptVision(
-    model: *Model,
-    img: RgbImage,
-) !TextImageEmbedding {
-    const pixels = try preprocessCpu(
-        model.allocator,
-        img,
-        .{ 0.485, 0.456, 0.406 },
-        .{ 0.229, 0.224, 0.225 },
-    );
-    defer model.allocator.free(pixels);
-
-    const pixel_shape = [_]i64{ 1, 3, image_size, image_size };
-    const pixel_values = try onnx.Value.borrowF32(pixels, &pixel_shape);
-    defer pixel_values.deinit();
-
-    var levels: [concept_embedding_names.len]onnx.Value = undefined;
-    try model.concept_vision.runDevice(
-        &.{vision_input},
-        &.{pixel_values},
-        &concept_embedding_names,
-        &levels,
-    );
-
-    return .{ .levels = levels };
-}
-
-fn encodeConceptText(
-    model: *Model,
-    allocator: std.mem.Allocator,
-    encoding: tokenizer.Encoding,
-) ![]f32 {
+fn encodeConceptText(model: *Model, encoding: tokenizer.Encoding) ![]f32 {
     const token_shape = [_]i64{ 1, tokenizer.max_tokens };
     const ids = try onnx.Value.borrowI64(&encoding.ids, &token_shape);
     defer ids.deinit();
@@ -374,31 +289,24 @@ fn encodeConceptText(
     );
     defer text_features[0].deinit();
 
-    const data = try text_features[0].dataF32();
-    const out = try allocator.alloc(f32, data.len);
-    @memcpy(out, data);
-    return out;
+    return model.allocator.dupe(f32, try text_features[0].dataF32());
 }
 
 fn decodeConceptQuery(
     model: *Model,
-    allocator: std.mem.Allocator,
     embedding: *const TextImageEmbedding,
     phrase: []const u8,
     features: ?[]const f32,
     threshold: f32,
 ) !Masks {
     const encoding = try model.concept_tokenizer.encode(phrase);
-    var text_embedding: ?TextEmbedding = null;
-    defer if (text_embedding) |*value| value.deinit();
-    const text_value = if (features) |data| blk: {
-        if (data.len != tokenizer.max_tokens * 256) return error.InvalidTextFeatures;
-        break :blk try onnx.Value.borrowF32(data, &.{ 1, tokenizer.max_tokens, 256 });
-    } else blk: {
-        text_embedding = try model.encodeText(encoding);
-        break :blk text_embedding.?.value;
-    };
-    defer if (features != null) text_value.deinit();
+    const owned_features: ?[]f32 = if (features == null) try encodeConceptText(model, encoding) else null;
+    defer if (owned_features) |data| model.allocator.free(data);
+
+    const data = features orelse owned_features.?;
+    if (data.len != tokenizer.max_tokens * 256) return error.InvalidTextFeatures;
+    const text_value = try onnx.Value.borrowF32(data, &.{ 1, tokenizer.max_tokens, 256 });
+    defer text_value.deinit();
 
     const token_shape = [_]i64{ 1, tokenizer.max_tokens };
     const attention = try onnx.Value.borrowI64(&encoding.attention, &token_shape);
@@ -421,7 +329,7 @@ fn decodeConceptQuery(
     );
     defer for (results) |result| result.deinit();
 
-    return Masks.takeConcept(allocator, results[0], results[1], threshold);
+    return Masks.takeConcept(model.allocator, results[0], results[1], threshold);
 }
 
 pub const Masks = struct {
@@ -527,7 +435,7 @@ fn max(values: []const f32) f32 {
     return result;
 }
 
-/// The CPU path, and the reference the CUDA kernel is checked against.
+/// Resizes and normalizes an RGB image into the planar float tensor expected by the vision encoders.
 pub fn preprocessCpu(allocator: std.mem.Allocator, img: RgbImage, mean: [3]f32, deviation: [3]f32) ![]f32 {
     if (img.width == 0 or img.height == 0) return error.InvalidImage;
     const pixel_count = std.math.mul(usize, img.width, img.height) catch return error.InvalidImage;
@@ -544,46 +452,34 @@ pub fn preprocessCpu(allocator: std.mem.Allocator, img: RgbImage, mean: [3]f32, 
     const byte_scale: f32 = 1.0 / 255.0;
 
     // Resize all three interleaved byte channels together and write directly
-    // into the model's planar normalized tensor. The old path converted the
-    // entire source image to float and resized it independently three times.
+    // into the model's planar normalized tensor.
     for (0..image_size) |y| {
-        const in_y = ratio_y * (@as(f32, @floatFromInt(y)) + 0.5) - 0.5;
-        const y0 = clampPixelIndex(in_y, img.height);
-        const y1 = @min(y0 + 1, img.height - 1);
-        const wy = @max(0.0, in_y - @as(f32, @floatFromInt(y0)));
-        const row0 = pixels[y0 * img.width * 3 ..][0 .. img.width * 3];
-        const row1 = pixels[y1 * img.width * 3 ..][0 .. img.width * 3];
+        const sy = render.axisSample(y, ratio_y, img.height);
+        const row0 = pixels[sy.lo * img.width * 3 ..][0 .. img.width * 3];
+        const row1 = pixels[sy.hi * img.width * 3 ..][0 .. img.width * 3];
 
         for (0..image_size) |x| {
-            const in_x = ratio_x * (@as(f32, @floatFromInt(x)) + 0.5) - 0.5;
-            const x0 = clampPixelIndex(in_x, img.width);
-            const x1 = @min(x0 + 1, img.width - 1);
-            const wx = @max(0.0, in_x - @as(f32, @floatFromInt(x0)));
-            const p00 = row0[x0 * 3 ..][0..3];
-            const p01 = row0[x1 * 3 ..][0..3];
-            const p10 = row1[x0 * 3 ..][0..3];
-            const p11 = row1[x1 * 3 ..][0..3];
+            const sx = render.axisSample(x, ratio_x, img.width);
+            const p00 = row0[sx.lo * 3 ..][0..3];
+            const p01 = row0[sx.hi * 3 ..][0..3];
+            const p10 = row1[sx.lo * 3 ..][0..3];
+            const p11 = row1[sx.hi * 3 ..][0..3];
             const index = y * image_size + x;
-            const a: [3]f32 = .{ @floatFromInt(p00[0]), @floatFromInt(p00[1]), @floatFromInt(p00[2]) };
-            const b: [3]f32 = .{ @floatFromInt(p01[0]), @floatFromInt(p01[1]), @floatFromInt(p01[2]) };
-            const c: [3]f32 = .{ @floatFromInt(p10[0]), @floatFromInt(p10[1]), @floatFromInt(p10[2]) };
-            const d: [3]f32 = .{ @floatFromInt(p11[0]), @floatFromInt(p11[1]), @floatFromInt(p11[2]) };
 
             inline for (0..3) |channel| {
-                const top = a[channel] + (b[channel] - a[channel]) * wx;
-                const bottom = c[channel] + (d[channel] - c[channel]) * wx;
-                const resized = (top + (bottom - top) * wy) * byte_scale;
+                const resized = render.bilerp(
+                    @floatFromInt(p00[channel]),
+                    @floatFromInt(p01[channel]),
+                    @floatFromInt(p10[channel]),
+                    @floatFromInt(p11[channel]),
+                    sx.w,
+                    sy.w,
+                ) * byte_scale;
                 out[channel * plane_size + index] = (resized - mean[channel]) / deviation[channel];
             }
         }
     }
     return out;
-}
-
-fn clampPixelIndex(coordinate: f32, limit: usize) usize {
-    if (coordinate <= 0.0) return 0;
-    const floored: usize = @intFromFloat(@floor(coordinate));
-    return @min(floored, limit - 1);
 }
 
 test "RGB image view validates input and preserves channel order" {
@@ -622,5 +518,6 @@ test "mask planes borrow the corresponding logits" {
 }
 
 test {
+    _ = tokenizer;
     std.testing.refAllDecls(@This());
 }

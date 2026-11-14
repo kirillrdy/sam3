@@ -10,7 +10,6 @@ The SAM 3 library runs inference directly. Applications can cache the owned
 - native Zig PTX output without cuda toolchain
 - fast compilation
 - small binaries
-- target older GPUs  `-Dsm=sm_61`
 
 ## Use as a Zig library
 

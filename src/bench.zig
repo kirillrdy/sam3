@@ -52,7 +52,7 @@ pub fn main(init: std.process.Init) !void {
     // 1. Initialize model
     std.debug.print("Opening SAM 3 model graphs...\n", .{});
     const t_open_start = now(io);
-    var model = try sam3.Model.open(allocator, io);
+    var model = try sam3.Model.openText(allocator, io);
     defer model.deinit();
     const t_open_end = now(io);
     const open_ms = @as(f64, @floatFromInt(elapsedNs(t_open_start, t_open_end))) / 1_000_000.0;
@@ -160,21 +160,22 @@ pub fn main(init: std.process.Init) !void {
     const query_runs = 10;
 
     std.debug.print("--- Benchmarking Text Feature Encoding (encodeTextFeatures) ---\n", .{});
-    for (phrases) |phrase| {
+    var cached_features: [phrases.len]?[]f32 = @splat(null);
+    defer for (cached_features) |maybe_feat| if (maybe_feat) |feat| allocator.free(feat);
+
+    for (phrases, 0..) |phrase, phrase_idx| {
         var text_durations: [query_runs]i96 = undefined;
-        var text_features: ?[]f32 = null;
         for (0..query_runs) |i| {
             const t0 = now(io);
             const feat = try model.encodeTextFeatures(phrase);
             const t1 = now(io);
             text_durations[i] = elapsedNs(t0, t1);
             if (i == 0) {
-                text_features = feat;
+                cached_features[phrase_idx] = feat;
             } else {
                 allocator.free(feat);
             }
         }
-        defer if (text_features) |feat| allocator.free(feat);
         const text_stats = Stats.compute(&text_durations);
         std.debug.print("Text \"{s:<10}\" ({d} runs): mean={d:.2} ms | median={d:.2} ms | min={d:.2} ms | max={d:.2} ms (dim={d})\n", .{
             phrase,
@@ -183,7 +184,7 @@ pub fn main(init: std.process.Init) !void {
             text_stats.median_ms,
             text_stats.min_ms,
             text_stats.max_ms,
-            text_features.?.len,
+            cached_features[phrase_idx].?.len,
         });
     }
     std.debug.print("\n", .{});
@@ -197,10 +198,8 @@ pub fn main(init: std.process.Init) !void {
         "", "", "", "", "", "", "",
     });
 
-    for (phrases) |phrase| {
-        // Precompute text features for cached benchmark
-        const text_features = try model.encodeTextFeatures(phrase);
-        defer allocator.free(text_features);
+    for (phrases, cached_features) |phrase, maybe_feat| {
+        const text_features = maybe_feat.?;
 
         // Warm up find
         {

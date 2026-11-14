@@ -49,7 +49,7 @@ pub const Asset = struct {
     }
 };
 
-pub const Assets = struct {
+const Assets = struct {
     vision_encoder: Asset,
     vision_encoder_data: Asset,
     decoder: Asset,
